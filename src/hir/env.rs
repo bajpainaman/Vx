@@ -1341,6 +1341,7 @@ impl<'a> TypeChecker<'a> {
             where_transfers: Vec::new(),
             body: new_body,
             doc_comment: generic_func.doc_comment.clone(),
+            span: generic_func.span,
         }
     }
 
@@ -1558,7 +1559,7 @@ impl<'a> TypeChecker<'a> {
                 self.errors.warn(
                     crate::diagnostic::DiagnosticCode::W1009,
                     format!("Unused function parameter '{}'", param_name),
-                    None,
+                    Some(crate::diagnostic::SourceSpan::from_ast_span(&func.span)),
                 );
             }
         }

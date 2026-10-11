@@ -44,6 +44,9 @@ pub struct MeliorGenerator<'c> {
     pub(crate) declared_tensor_prints: std::collections::HashSet<&'static str>,
     /// Locals whose element pointer the function takes: a view through it can share their memory.
     pub(crate) pointer_taken: std::collections::HashSet<crate::symbol::Symbol>,
+    /// The locals of the function being lowered that are borrowed with `&x`. Each gets a stack
+    /// slot, so every borrow of it is the same address.
+    pub(crate) address_taken: std::collections::HashSet<crate::symbol::Symbol>,
     /// Declared memory spaces, keyed by space, so a `transfer` can emit the sub-space descriptor
     /// (granule/capacity/scope/parent) as IR metadata for later passes (see subspace_scheduling.md).
     pub(crate) memories: HashMap<syntax::MemorySpace, syntax::MemoryDecl>,
@@ -240,6 +243,11 @@ pub(crate) fn scalar_type_bits(ty_text: &str) -> Option<u32> {
     }
 }
 
+/// Whether an MLIR type spelling is a float type.
+pub(crate) fn is_float_text(ty_text: &str) -> bool {
+    matches!(ty_text, "f16" | "bf16" | "f32" | "f64")
+}
+
 /// A drop waiting for the value of the statement it precedes.
 pub(crate) enum WaitingDrop<'c> {
     /// The buffer to free, read where the drop was: the owner, or (`field`) a tensor field of
@@ -357,11 +365,6 @@ impl<'c> MeliorGenerator<'c> {
         ty_str.starts_with("memref<")
             && !ty_str.contains('x')
             && !ty_str.starts_with("memref<memref<")
-    }
-
-    pub fn is_llvm_ptr(&self, ty: &Type<'c>) -> bool {
-        let ty_str = ty.to_string();
-        ty_str.starts_with("!llvm.ptr") || ty_str.starts_with("!llvm.array")
     }
 
     /// Adapt a closure-literal environment struct (`Closure_N`, the by-value capture record) to a
@@ -799,6 +802,7 @@ impl<'c> MeliorGenerator<'c> {
             owned_tensors: std::collections::HashSet::new(),
             declared_tensor_prints: std::collections::HashSet::new(),
             pointer_taken: std::collections::HashSet::new(),
+            address_taken: std::collections::HashSet::new(),
             memories: HashMap::new(),
             transfer_impls: HashMap::new(),
             topologies: HashMap::new(),
@@ -1208,6 +1212,7 @@ impl<'c> MeliorGenerator<'c> {
         self.allocs.clear();
         self.subspace_offsets.clear(); // per-function sub-space bump allocator (SS2)
         self.pointer_taken = syntax::locals_with_pointer_taken(&func.body);
+        self.address_taken = syntax::locals_with_address_taken(&func.body);
         let is_main = func.name.as_ref() == "main";
         let true_ret_ty = self.lower_type(&func.return_type)?;
         let ret_ty = if is_main { self.i32_ty } else { true_ret_ty };
@@ -1254,8 +1259,6 @@ impl<'c> MeliorGenerator<'c> {
             crate::codegen::lower::LowerError::from("No first operation".to_string())
         })?;
         let func_loc = dummy_op.location();
-
-        let _region = Region::new();
 
         let mut block_args = Vec::new();
         for ty in &arg_tys {
@@ -1859,6 +1862,9 @@ impl<'c> MeliorGenerator<'c> {
         for position in 0..arity {
             let mut payload_ty_str = "none".to_string();
             let mut widest = 0u32;
+            // Numbers of different kinds, such as `i32` and `f32`, share an integer slot. A float
+            // goes in as its bits; an integer in a float slot could read back as a denormal.
+            let mut scalars: Vec<String> = Vec::new();
             for (_v_name, payload) in enum_def {
                 let Some(types) = payload else { continue };
                 let Some(ty) = types.get(position) else {
@@ -1883,6 +1889,9 @@ impl<'c> MeliorGenerator<'c> {
                          generator"
                     )));
                 }
+                if scalar_type_bits(&lowered).is_some() && !scalars.contains(&lowered) {
+                    scalars.push(lowered.clone());
+                }
                 match scalar_type_bits(&lowered) {
                     Some(b) if b > widest => {
                         widest = b;
@@ -1891,6 +1900,9 @@ impl<'c> MeliorGenerator<'c> {
                     None if payload_ty_str == "none" => payload_ty_str = lowered,
                     _ => {}
                 }
+            }
+            if scalars.len() > 1 && scalars.iter().any(|t| is_float_text(t)) {
+                payload_ty_str = format!("i{widest}");
             }
             slots.push(payload_ty_str);
         }
@@ -1915,7 +1927,6 @@ impl<'c> MeliorGenerator<'c> {
         })
     }
 
-    /// An instantiated generic enum (its name holds `<...>`): a tag and the payload slot.
     /// The `vx.placed` mark of a placed parameter or result. A placement written as a device
     /// holds that device's memory; on-chip memory, by the address space its type is given, is
     /// scratch nothing frees.
@@ -2316,6 +2327,13 @@ impl<'c> MeliorGenerator<'c> {
                 is_mut: b.is_mut,
                 region_id: syntax::REGION_UNSET as usize,
             }),
+            // A generic struct's literal does not spell its type arguments, so only a plain
+            // struct is known from the literal alone.
+            Expr::StructInit(s) => self
+                .structs
+                .get(&s.name)
+                .filter(|decl| decl.generics.is_empty())
+                .map(|_| syntax::Type::Struct(s.name.clone(), s.type_id)),
             Expr::Identifier(id) => self.ast_env.get(&id.name).cloned().or_else(|| {
                 // A bare function name used as a *value* (`let f = probe`) is a function pointer;
                 // recover its signature from the function registry so a later indirect call `f(..)`

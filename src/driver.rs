@@ -740,6 +740,7 @@ impl CompilerDriver {
     fn native_host_program() -> crate::syntax::Program {
         crate::syntax::Program {
             module_path: crate::symbol::Symbol::from(NATIVE_HOST_MODULE),
+            file: None,
             item_macros: Vec::new(),
             memories: vec![crate::syntax::MemoryDecl {
                 name: crate::symbol::Symbol::from("CPU_DRAM"),
@@ -959,10 +960,20 @@ impl CompilerDriver {
         let mut checker = TypeChecker::new(&env, &mut worker);
         checker.seam.verify = self.options.verify_seams;
 
+        // Every diagnostic names the file it is about. The checks that look at the whole
+        // program at once can only name one when the program is one file.
+        let whole_program_file = if other_asts.is_empty() {
+            ast.file.clone()
+        } else {
+            None
+        };
+
         // Everything that is about the program as a whole rather than one function, before any
         // body is checked. Shared with the parallel pipeline so the two frontends cannot drift.
+        checker.errors.file = whole_program_file.clone();
         checker.check_whole_program_declarations();
 
+        checker.errors.file = ast.file.clone();
         for f in &mut ast.functions {
             checker.check_function(f);
         }
@@ -1003,6 +1014,7 @@ impl CompilerDriver {
         // the library never saw. Reviewed and reproduced: an imported lowering that
         // fails every lowering check compiled clean before this loop.
         for p in other_asts.values_mut() {
+            checker.errors.file = p.file.clone();
             for t in &mut p.transfer_impls {
                 checker.seam.lowering_edge = Some((
                     t.from.clone(),
@@ -1016,6 +1028,7 @@ impl CompilerDriver {
             }
         }
         for p in other_asts.values() {
+            checker.errors.file = p.file.clone();
             checker.check_transfer_impl_bodies(&p.transfer_impls);
         }
 
@@ -1034,6 +1047,7 @@ impl CompilerDriver {
             (String, Vec<crate::diagnostic::Diagnostic>),
         > = std::collections::BTreeMap::new();
         for p in other_asts.values_mut() {
+            checker.errors.file = p.file.clone();
             for f in &mut p.functions {
                 if f.generics.is_empty() {
                     let before = checker.errors.len();
@@ -1073,6 +1087,7 @@ impl CompilerDriver {
         // monomorphized call graph. Reads only the summaries the per-function checks exported,
         // never a body, and only ever adds refusals.
         {
+            checker.errors.file = whole_program_file;
             let summaries = std::mem::take(&mut checker.traffic.capacity_summaries);
             crate::hir::check::capacity_fold::fold_cross_call_capacity(
                 &summaries,
@@ -1659,6 +1674,7 @@ impl CompilerDriver {
                 where_transfers: vec![],
                 body: vec![],
                 doc_comment: None,
+                span: crate::syntax::Span::default(),
             };
             imported_entries.push((synth, body.hir.clone(), body.types.clone()));
         }

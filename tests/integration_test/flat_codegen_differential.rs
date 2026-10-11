@@ -2154,6 +2154,7 @@ fn program_links_a_function_body_from_a_vxlib_artifact() {
     let synth = Function {
         is_unsafe: false,
         name: body.name.clone(),
+        span: vxc::syntax::Span::default(),
         generics: vec![],
         params: body
             .params

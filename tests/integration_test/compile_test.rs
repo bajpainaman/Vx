@@ -449,6 +449,8 @@ fn run_warning_test(path: &Path) -> Result<(), String> {
     checker.seam.verify = source.contains("// VERIFY-SEAMS");
     checker.check_topology_coherence(&program.topologies);
     checker.check_memory_coherence();
+    // As the driver does: a warning names the file it is in.
+    checker.errors.file = program.file.clone();
     for f in &mut program.functions {
         checker.check_function(f);
     }

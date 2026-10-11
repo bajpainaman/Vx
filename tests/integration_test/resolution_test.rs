@@ -380,6 +380,7 @@ fn test_local_name_resolution() -> Result<(), String> {
         item_macros: Vec::new(),
         imports: Vec::new(),
         module_path: "core::math".into(),
+        file: None,
         topologies: vec![],
         memories: vec![],
         transfer_impls: Vec::new(),
@@ -407,6 +408,7 @@ fn test_local_name_resolution() -> Result<(), String> {
             where_transfers: Vec::new(),
             body: vec![],
             doc_comment: None,
+            span: Span::default(),
         }],
         consts: vec![],
     };
@@ -449,6 +451,7 @@ fn test_unresolved_symbol_remains_none() -> Result<(), String> {
         item_macros: Vec::new(),
         imports: Vec::new(),
         module_path: "core::bad".into(),
+        file: None,
         topologies: vec![],
         memories: vec![],
         transfer_impls: Vec::new(),
@@ -471,6 +474,7 @@ fn test_unresolved_symbol_remains_none() -> Result<(), String> {
             where_transfers: Vec::new(),
             body: vec![],
             doc_comment: None,
+            span: Span::default(),
         }],
         consts: vec![],
     };
@@ -498,6 +502,7 @@ fn test_nested_type_resolution() -> Result<(), String> {
         item_macros: Vec::new(),
         imports: Vec::new(),
         module_path: "core::math".into(),
+        file: None,
         topologies: vec![],
         memories: vec![],
         transfer_impls: Vec::new(),
@@ -534,6 +539,7 @@ fn test_nested_type_resolution() -> Result<(), String> {
             where_transfers: Vec::new(),
             body: vec![],
             doc_comment: None,
+            span: Span::default(),
         }],
         consts: vec![],
     };
@@ -565,6 +571,7 @@ fn test_expr_and_stmt_resolution() -> Result<(), String> {
         item_macros: Vec::new(),
         imports: Vec::new(),
         module_path: "core::app".into(),
+        file: None,
         topologies: vec![],
         memories: vec![],
         transfer_impls: Vec::new(),
@@ -603,6 +610,7 @@ fn test_expr_and_stmt_resolution() -> Result<(), String> {
                 span: Span::default(),
             })],
             doc_comment: None,
+            span: Span::default(),
         }],
         consts: vec![],
     };

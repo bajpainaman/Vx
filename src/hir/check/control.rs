@@ -949,6 +949,7 @@ impl<'a> TypeChecker<'a> {
                     where_transfers: vec![],
                     body: body_stmts,
                     doc_comment: None,
+                    span: e.span,
                 };
 
                 self.mono.functions.push((call_func, 0));

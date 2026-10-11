@@ -284,6 +284,9 @@ pub fn fill_trait_defaults_in(program: &mut crate::syntax::Program, defaults: &T
                 is_unsafe: false,
                 body,
                 doc_comment: None,
+                // A trait's method signature carries no position, so a copied default has
+                // none of its own.
+                span: crate::syntax::Span::default(),
             });
         }
     }

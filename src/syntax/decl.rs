@@ -95,6 +95,9 @@ pub struct Function {
     pub is_unsafe: bool,
     pub body: Vec<Statement>,
     pub doc_comment: Option<String>,
+    /// Where the function's name is written. A diagnostic about the function as a whole, such
+    /// as an unused parameter, points here.
+    pub span: Span,
 }
 
 impl Function {
@@ -116,6 +119,7 @@ impl Function {
                 Vec::new()
             },
             doc_comment: self.doc_comment.clone(),
+            span: self.span,
         }
     }
 }
@@ -418,6 +422,9 @@ pub struct Program {
     /// it produced and empties this list.
     pub item_macros: Vec<crate::syntax::stmt::MacroCallStmt>,
     pub module_path: Symbol,
+    /// The path this module was read from, as the compiler was given it or as the import
+    /// search found it. Diagnostics name it. `None` for a program built in memory.
+    pub file: Option<String>,
     pub imports: Vec<ImportDecl>,
     pub macros: Vec<MacroDefDecl>,
     pub externs: Vec<ExternDecl>,
@@ -454,6 +461,7 @@ impl Program {
     pub fn clone_signature(&self) -> Self {
         Self {
             module_path: self.module_path.clone(),
+            file: self.file.clone(),
             // Not carried: a signature-only copy is taken after expansion, when the list is
             // already empty, and carrying it would expand the same call a second time.
             item_macros: Vec::new(),

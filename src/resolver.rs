@@ -212,6 +212,9 @@ pub fn fill_trait_defaults_in(program: &mut crate::syntax::Program, defaults: &T
     if defaults.methods.is_empty() {
         return;
     }
+    // A copied default is checked as part of the impl's file: the trait's signature carries
+    // no position and no file of its own.
+    let file = program.file.clone();
     for block in &mut program.impls {
         let Some(trait_name) = block.trait_name.clone() else {
             continue;
@@ -284,6 +287,8 @@ pub fn fill_trait_defaults_in(program: &mut crate::syntax::Program, defaults: &T
                 is_unsafe: false,
                 body,
                 doc_comment: None,
+                span: crate::syntax::Span::default(),
+                file: file.clone(),
             });
         }
     }

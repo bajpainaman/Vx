@@ -138,6 +138,12 @@ impl<'a> Parser<'a> {
         let is_unsafe = self.match_token(&TokenType::Unsafe);
         self.consume(&TokenType::Fn, "Expected 'fn'")?;
 
+        let name_token = self.peek();
+        let span = crate::syntax::Span {
+            line: name_token.line,
+            column: name_token.column,
+            length: name_token.length,
+        };
         let name = self.expect_identifier("Expected function name")?;
 
         let generics = self.parse_generic_params()?;
@@ -256,6 +262,8 @@ impl<'a> Parser<'a> {
             where_transfers,
             body,
             doc_comment: None,
+            span,
+            file: None,
         })
     }
 
@@ -1440,6 +1448,7 @@ impl<'a> Parser<'a> {
         }
         Ok(Program {
             module_path: self.source.to_string().into(), // Default fallback, should be overridden by pipeline
+            file: None,
             item_macros,
             imports,
             macros,

@@ -1365,6 +1365,8 @@ impl<'a> TypeChecker<'a> {
             where_transfers: Vec::new(),
             body: new_body,
             doc_comment: generic_func.doc_comment.clone(),
+            span: generic_func.span,
+            file: generic_func.file.clone(),
         }
     }
 
@@ -1498,6 +1500,9 @@ impl<'a> TypeChecker<'a> {
         let prev_declared_vars = std::mem::take(&mut self.declared_vars);
         let prev_declared_mut_vars = std::mem::take(&mut self.declared_mut_vars);
         let prev_changed_vars = std::mem::take(&mut self.changed_vars);
+        // Diagnostics name the file the function is written in, even when it is a generic
+        // instance or a copied default checked from inside another file's function.
+        let prev_file = std::mem::replace(&mut self.errors.file, func.file.clone());
         self.push_scope();
 
         let prev_top = self.active_topology.clone();
@@ -1595,10 +1600,14 @@ impl<'a> TypeChecker<'a> {
                 && name_str != "self"
                 && !self.used_vars.contains(param_name.as_ref())
             {
+                // A function built in memory, such as a copied trait default, has no position
+                // of its own; `0:0` would point nowhere.
+                let at = (func.span.line > 0)
+                    .then(|| crate::diagnostic::SourceSpan::from_ast_span(&func.span));
                 self.errors.warn(
                     crate::diagnostic::DiagnosticCode::W1009,
                     format!("Unused function parameter '{}'", param_name),
-                    None,
+                    at,
                 );
             }
         }
@@ -1665,6 +1674,7 @@ impl<'a> TypeChecker<'a> {
         self.declared_vars = prev_declared_vars;
         self.declared_mut_vars = prev_declared_mut_vars;
         self.changed_vars = prev_changed_vars;
+        self.errors.file = prev_file;
     }
 
     pub fn parse_ty_str(&self, s: &str) -> Type {

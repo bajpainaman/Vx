@@ -100,10 +100,10 @@ fn main() -> i32 {
   return 0;
 }
 
-// CHECK-DAG: Error[E4013] at 60:13: `p.a` cannot be moved out of the struct that holds it
-// CHECK-DAG: Error[E4013] at 66:17: `p.a` cannot be moved out of the struct that holds it
-// CHECK-DAG: Error[E4013] at 71:12: `p.a` cannot be moved out of the struct that holds it
-// CHECK-DAG: Error[E4013] at 78:18: `f.pair.b` cannot be moved out of the struct that holds it
-// CHECK-DAG: Error[E4013] at 89:13: `o.h` cannot be moved out of the struct that holds it
-// CHECK-DAG: Error[E4013] at 95:18: this field cannot be moved out of the struct that holds it
+// CHECK-DAG: Error[E4013] at {{.*}}field_with_something_to_drop_moved_out_of_its_struct.vx:60:13: `p.a` cannot be moved out of the struct that holds it
+// CHECK-DAG: Error[E4013] at {{.*}}field_with_something_to_drop_moved_out_of_its_struct.vx:66:17: `p.a` cannot be moved out of the struct that holds it
+// CHECK-DAG: Error[E4013] at {{.*}}field_with_something_to_drop_moved_out_of_its_struct.vx:71:12: `p.a` cannot be moved out of the struct that holds it
+// CHECK-DAG: Error[E4013] at {{.*}}field_with_something_to_drop_moved_out_of_its_struct.vx:78:18: `f.pair.b` cannot be moved out of the struct that holds it
+// CHECK-DAG: Error[E4013] at {{.*}}field_with_something_to_drop_moved_out_of_its_struct.vx:89:13: `o.h` cannot be moved out of the struct that holds it
+// CHECK-DAG: Error[E4013] at {{.*}}field_with_something_to_drop_moved_out_of_its_struct.vx:95:18: this field cannot be moved out of the struct that holds it
 // CHECK: 6 error(s) emitted

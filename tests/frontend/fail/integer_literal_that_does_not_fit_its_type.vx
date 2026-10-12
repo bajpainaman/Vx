@@ -14,6 +14,10 @@ fn take(n : u8) -> u8 {
   return n;
 }
 
+fn take_i8(n : i8) -> i8 {
+  return n;
+}
+
 fn main() -> i32 {
   // CHECK: Error[E3045]: 0xFFFF_FFFF does not fit `i32`, which holds -2147483648 up to 2147483647
   let typed : i32 = 0xFFFF_FFFF;
@@ -32,6 +36,9 @@ fn main() -> i32 {
   // Two minuses cancel, so this is 128.
   // CHECK: Error[E3045]: 128 does not fit `i8`
   let twice : i8 = --128;
+  // The argument path uses the same parity.
+  // CHECK: Error[E3045]: 128 does not fit `i8`
+  let passed_twice = take_i8(--128);
   return 0;
 }
-// CHECK: 8 error(s) emitted
+// CHECK: 9 error(s) emitted

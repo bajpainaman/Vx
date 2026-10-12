@@ -20,7 +20,7 @@ use vxc::jit::execute_mlir;
 use vxc::lexer::Lexer;
 use vxc::parser::Parser;
 use vxc::session::{GlobalSession, LocalWorkerState};
-use vxc::syntax::Program;
+use vxc::syntax::{Function, Program};
 
 fn make_context() -> melior::Context {
     let registry = melior::dialect::DialectRegistry::new();
@@ -149,6 +149,86 @@ fn ast_exit_code(src: &str) -> i32 {
     exit_code(&ast_llvm(src))
 }
 
+/// Lowers every function into its own worker. Declines the whole program (`None`, after
+/// saying which function) if any function is outside the flat subset: module-level
+/// keep-green atomicity.
+fn lower_all(
+    functions: &[Function],
+    session: &std::sync::Arc<GlobalSession>,
+) -> Option<Vec<LocalWorkerState>> {
+    let mut lowered: Vec<LocalWorkerState> = Vec::new();
+    for f in functions {
+        let mut worker = LocalWorkerState::new(session.clone());
+        if let Err(e) = lower_function_to_hir(f, &mut worker) {
+            eprintln!("flat path declined `{}`: {e:?}", f.name);
+            return None;
+        }
+        lowered.push(worker);
+    }
+    Some(lowered)
+}
+
+/// Each function paired with the HIR and type streams its worker produced.
+fn flat_fns<'a>(
+    functions: &'a [Function],
+    lowered: &'a [LocalWorkerState],
+) -> Vec<vxc::codegen::flat::FlatFn<'a>> {
+    functions
+        .iter()
+        .zip(lowered)
+        .map(|(f, w)| {
+            (
+                f,
+                w.local_hir_stream.as_slice(),
+                w.local_type_stream.as_slice(),
+            )
+        })
+        .collect()
+}
+
+/// Gathers the per-worker tables and emits one module through `flat::emit_module_mlir`.
+fn emit_flat_module(
+    functions: &[Function],
+    lowered: &[LocalWorkerState],
+    registry: &vxc::registry::ImmutableGlobalRegistry,
+    subspaces: &[vxc::codegen::flat::SubspaceInfo],
+) -> vxc::decline::Lowered<String> {
+    let funcs = flat_fns(functions, lowered);
+    let tensor_types: Vec<_> = lowered
+        .iter()
+        .flat_map(|w| w.local_tensor_types.iter().cloned())
+        .collect();
+    let string_tables: Vec<&[String]> = lowered
+        .iter()
+        .map(|w| w.local_string_table.as_slice())
+        .collect();
+    let inline_tables: Vec<&[vxc::hir::flatten::InlineBlock]> = lowered
+        .iter()
+        .map(|w| w.local_inline_blocks.as_slice())
+        .collect();
+    let agg_layouts: Vec<_> = lowered
+        .iter()
+        .flat_map(|w| w.local_agg_layouts.iter().cloned())
+        .collect();
+    let alias_tables: Vec<&[vxc::codegen::flat::AliasStore]> = lowered
+        .iter()
+        .map(|w| w.local_place_alias_stores.as_slice())
+        .collect();
+    vxc::codegen::flat::emit_module_mlir(
+        &funcs,
+        registry,
+        &tensor_types,
+        &string_tables,
+        &inline_tables,
+        &agg_layouts,
+        &alias_tables,
+        subspaces,
+        &[],
+        &[],
+        vxc::config::Schedule::Parallel,
+    )
+}
+
 /// The lowered LLVM-dialect MLIR for the whole program compiled through the *flat*
 /// path, or `None` if the flat HIR / emitter declines any function (outside the
 /// current subset). Lowers *all* functions (so calls resolve to their callee
@@ -193,63 +273,8 @@ fn flat_llvm(src: &str) -> Option<String> {
     let registry = vxc::pipeline::build_frozen_registry(&mods).ok()?;
     let session = std::sync::Arc::new(GlobalSession::with_registry(1, registry));
 
-    // Lower every function into its own worker; decline the whole program if any
-    // function is outside the flat subset (module-level keep-green atomicity).
-    let mut lowered: Vec<LocalWorkerState> = Vec::new();
-    for f in &mods[0].functions {
-        let mut worker = LocalWorkerState::new(session.clone());
-        if let Err(e) = lower_function_to_hir(f, &mut worker) {
-            eprintln!("flat path declined `{}`: {e:?}", f.name);
-            return None;
-        }
-        lowered.push(worker);
-    }
-    let funcs: Vec<(&_, &[_], &[_])> = mods[0]
-        .functions
-        .iter()
-        .zip(&lowered)
-        .map(|(f, w)| {
-            (
-                f,
-                w.local_hir_stream.as_slice(),
-                w.local_type_stream.as_slice(),
-            )
-        })
-        .collect();
-    let tensor_types: Vec<_> = lowered
-        .iter()
-        .flat_map(|w| w.local_tensor_types.iter().cloned())
-        .collect();
-    let string_tables: Vec<&[String]> = lowered
-        .iter()
-        .map(|w| w.local_string_table.as_slice())
-        .collect();
-    let inline_tables: Vec<&[vxc::hir::flatten::InlineBlock]> = lowered
-        .iter()
-        .map(|w| w.local_inline_blocks.as_slice())
-        .collect();
-    let agg_layouts: Vec<_> = lowered
-        .iter()
-        .flat_map(|w| w.local_agg_layouts.iter().cloned())
-        .collect();
-    let alias_tables: Vec<&[(usize, usize, Vec<usize>)]> = lowered
-        .iter()
-        .map(|w| w.local_place_alias_stores.as_slice())
-        .collect();
-    let body = vxc::codegen::flat::emit_module_mlir(
-        &funcs,
-        &session.registry,
-        &tensor_types,
-        &string_tables,
-        &inline_tables,
-        &agg_layouts,
-        &alias_tables,
-        &[],
-        &[],
-        &[],
-        vxc::config::Schedule::Parallel,
-    )
-    .ok()?;
+    let lowered = lower_all(&mods[0].functions, &session)?;
+    let body = emit_flat_module(&mods[0].functions, &lowered, &session.registry, &[]).ok()?;
 
     let context = make_context();
     let mut module = melior::ir::Module::parse(&context, &body).expect("flat MLIR parses");
@@ -295,62 +320,10 @@ fn flat_module_mlir(src: &str) -> Option<String> {
     // should be reimplementing the thing it differentiates.
     let subspaces: Vec<vxc::codegen::flat::SubspaceInfo> =
         vxc::codegen::flat::subspaces_from_env(&env);
-    let mut lowered: Vec<LocalWorkerState> = Vec::new();
-    for f in &mods[0].functions {
-        let mut worker = LocalWorkerState::new(session.clone());
-        if let Err(e) = lower_function_to_hir(f, &mut worker) {
-            eprintln!("flat path declined `{}`: {e:?}", f.name);
-            return None;
-        }
-        lowered.push(worker);
-    }
-    let funcs: Vec<(&_, &[_], &[_])> = mods[0]
-        .functions
-        .iter()
-        .zip(&lowered)
-        .map(|(f, w)| {
-            (
-                f,
-                w.local_hir_stream.as_slice(),
-                w.local_type_stream.as_slice(),
-            )
-        })
-        .collect();
-    let tensor_types: Vec<_> = lowered
-        .iter()
-        .flat_map(|w| w.local_tensor_types.iter().cloned())
-        .collect();
-    let string_tables: Vec<&[String]> = lowered
-        .iter()
-        .map(|w| w.local_string_table.as_slice())
-        .collect();
-    let inline_tables: Vec<&[vxc::hir::flatten::InlineBlock]> = lowered
-        .iter()
-        .map(|w| w.local_inline_blocks.as_slice())
-        .collect();
-    let agg_layouts: Vec<_> = lowered
-        .iter()
-        .flat_map(|w| w.local_agg_layouts.iter().cloned())
-        .collect();
-    let alias_tables: Vec<&[(usize, usize, Vec<usize>)]> = lowered
-        .iter()
-        .map(|w| w.local_place_alias_stores.as_slice())
-        .collect();
-    vxc::codegen::flat::emit_module_mlir(
-        &funcs,
-        &session.registry,
-        &tensor_types,
-        &string_tables,
-        &inline_tables,
-        &agg_layouts,
-        &alias_tables,
-        &subspaces,
-        &[],
-        &[],
-        vxc::config::Schedule::Parallel,
-    )
-    .map_err(|e| eprintln!("flat path failed to emit: {e:?}"))
-    .ok()
+    let lowered = lower_all(&mods[0].functions, &session)?;
+    emit_flat_module(&mods[0].functions, &lowered, &session.registry, &subspaces)
+        .map_err(|e| eprintln!("flat path failed to emit: {e:?}"))
+        .ok()
 }
 
 /// The parity assertion for a *printing* program: the flat path lowers it, and its
@@ -2109,9 +2082,39 @@ fn build_lib_interface(path: &str, src: &str) -> Vec<u8> {
 /// **body from a precompiled `.vxlib` artifact**, with the library's source *never parsed* in the
 /// consumer compile. Proves the whole mechanism end to end through the flat path — producer (harvest +
 /// serialize) → deserialize → registry merge → flat codegen links `body_of` → JIT.
+/// A signature-only `Function` for a body that came from an artifact, so the emitter has
+/// something to emit the body against. The parameters are named `a0`, `a1`, ...
+fn signature_only(body: &vxc::registry::FnBody) -> Function {
+    use vxc::syntax::Topology;
+    Function {
+        is_unsafe: false,
+        name: body.name.clone(),
+        generics: vec![],
+        params: body
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                (
+                    vxc::symbol::Symbol::from(format!("a{i}").as_str()),
+                    t.clone(),
+                )
+            })
+            .collect(),
+        mut_params: Vec::new(),
+        topology: Topology::CPU,
+        return_type: body.ret_ty.clone(),
+        requires: vec![],
+        ensures: vec![],
+        where_transfers: vec![],
+        body: vec![],
+        doc_comment: None,
+    }
+}
+
 #[test]
 fn program_links_a_function_body_from_a_vxlib_artifact() {
-    use vxc::syntax::{ElementType, Function, Topology, Type};
+    use vxc::syntax::{ElementType, Type};
 
     // 1. Producer: a library module -> a `.vxlib` interface (bytes). This is the only place its
     //    source is ever seen; the consumer below works purely from these bytes.
@@ -2153,45 +2156,11 @@ fn program_links_a_function_body_from_a_vxlib_artifact() {
         .body_of(double_gid)
         .expect("double's body came from the .vxlib artifact")
         .clone();
-    let synth = Function {
-        is_unsafe: false,
-        name: body.name.clone(),
-        generics: vec![],
-        params: body
-            .params
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                (
-                    vxc::symbol::Symbol::from(format!("a{i}").as_str()),
-                    t.clone(),
-                )
-            })
-            .collect(),
-        mut_params: Vec::new(),
-        topology: Topology::CPU,
-        return_type: body.ret_ty.clone(),
-        requires: vec![],
-        ensures: vec![],
-        where_transfers: vec![],
-        body: vec![],
-        doc_comment: None,
-    };
+    let synth = signature_only(&body);
     assert_eq!(synth.return_type, Type::Scalar(ElementType::I32));
 
     // Emit one module: the app's `main` + the imported `double` (body from the artifact).
-    let mut funcs: Vec<(&Function, &[_], &[_])> = mods[0]
-        .functions
-        .iter()
-        .zip(&lowered)
-        .map(|(f, w)| {
-            (
-                f,
-                w.local_hir_stream.as_slice(),
-                w.local_type_stream.as_slice(),
-            )
-        })
-        .collect();
+    let mut funcs = flat_fns(&mods[0].functions, &lowered);
     funcs.push((&synth, body.hir.as_slice(), body.types.as_slice()));
 
     let mlir = vxc::codegen::flat::emit_module_mlir(
@@ -2224,6 +2193,22 @@ fn program_links_a_function_body_from_a_vxlib_artifact() {
 /// flag rides on `FnSig`. Two libraries are built, one `unsafe fn` and one not, and the same call
 /// is made against each: refused for the first, accepted for the second. Asserting only the refusal
 /// would pass equally if the check refused every imported call.
+/// What the driver prints on stderr when `app` is compiled against the interface `artifact`.
+fn link_check_stderr(vxc: &str, artifact: &std::path::Path, app: &std::path::Path) -> String {
+    let out = std::process::Command::new(vxc)
+        .args([
+            "--link-interface",
+            artifact.to_str().unwrap(),
+            app.to_str().unwrap(),
+            "--action",
+            "print-ast",
+        ])
+        .stdout(std::process::Stdio::null())
+        .output()
+        .expect("run vxc --link-interface");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
 #[test]
 fn driver_link_interface_refuses_an_unguarded_unsafe_import() {
     use std::process::Command;
@@ -2267,29 +2252,14 @@ fn driver_link_interface_refuses_an_unguarded_unsafe_import() {
         "emit-interface failed for the safe library"
     );
 
-    let check_against = |artifact: &std::path::Path| -> String {
-        let out = Command::new(vxc)
-            .args([
-                "--link-interface",
-                artifact.to_str().unwrap(),
-                app.to_str().unwrap(),
-                "--action",
-                "print-ast",
-            ])
-            .stdout(std::process::Stdio::null())
-            .output()
-            .expect("run vxc --link-interface");
-        String::from_utf8_lossy(&out.stderr).into_owned()
-    };
-
-    let refused = check_against(&vxlib);
+    let refused = link_check_stderr(vxc, &vxlib, &app);
     assert!(
         refused.contains("E5001") && refused.contains("double"),
         "an unguarded call to an imported `unsafe fn` must be refused from the artifact's \
          signature alone, got:\n{refused}"
     );
 
-    let accepted = check_against(&safevxlib);
+    let accepted = link_check_stderr(vxc, &safevxlib, &app);
     assert!(
         !accepted.contains("E5001"),
         "the same call against a safe library must not be refused -- otherwise the check \

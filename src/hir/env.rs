@@ -693,23 +693,13 @@ impl<'a> TypeChecker<'a> {
                 uses.insert(id.name.to_string());
             }
             Expr::MemberAccess(m) => Self::extract_uses_expr(&m.base, uses),
-            Expr::BinaryOp(b) => {
-                Self::extract_uses_expr(&b.lhs, uses);
-                Self::extract_uses_expr(&b.rhs, uses);
-            }
-            Expr::RelationalOp(r) => {
-                Self::extract_uses_expr(&r.lhs, uses);
-                Self::extract_uses_expr(&r.rhs, uses);
-            }
-            Expr::LogicalOp(l) => {
-                Self::extract_uses_expr(&l.lhs, uses);
-                Self::extract_uses_expr(&l.rhs, uses);
-            }
+            // Two operands: an operator, an index, a range.
+            Expr::BinaryOp(_)
+            | Expr::RelationalOp(_)
+            | Expr::LogicalOp(_)
+            | Expr::IndexAccess(_)
+            | Expr::Range(_) => Self::extract_uses_pair(expr, uses),
             Expr::UnaryOp(u) => Self::extract_uses_expr(&u.expr, uses),
-            Expr::IndexAccess(i) => {
-                Self::extract_uses_expr(&i.base, uses);
-                Self::extract_uses_expr(&i.index, uses);
-            }
             Expr::Borrow(b) => Self::extract_uses_expr(&b.expr, uses),
             // `transfer(x, Memory::W)` reads `x`. Without this the block's liveness map has no
             // entry for a value whose only reader is a transfer, which makes a live tile look
@@ -718,10 +708,6 @@ impl<'a> TypeChecker<'a> {
             Expr::TransferPredicate(predicate) => {
                 Self::extract_uses_topology(&predicate.from, uses);
                 Self::extract_uses_topology(&predicate.to, uses);
-            }
-            Expr::Range(r) => {
-                Self::extract_uses_expr(&r.start, uses);
-                Self::extract_uses_expr(&r.end, uses);
             }
             Expr::Topology(topology_expr) => Self::extract_uses_topology(&topology_expr.top, uses),
             Expr::Dereference(d) => Self::extract_uses_expr(&d.expr, uses),
@@ -754,6 +740,36 @@ impl<'a> TypeChecker<'a> {
             | Expr::If(_)
             | Expr::UnsafeBlock(_)
             | Expr::ComptimeBlock(_) => Self::extract_uses_nested(expr, uses),
+        }
+    }
+
+    /// The part of [`Self::extract_uses_expr`] for an expression made of two others: a binary,
+    /// relational or logical operator, an index access, a range.
+    fn extract_uses_pair(expr: &Expr, uses: &mut std::collections::HashSet<String>) {
+        match expr {
+            Expr::BinaryOp(b) => {
+                Self::extract_uses_expr(&b.lhs, uses);
+                Self::extract_uses_expr(&b.rhs, uses);
+            }
+            Expr::RelationalOp(r) => {
+                Self::extract_uses_expr(&r.lhs, uses);
+                Self::extract_uses_expr(&r.rhs, uses);
+            }
+            Expr::LogicalOp(l) => {
+                Self::extract_uses_expr(&l.lhs, uses);
+                Self::extract_uses_expr(&l.rhs, uses);
+            }
+            Expr::IndexAccess(i) => {
+                Self::extract_uses_expr(&i.base, uses);
+                Self::extract_uses_expr(&i.index, uses);
+            }
+            Expr::Range(r) => {
+                Self::extract_uses_expr(&r.start, uses);
+                Self::extract_uses_expr(&r.end, uses);
+            }
+            // Every other kind of expression is handled by `extract_uses_expr`, which has
+            // no catch-all, so a new kind of expression cannot be missed.
+            _ => {}
         }
     }
 

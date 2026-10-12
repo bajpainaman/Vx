@@ -250,7 +250,7 @@ enum Stated {
     Space,
 }
 
-/// The public reading of [`Stated`], for callers that must derive the other half themselves.
+/// The public reading of `Stated`, for callers that must derive the other half themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Written {
     /// The source wrote the device, `Topology::X`.

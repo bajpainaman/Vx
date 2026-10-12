@@ -2511,8 +2511,15 @@ impl<'r> Lowerer<'r> {
                 }
             }
         }
+        self.finish_match(depth, merge);
+        Ok(())
+    }
+
+    /// The end of a statement `match`: close the arm scopes down to `depth`, and open the
+    /// `merge` block that every arm branches to. When no default arm matched, the final else
+    /// block falls through to the merge.
+    fn finish_match(&mut self, depth: usize, merge: u32) {
         self.close_blocks_to(depth);
-        // No wildcard matched: the final else block falls through to the merge.
         if !self.block_terminated() {
             self.emit_effect(Opcode::Br, Register(0), Register(0), u64::from(merge));
         }
@@ -2522,7 +2529,6 @@ impl<'r> Lowerer<'r> {
             Register(0),
             u64::from(merge),
         );
-        Ok(())
     }
 
     /// The enum a `match` is over, when that enum has a variant that carries a value
@@ -2721,16 +2727,7 @@ impl<'r> Lowerer<'r> {
                 }
             }
         }
-        self.close_blocks_to(depth);
-        if !self.block_terminated() {
-            self.emit_effect(Opcode::Br, Register(0), Register(0), u64::from(merge));
-        }
-        self.emit_effect(
-            Opcode::BlockStart,
-            Register(0),
-            Register(0),
-            u64::from(merge),
-        );
+        self.finish_match(depth, merge);
         Ok(())
     }
 
@@ -3012,25 +3009,7 @@ impl<'r> Lowerer<'r> {
         self.emit_effect(Opcode::Store, slot.reg, rhs.reg, 0);
         self.emit_effect(Opcode::Br, Register(0), Register(0), u64::from(merge_b));
 
-        // The short-circuit constant: `false` for `&&`, `true` for `||`.
-        self.emit_effect(
-            Opcode::BlockStart,
-            Register(0),
-            Register(0),
-            u64::from(short_b),
-        );
-        let imm = match e.op {
-            LogicalOp::And => 0,
-            LogicalOp::Or => 1,
-        };
-        let konst = self.emit_value(
-            Opcode::Const,
-            (Register(0), Register(0)),
-            ElementType::Bool,
-            imm,
-        );
-        self.emit_effect(Opcode::Store, slot.reg, konst.reg, 0);
-        self.emit_effect(Opcode::Br, Register(0), Register(0), u64::from(merge_b));
+        self.emit_short_circuit_block(&e.op, slot.reg, short_b, merge_b);
 
         self.emit_effect(
             Opcode::BlockStart,
@@ -3044,6 +3023,36 @@ impl<'r> Lowerer<'r> {
             ElementType::Bool,
             0,
         ))
+    }
+
+    /// The block of `lower_logical` taken when the left operand decides the result on its own:
+    /// `short_b` stores the short-circuit constant into `slot` (`false` for `&&`, `true` for
+    /// `||`) and branches to `merge_b`.
+    fn emit_short_circuit_block(
+        &mut self,
+        op: &LogicalOp,
+        slot: Register,
+        short_b: u32,
+        merge_b: u32,
+    ) {
+        self.emit_effect(
+            Opcode::BlockStart,
+            Register(0),
+            Register(0),
+            u64::from(short_b),
+        );
+        let imm = match op {
+            LogicalOp::And => 0,
+            LogicalOp::Or => 1,
+        };
+        let konst = self.emit_value(
+            Opcode::Const,
+            (Register(0), Register(0)),
+            ElementType::Bool,
+            imm,
+        );
+        self.emit_effect(Opcode::Store, slot, konst.reg, 0);
+        self.emit_effect(Opcode::Br, Register(0), Register(0), u64::from(merge_b));
     }
 
     /// Lower an infinite `loop { body }`: a header block the body branches back to, plus an exit
@@ -3193,7 +3202,24 @@ impl<'r> Lowerer<'r> {
                 ty: LoweredTy::Scalar(elem.clone()),
             },
         );
+        self.emit_for_range_blocks(f, (i_slot.reg, end_slot.reg), elem, step_imm)
+    }
 
+    /// The blocks of a `for` over a range, once the loop variable and the bound are in their
+    /// slots (`i_slot` and `end_slot`): a header that tests `i < end`, the body, a latch that
+    /// steps `i` and goes back to the header, and the exit. `step_imm` is the tag the step's add
+    /// carries for a parallel loop, or 0.
+    ///
+    /// # Errors
+    ///
+    /// Declines when a statement in the body cannot be lowered.
+    fn emit_for_range_blocks(
+        &mut self,
+        f: &crate::syntax::ForLoopStmt,
+        (i_slot, end_slot): (Register, Register),
+        elem: ElementType,
+        step_imm: u64,
+    ) -> Lowered<()> {
         let header = self.new_block();
         let body_b = self.new_block();
         let latch = self.new_block();
@@ -3207,7 +3233,7 @@ impl<'r> Lowerer<'r> {
             Register(0),
             u64::from(header),
         );
-        self.emit_for_test(i_slot.reg, end_slot.reg, &elem, pack_targets(body_b, exit));
+        self.emit_for_test(i_slot, end_slot, &elem, pack_targets(body_b, exit));
 
         // body
         self.emit_effect(
@@ -3230,7 +3256,7 @@ impl<'r> Lowerer<'r> {
             Register(0),
             u64::from(latch),
         );
-        self.emit_for_step(i_slot.reg, elem, step_imm);
+        self.emit_for_step(i_slot, elem, step_imm);
         self.emit_effect(Opcode::Br, Register(0), Register(0), u64::from(header));
 
         self.emit_effect(
@@ -7384,7 +7410,7 @@ fn encode_imm(s: &str, elem: &ElementType) -> Option<u64> {
 }
 
 /// Debug-only structural check on a worker's flat HIR: every value `type_idx` is in-bounds (effect
-/// instructions carry the [`NO_TYPE`] sentinel), every operand an opcode reads names a
+/// instructions carry the `NO_TYPE` sentinel), every operand an opcode reads names a
 /// strictly-earlier instruction (temporaries are block-local, so the linear check still captures SSA
 /// dominance), and every branch targets a declared block. One worker holds exactly one function's
 /// stream.

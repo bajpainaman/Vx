@@ -52,7 +52,7 @@ fn which(tool: &str) -> Result<PathBuf, ()> {
         .arg("-c")
         .arg(format!("command -v {tool}"))
         .output()
-        .map_err(|_| ())?;
+        .map_err(|_sh_did_not_start| ())?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() {
         Err(())

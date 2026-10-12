@@ -1,8 +1,15 @@
+//! A scratch program that checks MLIR accepts the debug-info location attributes the compiler
+//! generates.
 use anyhow::{Context as AnyhowContext, Result};
 use melior::ir::operation::OperationLike;
 use melior::ir::BlockLike;
 use melior::Context;
 
+/// Parses a small module with a debug-info location and prints that location.
+///
+/// # Errors
+///
+/// Returns an error when MLIR cannot parse the module, or the module has no operation.
 fn main() -> Result<()> {
     let context = Context::new();
     melior::dialect::DialectHandle::llvm().register_dialect(&context);

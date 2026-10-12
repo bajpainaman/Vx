@@ -1,3 +1,11 @@
+//! Stress tests that build very large or deeply nested Vx programs and run the lexer, the
+//! parser and the type checker over them.
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
+
 mod vx_generator;
 
 use vx_generator::{FunctionBuilder, ModuleBuilder, StructBuilder};
@@ -6,7 +14,7 @@ use vxc::lexer::Lexer;
 use vxc::parser::Parser;
 
 #[test]
-#[ignore]
+#[ignore = "a slow stress test; run it on purpose with --ignored"]
 fn test_stress_broad_ast_core_saturation() -> Result<(), String> {
     let mut module = ModuleBuilder::new();
 
@@ -64,7 +72,7 @@ fn test_stress_broad_ast_core_saturation() -> Result<(), String> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "a slow stress test; run it on purpose with --ignored"]
 fn test_stress_deep_control_flow_nesting() -> Result<(), String> {
     let mut module = ModuleBuilder::new();
 
@@ -123,7 +131,7 @@ fn test_stress_deep_control_flow_nesting() -> Result<(), String> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "a slow stress test; run it on purpose with --ignored"]
 fn test_stress_massive_struct_definitions() -> Result<(), String> {
     let mut module = ModuleBuilder::new();
     let num_structs = 500;

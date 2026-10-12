@@ -25,6 +25,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+//! Runs the Vx benchmarks and prints what they report; `compare` also builds each one in
+//! C++ and compares the two.
+
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -140,6 +143,11 @@ fn records_from(benchmark: &str, stdout: &str) -> Vec<Record> {
         .collect()
 }
 
+/// The benchmark files named in `benchmarks/manifest.txt`, as paths under `root`.
+///
+/// # Errors
+///
+/// Returns an error when the manifest cannot be read.
 fn manifest_entries(root: &Path) -> Result<Vec<PathBuf>, String> {
     let path = root.join("benchmarks/manifest.txt");
     let text = std::fs::read_to_string(&path)
@@ -160,6 +168,8 @@ fn main() -> ExitCode {
     }
 }
 
+/// Runs every benchmark in the manifest and prints what they measured. The exit code is a
+/// failure when any benchmark could not run or reported nothing.
 fn run_manifest() -> ExitCode {
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let entries = match manifest_entries(&root) {
@@ -183,53 +193,11 @@ fn run_manifest() -> ExitCode {
     let mut failed = Vec::new();
 
     for path in &entries {
-        let rel = path
-            .strip_prefix(&root)
-            .unwrap_or(path)
-            .display()
-            .to_string();
-        if !path.exists() {
-            failed.push(format!("{rel}: listed in the manifest but does not exist"));
-            continue;
-        }
-        let out = match Command::new(&vxc).arg(path).arg("--run").output() {
-            Ok(o) => o,
-            Err(e) => {
-                failed.push(format!("{rel}: could not run {}: {e}", vxc.display()));
-                continue;
-            }
-        };
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let mine = records_from(&rel, &stdout);
-        if !out.status.success() {
-            failed.push(format!("{rel}: exited {}", out.status));
-        } else if mine.is_empty() {
-            // The case the old runner could not see: it ran, it succeeded, and it
-            // measured nothing.
-            failed.push(format!("{rel}: ran but reported no measurement"));
-        }
-        records.extend(mine);
+        run_entry(&vxc, &root, path, &mut records, &mut failed);
     }
 
     if !records.is_empty() {
-        let w = records
-            .iter()
-            .map(|r| r.name.len())
-            .max()
-            .unwrap_or(4)
-            .max(4);
-        println!("{:<w$}  {:>14}  unit", "name", "value", w = w);
-        for r in &records {
-            println!(
-                "{:<w$}  {:>14.9}  {}   ({})",
-                r.name,
-                r.value,
-                r.unit,
-                r.benchmark,
-                w = w
-            );
-        }
-        println!();
+        print_records(&records);
     }
 
     if failed.is_empty() {
@@ -252,11 +220,71 @@ fn run_manifest() -> ExitCode {
     }
 }
 
+/// Runs one benchmark with `vxc --run` and keeps what it reported. A benchmark that is
+/// missing, cannot start, exits with an error or reports nothing is added to `failed`.
+fn run_entry(
+    vxc: &Path,
+    root: &Path,
+    path: &Path,
+    records: &mut Vec<Record>,
+    failed: &mut Vec<String>,
+) {
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    if !path.exists() {
+        failed.push(format!("{rel}: listed in the manifest but does not exist"));
+        return;
+    }
+    let out = match Command::new(vxc).arg(path).arg("--run").output() {
+        Ok(o) => o,
+        Err(e) => {
+            failed.push(format!("{rel}: could not run {}: {e}", vxc.display()));
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mine = records_from(&rel, &stdout);
+    if !out.status.success() {
+        failed.push(format!("{rel}: exited {}", out.status));
+    } else if mine.is_empty() {
+        // The case the old runner could not see: it ran, it succeeded, and it
+        // measured nothing.
+        failed.push(format!("{rel}: ran but reported no measurement"));
+    }
+    records.extend(mine);
+}
+
+/// Prints one line per measurement, with the names lined up.
+fn print_records(records: &[Record]) {
+    let w = records
+        .iter()
+        .map(|r| r.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    println!("{:<w$}  {:>14}  unit", "name", "value", w = w);
+    for r in records {
+        println!(
+            "{:<w$}  {:>14.9}  {}   ({})",
+            r.name,
+            r.value,
+            r.unit,
+            r.benchmark,
+            w = w
+        );
+    }
+    println!();
+}
+
 /// `cargo vx-bench compare`: build each benchmark in Vx and in C++, run the programs in
 /// alternating rounds, and compare what they report.
 mod compare {
     use super::{capture, provenance, records_from, vxc_path, CompareArgs, Record};
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitCode};
 
@@ -275,6 +303,30 @@ mod compare {
         results: Vec<f64>,
     }
 
+    /// What one set of samples is for: (benchmark, build label, record name).
+    type SampleKey = (String, String, String);
+
+    /// Who produced the numbers: the commit, the machine and its CPU.
+    struct RunInfo {
+        commit: String,
+        machine: String,
+        cpu_model: String,
+    }
+
+    /// One line of a comparison table: one build's time and answer for one quantity.
+    struct Row {
+        benchmark: String,
+        quantity: String,
+        label: String,
+        implementation: String,
+        median: f64,
+        min: f64,
+        max: f64,
+        runs: usize,
+        result: Option<f64>,
+        result_varies: bool,
+    }
+
     fn median(v: &[f64]) -> f64 {
         let mut s = v.to_vec();
         s.sort_by(f64::total_cmp);
@@ -286,6 +338,12 @@ mod compare {
         }
     }
 
+    /// Runs `cmd` to the end and returns its stdout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, with the program's output in it, when `cmd` cannot start or exits
+    /// with a failure status.
     fn run_to_completion(mut cmd: Command, what: &str) -> Result<String, String> {
         let out = cmd
             .output()
@@ -302,6 +360,11 @@ mod compare {
     }
 
     /// Compiles `src` with `vxc --action emit-obj -O3` and links it the way `--run` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `vxc` or the linker fails, when `vxc` writes no object file,
+    /// or when the runtime libraries to link cannot be found.
     fn build_vx(vxc: &Path, src: &Path, out_dir: &Path, stem: &str) -> Result<PathBuf, String> {
         let obj = out_dir.join(format!("{stem}.o"));
         let exe = out_dir.join(format!("{stem}-vx"));
@@ -339,6 +402,11 @@ mod compare {
         Ok(exe)
     }
 
+    /// Compiles `src` with a C++ compiler at `-O3`, with `-ffast-math` too when asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the compiler cannot start or fails.
     fn build_cxx(
         compiler: &str,
         fast_math: bool,
@@ -346,7 +414,11 @@ mod compare {
         out_dir: &Path,
         stem: &str,
     ) -> Result<PathBuf, String> {
-        let tag = compiler.replace(['+', '/'], "p") + if fast_math { "-fast" } else { "" };
+        let tag = format!(
+            "{}{}",
+            compiler.replace(['+', '/'], "p"),
+            if fast_math { "-fast" } else { "" }
+        );
         let exe = out_dir.join(format!("{stem}-{tag}"));
         let mut cmd = Command::new(compiler);
         cmd.args(["-O3", "-march=native", "-std=c++20"]);
@@ -359,6 +431,11 @@ mod compare {
     }
 
     /// The benchmarks in the suite, as (name, directory), sorted by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the suite directory cannot be read, or when a wanted name has
+    /// no directory in it.
     fn benchmarks(suite: &Path, wanted: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
         let mut found = Vec::new();
         let entries = std::fs::read_dir(suite)
@@ -386,7 +463,9 @@ mod compare {
                 '"' => out.push_str("\\\""),
                 '\\' => out.push_str("\\\\"),
                 '\n' => out.push_str("\\n"),
-                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c if (c as u32) < 0x20 => {
+                    let _ = write!(out, "\\u{:04x}", c as u32);
+                }
                 c => out.push(c),
             }
         }
@@ -394,32 +473,17 @@ mod compare {
         out
     }
 
-    pub fn run(args: &CompareArgs) -> ExitCode {
-        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let suite = root.join(&args.suite);
-        let list = match benchmarks(&suite, &args.names) {
-            Ok(l) if !l.is_empty() => l,
-            Ok(_) => {
-                eprintln!("error: {} holds no benchmarks", suite.display());
-                return ExitCode::FAILURE;
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let vxc = args.vxc.clone().unwrap_or_else(vxc_path);
-        let (commit, machine) = provenance();
-        let cpu_model = capture(
-            "sh",
-            &["-c", "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2"],
-        );
-        println!("commit {commit}   machine {machine}   cpu {cpu_model}");
-
-        // Build everything first, so a round measures only running.
-        let mut failures: Vec<String> = Vec::new();
+    /// Builds every benchmark in `list` every way it is written: in Vx, and in C++ with each
+    /// compiler, with and without `-ffast-math`. A build that fails is added to `failures`.
+    fn build_all(
+        args: &CompareArgs,
+        root: &Path,
+        list: &[(String, PathBuf)],
+        vxc: &Path,
+        failures: &mut Vec<String>,
+    ) -> Vec<Build> {
         let mut builds: Vec<Build> = Vec::new();
-        for (name, dir) in &list {
+        for (name, dir) in list {
             let out_dir = root.join("target/vx-bench").join(name);
             if let Err(e) = std::fs::create_dir_all(&out_dir) {
                 failures.push(format!("{name}: cannot create {}: {e}", out_dir.display()));
@@ -427,7 +491,7 @@ mod compare {
             }
             let vx_src = dir.join(format!("{name}.vx"));
             if vx_src.exists() {
-                match build_vx(&vxc, &vx_src, &out_dir, name) {
+                match build_vx(vxc, &vx_src, &out_dir, name) {
                     Ok(exe) => builds.push(Build {
                         benchmark: name.clone(),
                         label: "vx".into(),
@@ -460,19 +524,20 @@ mod compare {
                 }
             }
         }
-        println!(
-            "{} programs, {} rounds{}",
-            builds.len(),
-            args.rounds,
-            args.cpu
-                .map(|c| format!(", on cpu {c}"))
-                .unwrap_or_default()
-        );
-        println!();
+        builds
+    }
 
-        // (benchmark, label, record name) -> samples. Rounds alternate between programs, so
-        // a slow stretch of the machine is spread over all of them rather than one.
-        let mut samples: BTreeMap<(String, String, String), Samples> = BTreeMap::new();
+    /// Runs every program `args.rounds` times and gathers what each one reported. Rounds
+    /// alternate between programs, so a slow stretch of the machine is spread over all of
+    /// them rather than one. A program that fails or reports nothing is added to `failures`
+    /// and not run again.
+    fn run_rounds(
+        args: &CompareArgs,
+        root: &Path,
+        builds: &[Build],
+        failures: &mut Vec<String>,
+    ) -> BTreeMap<SampleKey, Samples> {
+        let mut samples: BTreeMap<SampleKey, Samples> = BTreeMap::new();
         let mut broken = vec![false; builds.len()];
         for _ in 0..args.rounds {
             for (i, b) in builds.iter().enumerate() {
@@ -487,7 +552,7 @@ mod compare {
                     }
                     None => Command::new(&b.exe),
                 };
-                cmd.current_dir(&root);
+                cmd.current_dir(root);
                 let what = format!("{} ({})", b.benchmark, b.label);
                 let stdout = match run_to_completion(cmd, &what) {
                     Ok(s) => s,
@@ -518,22 +583,14 @@ mod compare {
                 }
             }
         }
+        samples
+    }
 
-        // One table per benchmark and quantity; the quantity is the record name up to `/`.
-        struct Row {
-            benchmark: String,
-            quantity: String,
-            label: String,
-            implementation: String,
-            median: f64,
-            min: f64,
-            max: f64,
-            runs: usize,
-            result: Option<f64>,
-            result_varies: bool,
-        }
+    /// One row per build and quantity that reported a time, sorted by benchmark and
+    /// quantity, fastest first within a quantity. The quantity is the record name up to `/`.
+    fn rows_from(samples: &BTreeMap<SampleKey, Samples>) -> Vec<Row> {
         let mut rows: Vec<Row> = Vec::new();
-        for ((benchmark, label, name), s) in &samples {
+        for ((benchmark, label, name), s) in samples {
             if s.seconds.is_empty() {
                 continue;
             }
@@ -557,7 +614,12 @@ mod compare {
                 .cmp(&(&b.benchmark, &b.quantity))
                 .then(a.median.total_cmp(&b.median))
         });
+        rows
+    }
 
+    /// Prints one table per benchmark and quantity, and a footnote when an answer differs
+    /// from the fastest Vx answer by more than `tolerance`.
+    fn print_tables(rows: &[Row], tolerance: f64) {
         let mut differ = false;
         let mut i = 0;
         while i < rows.len() {
@@ -567,93 +629,163 @@ mod compare {
                     (&r.benchmark, &r.quantity) != (&rows[i].benchmark, &rows[i].quantity)
                 })
                 .map_or(rows.len(), |k| i + k);
-            let group = &rows[i..j];
-            // The fastest Vx implementation is the yardstick: `vs vx` above 1 is slower.
-            let vx = group
-                .iter()
-                .filter(|r| r.label == "vx")
-                .min_by(|a, b| a.median.total_cmp(&b.median));
-            let reference = vx.and_then(|r| r.result).or_else(|| group[0].result);
-            println!("{} / {}", group[0].benchmark, group[0].quantity);
-            println!(
-                "  {:<22} {:<30} {:>11} {:>11} {:>11} {:>7}  result",
-                "build", "implementation", "median ms", "min ms", "max ms", "vs vx"
-            );
-            for r in group {
-                let ratio = vx.map_or("-".to_string(), |v| format!("{:.2}x", r.median / v.median));
-                let mark = match (r.result, reference) {
-                    (Some(x), Some(y))
-                        if (x - y).abs() > args.tolerance * y.abs().max(f64::MIN_POSITIVE) =>
-                    {
-                        differ = true;
-                        " *"
-                    }
-                    _ => "",
-                };
-                let varies = if r.result_varies {
-                    " (changed between rounds)"
-                } else {
-                    ""
-                };
-                println!(
-                    "  {:<22} {:<30} {:>11.3} {:>11.3} {:>11.3} {:>7}  {}{mark}{varies}",
-                    r.label,
-                    r.implementation,
-                    r.median * 1e3,
-                    r.min * 1e3,
-                    r.max * 1e3,
-                    ratio,
-                    r.result.map_or("-".to_string(), |x| format!("{x}")),
-                );
-            }
-            println!();
+            differ |= print_group(&rows[i..j], tolerance);
             i = j;
         }
         if differ {
             println!(
-                "* differs from the fastest Vx answer by more than {} (relative). Not a failure: \
-                 a sum taken in another order is a different number.",
-                args.tolerance
+                "* differs from the fastest Vx answer by more than {tolerance} (relative). Not a \
+                 failure: a sum taken in another order is a different number."
             );
             println!();
         }
+    }
+
+    /// Prints the table for one benchmark and quantity, each build's time against the
+    /// fastest Vx build. Returns whether any answer differs from the reference one by more
+    /// than `tolerance`.
+    fn print_group(group: &[Row], tolerance: f64) -> bool {
+        // The fastest Vx implementation is the yardstick: `vs vx` above 1 is slower.
+        let vx = group
+            .iter()
+            .filter(|r| r.label == "vx")
+            .min_by(|a, b| a.median.total_cmp(&b.median));
+        let reference = vx.and_then(|r| r.result).or_else(|| group[0].result);
+        println!("{} / {}", group[0].benchmark, group[0].quantity);
+        println!(
+            "  {:<22} {:<30} {:>11} {:>11} {:>11} {:>7}  result",
+            "build", "implementation", "median ms", "min ms", "max ms", "vs vx"
+        );
+        let mut differ = false;
+        for r in group {
+            let ratio = vx.map_or("-".to_string(), |v| format!("{:.2}x", r.median / v.median));
+            let mark = match (r.result, reference) {
+                (Some(x), Some(y))
+                    if (x - y).abs() > tolerance * y.abs().max(f64::MIN_POSITIVE) =>
+                {
+                    differ = true;
+                    " *"
+                }
+                _ => "",
+            };
+            let varies = if r.result_varies {
+                " (changed between rounds)"
+            } else {
+                ""
+            };
+            println!(
+                "  {:<22} {:<30} {:>11.3} {:>11.3} {:>11.3} {:>7}  {}{mark}{varies}",
+                r.label,
+                r.implementation,
+                r.median * 1e3,
+                r.min * 1e3,
+                r.max * 1e3,
+                ratio,
+                r.result.map_or("-".to_string(), |x| format!("{x}")),
+            );
+        }
+        println!();
+        differ
+    }
+
+    /// The whole run as a JSON document: who ran it, every row, and every failure.
+    fn json_document(
+        args: &CompareArgs,
+        info: &RunInfo,
+        rows: &[Row],
+        failures: &[String],
+    ) -> String {
+        let mut out = format!(
+            "{{\n  \"commit\": {},\n  \"machine\": {},\n  \"cpu_model\": {},\n  \"rounds\": {},\n  \"cpu\": {},\n  \"rows\": [\n",
+            json_str(&info.commit),
+            json_str(&info.machine),
+            json_str(&info.cpu_model),
+            args.rounds,
+            args.cpu.map_or("null".to_string(), |c| c.to_string()),
+        );
+        let body: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "    {{\"benchmark\": {}, \"quantity\": {}, \"build\": {}, \"implementation\": {}, \"median_s\": {}, \"min_s\": {}, \"max_s\": {}, \"runs\": {}, \"result\": {}}}",
+                    json_str(&r.benchmark),
+                    json_str(&r.quantity),
+                    json_str(&r.label),
+                    json_str(&r.implementation),
+                    r.median,
+                    r.min,
+                    r.max,
+                    r.runs,
+                    r.result.map_or("null".to_string(), |x| format!("{x}")),
+                )
+            })
+            .collect();
+        out.push_str(&body.join(",\n"));
+        out.push_str("\n  ],\n  \"failures\": [");
+        out.push_str(
+            &failures
+                .iter()
+                .map(|f| json_str(f))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push_str("]\n}\n");
+        out
+    }
+
+    /// Records who is producing the numbers, and prints it.
+    fn run_info() -> RunInfo {
+        let (commit, machine) = provenance();
+        let cpu_model = capture(
+            "sh",
+            &["-c", "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2"],
+        );
+        println!("commit {commit}   machine {machine}   cpu {cpu_model}");
+        RunInfo {
+            commit,
+            machine,
+            cpu_model,
+        }
+    }
+
+    /// Builds, runs and compares the suite. The exit code is a failure when any build,
+    /// run or file write went wrong.
+    pub fn run(args: &CompareArgs) -> ExitCode {
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let suite = root.join(&args.suite);
+        let list = match benchmarks(&suite, &args.names) {
+            Ok(l) if !l.is_empty() => l,
+            Ok(_) => {
+                eprintln!("error: {} holds no benchmarks", suite.display());
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let vxc = args.vxc.clone().unwrap_or_else(vxc_path);
+        let info = run_info();
+
+        // Build everything first, so a round measures only running.
+        let mut failures: Vec<String> = Vec::new();
+        let builds = build_all(args, &root, &list, &vxc, &mut failures);
+        println!(
+            "{} programs, {} rounds{}",
+            builds.len(),
+            args.rounds,
+            args.cpu
+                .map(|c| format!(", on cpu {c}"))
+                .unwrap_or_default()
+        );
+        println!();
+
+        let samples = run_rounds(args, &root, &builds, &mut failures);
+        let rows = rows_from(&samples);
+        print_tables(&rows, args.tolerance);
 
         if let Some(path) = &args.json {
-            let mut out = format!(
-                "{{\n  \"commit\": {},\n  \"machine\": {},\n  \"cpu_model\": {},\n  \"rounds\": {},\n  \"cpu\": {},\n  \"rows\": [\n",
-                json_str(&commit),
-                json_str(&machine),
-                json_str(&cpu_model),
-                args.rounds,
-                args.cpu.map_or("null".to_string(), |c| c.to_string()),
-            );
-            let body: Vec<String> = rows
-                .iter()
-                .map(|r| {
-                    format!(
-                        "    {{\"benchmark\": {}, \"quantity\": {}, \"build\": {}, \"implementation\": {}, \"median_s\": {}, \"min_s\": {}, \"max_s\": {}, \"runs\": {}, \"result\": {}}}",
-                        json_str(&r.benchmark),
-                        json_str(&r.quantity),
-                        json_str(&r.label),
-                        json_str(&r.implementation),
-                        r.median,
-                        r.min,
-                        r.max,
-                        r.runs,
-                        r.result.map_or("null".to_string(), |x| format!("{x}")),
-                    )
-                })
-                .collect();
-            out.push_str(&body.join(",\n"));
-            out.push_str("\n  ],\n  \"failures\": [");
-            out.push_str(
-                &failures
-                    .iter()
-                    .map(|f| json_str(f))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
-            out.push_str("]\n}\n");
+            let out = json_document(args, &info, &rows, &failures);
             if let Err(e) = std::fs::write(path, out) {
                 failures.push(format!("cannot write {}: {e}", path.display()));
             } else {

@@ -58,7 +58,7 @@ pub enum DefPath<'a> {
 }
 
 impl DefPath<'_> {
-    /// Computes the deterministic 64-bit Word 1 for the `TypeId` (stable FNV-1a; see [`fnv1a_64`]).
+    /// Computes the deterministic 64-bit Word 1 for the `TypeId` (stable FNV-1a; see `fnv1a_64`).
     #[must_use]
     pub fn compute_symbol_hash(&self) -> u64 {
         match self {

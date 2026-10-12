@@ -36,12 +36,21 @@
 // stderr, so `cargo run --bin parallel_demo >/dev/null` shows just the report.
 //
 //===----------------------------------------------------------------------===//
+
+//! A demo program that compiles a generated corpus under 1, 2, 4 and 8 threads and reports the
+//! speed-up and that the result is the same each time.
 #[path = "corpus/mod.rs"]
 mod corpus;
 
 use std::io::Write;
 use std::time::Instant;
 
+/// Generates the corpus, compiles it under each thread count, and prints the report to stderr.
+///
+/// # Panics
+///
+/// Panics when the pipeline fails on the corpus, a thread pool cannot be built, or stderr
+/// cannot be written.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // Positional N is kept working: `parallel_demo 400` predates the flags and still means
@@ -61,37 +70,7 @@ fn main() {
 
     let report = std::io::stderr();
     let mut w = report.lock();
-    let hw = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
-    writeln!(
-        w,
-        "\n╔══════════════════════════════════════════════════════════════════╗"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "║   Vx parallel compiler — live demonstration                        ║"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "╚══════════════════════════════════════════════════════════════════╝"
-    )
-    .unwrap();
-    // The corpus line carries every parameter plus the two counts that decide how much interning
-    // there is to do, so this report is self-describing when it is pasted into an issue.
-    writeln!(w, "{}", c.log_line()).unwrap();
-    writeln!(w, "corpus dir: {}   (machine: {hw} cores)", c.dir.display()).unwrap();
-    writeln!(w, "pipeline: parse → resolve → freeze registry → parallel type-check + flat-HIR → dedup → SIMD-patch\n").unwrap();
-    writeln!(
-        w,
-        "  threads      wall-time    speedup    GID stream    order vs 1-thread"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "  ───────────────────────────────────────────────────────────────────"
-    )
-    .unwrap();
+    print_header(&mut w, &c);
 
     let mut baseline: Option<Vec<[u64; 4]>> = None;
     let mut single_time = 0.0f64;
@@ -133,6 +112,58 @@ fn main() {
         .unwrap();
     }
 
+    print_footer(&mut w);
+
+    // The corpus is left on disk. It is named by a digest of its parameters, so it is reused by the
+    // next run with the same flags rather than regenerated — and it can be inspected after the fact,
+    // which a PID-keyed directory deleted on exit could not be.
+}
+
+/// Prints the banner, the corpus description and the column headings of the report.
+///
+/// # Panics
+///
+/// Panics when the report cannot be written.
+fn print_header(w: &mut impl Write, c: &corpus::Corpus) {
+    let hw = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
+    writeln!(
+        w,
+        "\n╔══════════════════════════════════════════════════════════════════╗"
+    )
+    .unwrap();
+    writeln!(
+        w,
+        "║   Vx parallel compiler — live demonstration                        ║"
+    )
+    .unwrap();
+    writeln!(
+        w,
+        "╚══════════════════════════════════════════════════════════════════╝"
+    )
+    .unwrap();
+    // The corpus line carries every parameter plus the two counts that decide how much interning
+    // there is to do, so this report is self-describing when it is pasted into an issue.
+    writeln!(w, "{}", c.log_line()).unwrap();
+    writeln!(w, "corpus dir: {}   (machine: {hw} cores)", c.dir.display()).unwrap();
+    writeln!(w, "pipeline: parse → resolve → freeze registry → parallel type-check + flat-HIR → dedup → SIMD-patch\n").unwrap();
+    writeln!(
+        w,
+        "  threads      wall-time    speedup    GID stream    order vs 1-thread"
+    )
+    .unwrap();
+    writeln!(
+        w,
+        "  ───────────────────────────────────────────────────────────────────"
+    )
+    .unwrap();
+}
+
+/// Prints the closing notes that explain what the report shows.
+///
+/// # Panics
+///
+/// Panics when the report cannot be written.
+fn print_footer(w: &mut impl Write) {
     writeln!(w, "\n  What this shows").unwrap();
     writeln!(
         w,
@@ -164,8 +195,4 @@ fn main() {
         "    (pipeline.rs: flat_type_stream_order_is_deterministic_across_thread_counts).\n"
     )
     .unwrap();
-
-    // The corpus is left on disk. It is named by a digest of its parameters, so it is reused by the
-    // next run with the same flags rather than regenerated — and it can be inspected after the fact,
-    // which a PID-keyed directory deleted on exit could not be.
 }

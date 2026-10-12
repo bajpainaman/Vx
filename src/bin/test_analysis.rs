@@ -1,4 +1,12 @@
+//! A scratch program that loads one Vx file into the IDE analysis host and prints the hover
+//! and go-to-definition answers for a fixed position.
 use vxc::ide::AnalysisHost;
+
+/// Reads the file named on the command line and prints two IDE answers for it.
+///
+/// # Panics
+///
+/// Panics when the file cannot be read.
 fn main() {
     let mut host = AnalysisHost::new();
     let path = std::env::args().nth(1).unwrap_or_else(|| {

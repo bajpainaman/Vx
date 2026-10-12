@@ -5,7 +5,7 @@
 //! are that state sorted into the analyses it belongs to, so a new analysis brings its own struct
 //! rather than four more fields.
 //!
-//! The pattern is [`crate::hir::borrow_cx::BorrowCx`]'s, which did the same for borrow checking.
+//! The pattern is `crate::hir::borrow_cx::BorrowCx`'s, which did the same for borrow checking.
 //! Unlike `BorrowCx` these are plain state with no invariant to protect, so their fields stay
 //! reachable; when one grows an invariant, it should grow methods and hide the field the way
 //! `BorrowCx` hides `active_borrows`.

@@ -3,7 +3,7 @@
 //! borrow records only through this module.
 //!
 //! The point of the module boundary is that `active_borrows` is **private** — no code outside this file
-//! can read it. The only conflict-check read path is [`BorrowCx::live_borrows`], which sweeps dead
+//! can read it. The only conflict-check read path is `BorrowCx::live_borrows`, which sweeps dead
 //! borrows first, so a *new* access path physically cannot forget the sweep the way `check_borrow_expr`
 //! once did (#276): "remember to sweep" is now a type-system guarantee, not a convention. Save/restore
 //! and scope bookkeeping go through the other methods.

@@ -66,6 +66,30 @@ fn a_worker_name_resolves_to_a_machine() {
 /// recomputing six of them by hand, and a wrong recomputation would have looked exactly like a
 /// passing test. Here the two implementations are run against the same names and compared, so a
 /// divergence fails whatever the names are.
+/// Names to hash on both sides, spread over lengths, cases and separators, plus the empty name
+/// and the spellings a real machine file uses. None of these are built-in topology names, so
+/// every one takes the hash.
+fn probe_names() -> Vec<String> {
+    let mut names: Vec<String> = vec![
+        String::new(),
+        "A".into(),
+        "DecodeWorker".into(),
+        "PrefillWorker".into(),
+        "AcmeCore".into(),
+        "MyTPU".into(),
+        "L2_GPU5".into(),
+        "GPU6_VMEM".into(),
+        "DO2TX".into(),
+        "DSC0A".into(),
+        "a_very_long_declared_topology_name_that_keeps_going".into(),
+    ];
+    for i in 0..64 {
+        names.push(format!("H{i}"));
+        names.push(format!("SMEM_dev{i}"));
+    }
+    names
+}
+
 #[test]
 fn the_c_mirror_of_the_dispatch_hash_agrees_with_the_compiler() {
     let root = repo_root();
@@ -90,25 +114,7 @@ int main(int argc, char **argv) {{
     )
     .expect("write the mirror probe");
 
-    // Spread over lengths, cases and separators, plus the empty name and the spellings a real
-    // machine file uses. None of these are built-in topology names, so every one takes the hash.
-    let mut names: Vec<String> = vec![
-        String::new(),
-        "A".into(),
-        "DecodeWorker".into(),
-        "PrefillWorker".into(),
-        "AcmeCore".into(),
-        "MyTPU".into(),
-        "L2_GPU5".into(),
-        "GPU6_VMEM".into(),
-        "DO2TX".into(),
-        "DSC0A".into(),
-        "a_very_long_declared_topology_name_that_keeps_going".into(),
-    ];
-    for i in 0..64 {
-        names.push(format!("H{i}"));
-        names.push(format!("SMEM_dev{i}"));
-    }
+    let names = probe_names();
 
     let cxx = std::env::var("CC").unwrap_or_else(|_| "clang".to_string());
     let build = Command::new(&cxx)

@@ -1487,7 +1487,7 @@ impl TypeChecker<'_> {
     /// BOTH tiles, not just the source. The destination's declared
     /// shape is what `raw::extent(dst)` folds to and what the
     /// primitives delinearize against, so a lowering declaring an
-    /// [8,8] destination for a [2,2] site emitted 64 stores into a
+    /// `[8,8]` destination for a `[2,2]` site emitted 64 stores into a
     /// 4-element buffer -- admitted, with `written_bytes: 256`
     /// published beside `bytes: 16`.
     /// Both are statically shaped: that is one of the conditions that made this lowering

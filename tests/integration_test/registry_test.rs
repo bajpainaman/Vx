@@ -19,11 +19,11 @@ use vxc::registry::{ImmutableGlobalRegistry, TypeDefinition};
 #[test]
 fn test_valid_acyclic_registry() -> Result<(), String> {
     let mod_hash = compute_module_hash("core::test");
-    let struct_a_hash = DefPath::Named("A").compute_symbol_hash();
-    let struct_b_hash = DefPath::Named("B").compute_symbol_hash();
+    let sym_hash_a = DefPath::Named("A").compute_symbol_hash();
+    let sym_hash_b = DefPath::Named("B").compute_symbol_hash();
 
-    let id_a = TypeId::new(mod_hash, struct_a_hash, 0, 0);
-    let id_b = TypeId::new(mod_hash, struct_b_hash, 0, 0);
+    let id_a = TypeId::new(mod_hash, sym_hash_a, 0, 0);
+    let id_b = TypeId::new(mod_hash, sym_hash_b, 0, 0);
 
     let def_a = TypeDefinition {
         id: id_a,
@@ -72,11 +72,11 @@ fn test_valid_acyclic_registry() -> Result<(), String> {
 #[test]
 fn test_invalid_cyclic_registry() -> Result<(), String> {
     let mod_hash = compute_module_hash("core::test");
-    let struct_a_hash = DefPath::Named("A").compute_symbol_hash();
-    let struct_b_hash = DefPath::Named("B").compute_symbol_hash();
+    let sym_hash_a = DefPath::Named("A").compute_symbol_hash();
+    let sym_hash_b = DefPath::Named("B").compute_symbol_hash();
 
-    let id_a = TypeId::new(mod_hash, struct_a_hash, 0, 0);
-    let id_b = TypeId::new(mod_hash, struct_b_hash, 0, 0);
+    let id_a = TypeId::new(mod_hash, sym_hash_a, 0, 0);
+    let id_b = TypeId::new(mod_hash, sym_hash_b, 0, 0);
 
     let def_a = TypeDefinition {
         id: id_a,
@@ -100,9 +100,8 @@ fn test_invalid_cyclic_registry() -> Result<(), String> {
     if result.is_ok() {
         return Err("Assertion failed: result.is_err()".to_string());
     }
-    let err = match result {
-        Err(e) => e,
-        _ => return Err("Unexpected match".to_string()),
+    let Err(err) = result else {
+        return Err("Unexpected match".to_string());
     };
     if !(err.contains("Infinite-sized recursive layout detected")) {
         return Err(

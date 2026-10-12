@@ -12,7 +12,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-//! Macros that generate the C ABI functions for each standard library type.
+// A plain comment, not a `//!` doc: four test crates `include!` this file after their own
+// items, where an inner doc comment is a syntax error.
 
 /// The length of a caller's buffer as a `usize`. `None` when the length is zero or is too
 /// long for a Rust slice, which are the two cases where the caller has nothing to do.
@@ -588,7 +589,7 @@ macro_rules! instantiate_file_ffi {
                 return VX_FILE_STATUS_OK;
             }
             // A length that is not zero and still has no `usize` form is too long for a slice.
-            let Some(len) = $crate::ffi::macros::buffer_len(len) else {
+            let Some(len) = buffer_len(len) else {
                 return VX_FILE_STATUS_INVALID_ARGUMENT;
             };
             // SAFETY: the caller passes a live file that this library returned, and nothing
@@ -670,7 +671,7 @@ macro_rules! instantiate_file_ffi {
             if ptr.is_null() || buffer.is_null() {
                 return 0;
             }
-            let Some(len) = $crate::ffi::macros::buffer_len(len) else {
+            let Some(len) = buffer_len(len) else {
                 return 0;
             };
             // SAFETY: the caller passes a live pointer that this library returned, and nothing else
@@ -693,7 +694,7 @@ macro_rules! instantiate_file_ffi {
             if ptr.is_null() || buffer.is_null() {
                 return 0;
             }
-            let Some(len) = $crate::ffi::macros::buffer_len(len) else {
+            let Some(len) = buffer_len(len) else {
                 return 0;
             };
             // SAFETY: the caller passes a live pointer that this library returned, and nothing else
@@ -883,7 +884,7 @@ macro_rules! instantiate_tcp_stream_ffi {
             if ptr.is_null() || buffer.is_null() {
                 return 0;
             }
-            let Some(len) = $crate::ffi::macros::buffer_len(len) else {
+            let Some(len) = buffer_len(len) else {
                 return 0;
             };
             // SAFETY: the caller passes a live pointer that this library returned, and nothing else
@@ -906,7 +907,7 @@ macro_rules! instantiate_tcp_stream_ffi {
             if ptr.is_null() || buffer.is_null() {
                 return 0;
             }
-            let Some(len) = $crate::ffi::macros::buffer_len(len) else {
+            let Some(len) = buffer_len(len) else {
                 return 0;
             };
             // SAFETY: the caller passes a live pointer that this library returned, and nothing else
@@ -964,7 +965,7 @@ macro_rules! instantiate_udp_socket_ffi {
             if ptr.is_null() || buffer.is_null() {
                 return 0;
             }
-            let Some(len) = $crate::ffi::macros::buffer_len(len) else {
+            let Some(len) = buffer_len(len) else {
                 return 0;
             };
             // SAFETY: the caller passes a live pointer that this library returned, and nothing else
@@ -989,7 +990,7 @@ macro_rules! instantiate_udp_socket_ffi {
             if ptr.is_null() || buffer.is_null() || c_addr.is_null() {
                 return 0;
             }
-            let Some(len) = $crate::ffi::macros::buffer_len(len) else {
+            let Some(len) = buffer_len(len) else {
                 return 0;
             };
             // SAFETY: the caller passes a live pointer that this library returned, and nothing else
@@ -1081,7 +1082,7 @@ macro_rules! instantiate_stdio_ffi {
             if buffer.is_null() {
                 return 0;
             }
-            let Some(len) = $crate::ffi::macros::buffer_len(len) else {
+            let Some(len) = buffer_len(len) else {
                 return 0;
             };
             // SAFETY: the caller passes a buffer of at least `len` bytes that stays alive for this
@@ -1097,7 +1098,7 @@ macro_rules! instantiate_stdio_ffi {
             if buffer.is_null() {
                 return 0;
             }
-            let Some(len) = $crate::ffi::macros::buffer_len(len) else {
+            let Some(len) = buffer_len(len) else {
                 return 0;
             };
             // SAFETY: the caller passes a buffer of at least `len` bytes that stays alive for this
@@ -1113,7 +1114,7 @@ macro_rules! instantiate_stdio_ffi {
             if buffer.is_null() {
                 return 0;
             }
-            let Some(len) = $crate::ffi::macros::buffer_len(len) else {
+            let Some(len) = buffer_len(len) else {
                 return 0;
             };
             // SAFETY: the caller passes a buffer of at least `len` bytes that stays alive for this

@@ -249,7 +249,6 @@ impl<'c> LowerToMelior<'c> for syntax::TransferExpr {
         // Static byte size of the transferred tile, for the SS2 sub-space bump allocator.
         let tile_bytes = static_tile_bytes(gen, &self.expr);
         let (target_topology_id, source_topology_id) = transfer_topology_ids(self, gen);
-        let top_attr = IntegerAttribute::new(gen.i32_ty, i64::from(target_topology_id)).into();
 
         let mut target_ty = dynamic_target_type(gen, src_ty);
         let static_target = static_target_type(gen, &self.expr);
@@ -267,25 +266,13 @@ impl<'c> LowerToMelior<'c> for syntax::TransferExpr {
             }
         }
 
-        let mut transfer_builder = OperationBuilder::new("vx.transfer", location)
-            .add_operands(&[src_val])
-            .add_attributes(&[(Identifier::new(gen.context, "target_topology"), top_attr)]);
-
-        if source_topology_id != 0 {
-            let src_attr = IntegerAttribute::new(gen.i32_ty, i64::from(source_topology_id)).into();
-            transfer_builder = transfer_builder
-                .add_attributes(&[(Identifier::new(gen.context, "source_topology"), src_attr)]);
-        }
-
-        // The bandwidth-derived roofline cost (set by sema when the memory hierarchy declares
-        // bandwidths). Emitting it makes the paper's data-movement cost visible in the IR.
-        // i64, not i32: a picosecond-resolution time cost overflows i32 at 4.3 ms, which any
-        // multi-gigabyte host transfer exceeds.
-        if let Some(cost) = self.cost {
-            let cost_attr = IntegerAttribute::new(gen.i64_ty, cost.cast_signed()).into();
-            transfer_builder = transfer_builder
-                .add_attributes(&[(Identifier::new(gen.context, "cost"), cost_attr)]);
-        }
+        let transfer_builder = transfer_builder_with_topologies(
+            self,
+            gen,
+            location,
+            src_val,
+            (target_topology_id, source_topology_id),
+        );
 
         let (transfer_builder, granule_bytes) = add_space_attrs(self, gen, transfer_builder);
         let mut transfer_builder = schedule_tile(
@@ -303,11 +290,7 @@ impl<'c> LowerToMelior<'c> for syntax::TransferExpr {
         // (src, dst) parameters bound to the source value and the placed tile.
         // Inlined, not called: a func.call inside the kernel region silently costs
         // the kernel its device twin (`isDeviceLowerableDialect` excludes func).
-        let user_lowering = self.lowering.as_ref().and_then(|(f, t, topo)| {
-            gen.transfer_impls
-                .get(&(f.name(), t.name(), topo.clone()))
-                .cloned()
-        });
+        let user_lowering = user_lowering_of(self, gen);
         if user_lowering.is_some() {
             transfer_builder = transfer_builder.add_attributes(&[(
                 Identifier::new(gen.context, "user_lowered"),
@@ -336,6 +319,52 @@ impl<'c> LowerToMelior<'c> for syntax::TransferExpr {
 
         Ok((result_val, target_ty, block))
     }
+}
+
+/// A `vx.transfer` of `src_val` with its target topology and, when they are known, its source
+/// topology and the cost of the move as attributes. The two ids are the target's and the
+/// source's, in that order; a source of 0 is unknown and gets no attribute.
+fn transfer_builder_with_topologies<'c>(
+    this: &syntax::TransferExpr,
+    gen: &MeliorGenerator<'c>,
+    location: melior::ir::Location<'c>,
+    src_val: Value<'c, 'c>,
+    (target_topology_id, source_topology_id): (i32, i32),
+) -> OperationBuilder<'c> {
+    let top_attr = IntegerAttribute::new(gen.i32_ty, i64::from(target_topology_id)).into();
+    let mut transfer_builder = OperationBuilder::new("vx.transfer", location)
+        .add_operands(&[src_val])
+        .add_attributes(&[(Identifier::new(gen.context, "target_topology"), top_attr)]);
+
+    if source_topology_id != 0 {
+        let src_attr = IntegerAttribute::new(gen.i32_ty, i64::from(source_topology_id)).into();
+        transfer_builder = transfer_builder
+            .add_attributes(&[(Identifier::new(gen.context, "source_topology"), src_attr)]);
+    }
+
+    // The bandwidth-derived roofline cost (set by sema when the memory hierarchy declares
+    // bandwidths). Emitting it makes the paper's data-movement cost visible in the IR.
+    // i64, not i32: a picosecond-resolution time cost overflows i32 at 4.3 ms, which any
+    // multi-gigabyte host transfer exceeds.
+    if let Some(cost) = this.cost {
+        let cost_attr = IntegerAttribute::new(gen.i64_ty, cost.cast_signed()).into();
+        transfer_builder =
+            transfer_builder.add_attributes(&[(Identifier::new(gen.context, "cost"), cost_attr)]);
+    }
+    transfer_builder
+}
+
+/// The function a user wrote to lower this transfer, when sema matched the site to one and the
+/// generator knows that function's body.
+fn user_lowering_of(
+    this: &syntax::TransferExpr,
+    gen: &MeliorGenerator<'_>,
+) -> Option<syntax::Function> {
+    this.lowering.as_ref().and_then(|(f, t, topo)| {
+        gen.transfer_impls
+            .get(&(f.name(), t.name(), topo.clone()))
+            .cloned()
+    })
 }
 
 /// The size in bytes of the tensor `expr` evaluates to, when its shape is known while

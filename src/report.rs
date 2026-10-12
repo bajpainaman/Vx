@@ -19,7 +19,7 @@
 /// there, against the space's declared capacity. Recorded for *every* placed space, not only
 /// those that overflow — an admitted program emits no capacity diagnostic, so this is the only
 /// place its resident total appears. Downstream that total is what turns a capacity verdict into
-/// an engine's required memory utilization (#285). See [`crate::hir::env::TypeChecker::resident_sets`].
+/// an engine's required memory utilization (#285). See `crate::hir::env::TypeChecker::resident_sets`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResidentSet {
     /// The memory space the tiles are placed in.
@@ -38,7 +38,7 @@ pub struct ResidentSet {
 /// declared cost of each hop. A direct transfer has one hop; a multi-hop route (synthesized when
 /// no direct edge exists) has one per staging step. `derived_cost` is the bandwidth-roofline cost
 /// when the declarations make it computable, which is what the emitted `vx.transfer` carries.
-/// See [`crate::hir::env::TypeChecker::staging_routes`] (#282).
+/// See `crate::hir::env::TypeChecker::staging_routes` (#282).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StagingRoute {
     /// The spaces traversed, source first: `[CPU_DRAM, HBM3e, SMEM]`.

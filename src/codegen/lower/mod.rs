@@ -321,7 +321,7 @@ fn lower_match_arm_body<'c>(
             }
         }
         if let Some(nb) = gen.generate_statement(stmt, b)? {
-            b = nb
+            b = nb;
         } else {
             terminated = true;
             break;

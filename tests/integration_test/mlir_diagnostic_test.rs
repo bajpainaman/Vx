@@ -2,6 +2,7 @@ use melior::{
     ir::{operation::OperationBuilder, operation::OperationLike, BlockLike, Location, Module},
     Context,
 };
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 #[test]
@@ -99,10 +100,8 @@ fn test_mlir_diagnostic_parse_error() -> Result<(), String> {
 
     // We want to capture the diagnostic
     context.attach_diagnostic_handler(move |diagnostic| {
-        captured_clone
-            .lock()
-            .unwrap()
-            .push_str(&format!("{diagnostic}"));
+        write!(captured_clone.lock().unwrap(), "{diagnostic}")
+            .expect("writing to a String cannot fail");
         true
     });
 
@@ -118,39 +117,8 @@ fn test_mlir_diagnostic_parse_error() -> Result<(), String> {
     Ok(())
 }
 
-#[test]
-fn test_vx_valid_program_emits_remark() -> Result<(), String> {
-    let registry = melior::dialect::DialectRegistry::new();
-    melior::utility::register_all_dialects(&registry);
-    melior::utility::register_all_passes();
-    vxc::codegen::register_vx_passes();
-
-    let context = Context::new();
-    context.append_dialect_registry(&registry);
-    context.load_all_available_dialects();
-    vxc::codegen::register_vx_dialect(&context);
-
-    // Enable optimization remarks directly on the context via our C++ wrapper
-    vxc::codegen::enable_optimization_remarks(&context);
-
-    let captured = Arc::new(Mutex::new(String::new()));
-    let captured_clone = captured.clone();
-
-    // We want to capture the diagnostic
-    context.attach_diagnostic_handler(move |diagnostic| {
-        captured_clone
-            .lock()
-            .unwrap()
-            .push_str(&format!("{diagnostic}"));
-        true
-    });
-
-    // 1. Compile a valid Vx program
-    let input = r"
-fn test_remark() -> f32 {
-    return 1.0;
-}
-";
+/// Parses `input` and type-checks every function in it. Fails if the checker reports an error.
+fn parse_and_type_check(input: &str) -> Result<vxc::syntax::Program, String> {
     let mut lexer = vxc::lexer::Lexer::new(input);
     let tokens = lexer.tokenize();
     let mut parser = vxc::parser::Parser::new(&tokens, input);
@@ -175,6 +143,41 @@ fn test_remark() -> f32 {
         .any(|d| d.level == vxc::diagnostic::DiagnosticLevel::Error)"
             .to_string());
     }
+    Ok(ast)
+}
+
+#[test]
+fn test_vx_valid_program_emits_remark() -> Result<(), String> {
+    let registry = melior::dialect::DialectRegistry::new();
+    melior::utility::register_all_dialects(&registry);
+    melior::utility::register_all_passes();
+    vxc::codegen::register_vx_passes();
+
+    let context = Context::new();
+    context.append_dialect_registry(&registry);
+    context.load_all_available_dialects();
+    vxc::codegen::register_vx_dialect(&context);
+
+    // Enable optimization remarks directly on the context via our C++ wrapper
+    vxc::codegen::enable_optimization_remarks(&context);
+
+    let captured = Arc::new(Mutex::new(String::new()));
+    let captured_clone = captured.clone();
+
+    // We want to capture the diagnostic
+    context.attach_diagnostic_handler(move |diagnostic| {
+        write!(captured_clone.lock().unwrap(), "{diagnostic}")
+            .expect("writing to a String cannot fail");
+        true
+    });
+
+    // 1. Compile a valid Vx program
+    let input = r"
+fn test_remark() -> f32 {
+    return 1.0;
+}
+";
+    let ast = parse_and_type_check(input)?;
 
     // Generate MLIR
     let module_syntaxes = std::collections::HashMap::new();

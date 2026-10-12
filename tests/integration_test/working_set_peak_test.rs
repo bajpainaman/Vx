@@ -270,7 +270,10 @@ fn resident(log: &str) -> Option<(u64, usize)> {
         let end = rest.find(|c: char| !c.is_ascii_digit())?;
         rest[..end].parse().ok()
     };
-    Some((field("total_bytes")?, field("tiles")? as usize))
+    Some((
+        field("total_bytes")?,
+        usize::try_from(field("tiles")?).ok()?,
+    ))
 }
 
 #[test]

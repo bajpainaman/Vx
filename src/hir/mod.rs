@@ -11,11 +11,11 @@
 //===----------------------------------------------------------------------===//
 
 use crate::syntax::{
-    decl, ArrayExpr, AsCastExpr, AssertStmt, AssignStmt, BinaryOp, BinaryOpExpr, BinaryOperator,
-    BorrowExpr, CompoundAssignStmt, ComptimeBlockExpr, DereferenceExpr, Dim, DropStmt, ElementType,
-    EnumDecl, EnumVariantExpr, Expr, ExprStmtStmt, ForLoopStmt, Function, FunctionCallExpr,
-    GradExpr, IdentifierExpr, IfExpr, IndexAccessExpr, IndirectCallExpr, JvpExpr, LetDeclStmt,
-    LogicalOp, LogicalOpExpr, LoopStmt, Mangle, MatchArm, MatchExpr, MemberAccessExpr, MemorySpace,
+    decl, ArrayExpr, AsCastExpr, AssertStmt, AssignStmt, BinaryOp, BinaryOpExpr, BorrowExpr,
+    CompoundAssignStmt, ComptimeBlockExpr, DereferenceExpr, Dim, DropStmt, ElementType, EnumDecl,
+    EnumVariantExpr, Expr, ExprStmtStmt, ForLoopStmt, Function, FunctionCallExpr, GradExpr,
+    IdentifierExpr, IfExpr, IndexAccessExpr, IndirectCallExpr, JvpExpr, LetDeclStmt, LogicalOp,
+    LogicalOpExpr, LoopStmt, Mangle, MatchArm, MatchExpr, MemberAccessExpr, MemorySpace,
     MemorySpaceExpr, MethodCallExpr, NumberExpr, Pattern, Placement, RangeExpr, RelationalOp,
     RelationalOpExpr, ReturnStmt, Span, SpawnOnExpr, Statement, StringLiteralExpr, StructDecl,
     StructInitExpr, Topology, TopologyExpr, TransferExpr, Type, UnaryOp, UnaryOpExpr,

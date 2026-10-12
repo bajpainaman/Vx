@@ -477,7 +477,7 @@ impl<'a> Parser<'a> {
                     self.check(&TokenType::Comma) || self.check(&TokenType::RightAngle)
                 });
                 if let Some(ty) = parsed_type {
-                    type_args.push(ty)
+                    type_args.push(ty);
                 } else {
                     self.pos = saved_pos;
                     match self.parse_const_arg_expr() {

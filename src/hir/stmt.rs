@@ -1701,7 +1701,7 @@ impl TypeChecker<'_> {
     }
 
     /// Check an `assert`: require a boolean condition, evaluate it at comptime when possible, and
-    /// either flag a failure or fold it into the SMT constraints (Verified<T> discharge).
+    /// either flag a failure or fold it into the SMT constraints (`Verified<T>` discharge).
     fn check_assert_stmt(&mut self, assert: &mut AssertStmt, consume: bool, return_type: &Type) {
         let AssertStmt { expr, msg, span } = assert;
         let ty = self.check_expr_type_flag(expr, consume);

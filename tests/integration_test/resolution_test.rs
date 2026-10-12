@@ -44,8 +44,8 @@ fn peel(mut t: Type) -> Type {
             Type::Ref(inner, _)
             | Type::Pointer(inner, _, _)
             | Type::Verified(inner)
-            | Type::Pinned(inner, _) => *inner,
-            Type::Borrow { inner, .. } => *inner,
+            | Type::Pinned(inner, _)
+            | Type::Borrow { inner, .. } => *inner,
             other => return other,
         };
     }
@@ -559,9 +559,9 @@ fn test_nested_type_resolution() -> Result<(), String> {
     Ok(())
 }
 
-#[test]
-fn test_expr_and_stmt_resolution() -> Result<(), String> {
-    let mut module = VxModule {
+/// A module with a struct `Config` and a function whose `let` is annotated with that struct.
+fn module_with_a_let_of_config() -> VxModule {
+    VxModule {
         item_macros: Vec::new(),
         imports: Vec::new(),
         module_path: "core::app".into(),
@@ -605,7 +605,12 @@ fn test_expr_and_stmt_resolution() -> Result<(), String> {
             doc_comment: None,
         }],
         consts: vec![],
-    };
+    }
+}
+
+#[test]
+fn test_expr_and_stmt_resolution() -> Result<(), String> {
+    let mut module = module_with_a_let_of_config();
 
     let symbol_map = build_symbol_map(&[module.clone()]);
     module.resolve_names(&symbol_map, &[]);

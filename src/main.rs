@@ -12,6 +12,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+//! The `vxc` command line program: it parses the options and runs the compiler driver.
+
 use clap::Parser;
 use std::process;
 use vxc::driver::{CompilerDriver, DriverOptions};

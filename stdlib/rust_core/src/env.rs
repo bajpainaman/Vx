@@ -4,7 +4,7 @@ use std::ffi::CString;
 ///
 /// When executing via the JIT engine (lli), the process name is `lli` and the script
 /// is passed as a `.ll` file. We filter these out.
-/// When running as a standalone compiled executable, args[0] is the binary itself.
+/// When running as a standalone compiled executable, `args[0]` is the binary itself.
 #[allow(
     clippy::case_sensitive_file_extension_comparisons,
     reason = "the compiler always names the file it gives to lli with a lowercase `.ll`"

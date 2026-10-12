@@ -151,6 +151,22 @@ fn run_frontend(
     Ok(frontend)
 }
 
+/// A copy of every module with only its signatures: the input `GlobalAstEnv::build` reads.
+/// Each module's copy is independent, so a parallel compile makes them in parallel.
+fn clone_signatures(modules: &[VxModule], sched: Schedule) -> Vec<VxModule> {
+    if sched.is_seq() {
+        modules
+            .iter()
+            .map(super::syntax::decl::Program::clone_signature)
+            .collect()
+    } else {
+        modules
+            .par_iter()
+            .map(super::syntax::decl::Program::clone_signature)
+            .collect()
+    }
+}
+
 /// The frontend from macro expansion on, for modules a caller has already parsed. The file-path
 /// entry above parses exactly the files it is given; `vxc -j` loads modules through
 /// `ModuleLoader`, which follows imports. Both then run this.
@@ -198,19 +214,7 @@ fn run_frontend_on(
     // module's clone is independent. It stayed serial only because it was written before the phase
     // had a name, and it did not look like a phase. At 1,000 modules on 48 cores it was 16 ms of a
     // 265 ms compile -- 6%, entirely on the critical path, for a `map`.
-    let env_modules: Vec<VxModule> = timed("sig_clone", || {
-        if sched.is_seq() {
-            modules
-                .iter()
-                .map(super::syntax::decl::Program::clone_signature)
-                .collect()
-        } else {
-            modules
-                .par_iter()
-                .map(super::syntax::decl::Program::clone_signature)
-                .collect()
-        }
-    });
+    let env_modules: Vec<VxModule> = timed("sig_clone", || clone_signatures(&modules, sched));
     let mut env = timed("env_build", || GlobalAstEnv::build(&env_modules));
     // `clone_signature` above strips non-generic function bodies, so `build` could not summarize
     // their return provenance (#243). Refill from the full modules (bodies intact) before the

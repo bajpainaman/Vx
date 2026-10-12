@@ -1,34 +1,54 @@
-// This test expands the same raw-pointer FFI macro as the production library.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+//! Checks that the file open FFI call keeps a Unix path's bytes as they are, even when they
+//! are not valid UTF-8, and stops the program on an unknown open mode.
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "this test expands the same raw-pointer FFI macro as the runtime library"
+)]
+#![allow(unsafe_code, reason = "these tests call the C ABI the runtime exports")]
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 
-// A Unix filename is a byte sequence; opening it must not change invalid UTF-8 bytes.
 include!("../stdlib/rust_core/src/ffi/macros.rs");
 instantiate_file_ffi!();
+
+/// The child half of `file_open_rejects_unknown_modes`: opens the path from the environment
+/// with the given mode, which the FFI call is expected to abort on, and exits cleanly if it
+/// does not.
+#[allow(
+    clippy::exit,
+    reason = "the child process must end here instead of running the parent's checks"
+)]
+fn open_with_mode_from_environment(mode: &str) -> Result<(), String> {
+    let c_path = if std::env::var_os("VX_TEST_NULL_OPEN_PATH").is_some() {
+        None
+    } else {
+        let path = std::env::var_os("VX_TEST_OPEN_PATH")
+            .ok_or_else(|| "missing test file path".to_string())?;
+        Some(
+            std::ffi::CString::new(path.to_string_lossy().as_bytes())
+                .map_err(|error| format!("path contains a NUL byte: {error}"))?,
+        )
+    };
+    let file = vx_file_open(
+        c_path
+            .as_ref()
+            .map_or(std::ptr::null(), |path| path.as_ptr()),
+        mode.parse()
+            .map_err(|error| format!("invalid test mode: {error}"))?,
+    );
+    if !file.is_null() {
+        vx_file_drop(file);
+    }
+    std::process::exit(0);
+}
 
 #[test]
 fn file_open_rejects_unknown_modes() -> Result<(), String> {
     if let Ok(mode) = std::env::var("VX_TEST_INVALID_OPEN_MODE") {
-        let c_path = if std::env::var_os("VX_TEST_NULL_OPEN_PATH").is_some() {
-            None
-        } else {
-            let path = std::env::var_os("VX_TEST_OPEN_PATH")
-                .ok_or_else(|| "missing test file path".to_string())?;
-            Some(
-                std::ffi::CString::new(path.to_string_lossy().as_bytes())
-                    .map_err(|error| format!("path contains a NUL byte: {error}"))?,
-            )
-        };
-        let file = vx_file_open(
-            c_path
-                .as_ref()
-                .map_or(std::ptr::null(), |path| path.as_ptr()),
-            mode.parse()
-                .map_err(|error| format!("invalid test mode: {error}"))?,
-        );
-        if !file.is_null() {
-            vx_file_drop(file);
-        }
-        std::process::exit(0);
+        open_with_mode_from_environment(&mode)?;
     }
 
     let dir = tempfile::tempdir().map_err(|error| format!("create test directory: {error}"))?;

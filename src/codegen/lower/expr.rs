@@ -855,7 +855,7 @@ fn lower_comptime_block<'c>(
     let mut cur = block;
     for stmt in &this.stmts {
         if let Some(b) = gen.generate_statement(stmt, cur)? {
-            cur = b
+            cur = b;
         } else {
             cur = super::dead_continuation(cur);
             break;
@@ -5945,7 +5945,7 @@ struct PadTarget<'a> {
 /// - `t.reshape(shape, PadMode::Pad)`: into its first elements, both seen as flat, so the copy
 ///   keeps row order.
 /// - `t.pad(shape)` (`each_axis`): into a view of the new buffer with the source's sizes and
-///   the new buffer's strides, so element [i][j] stays at [i][j].
+///   the new buffer's strides, so element `[i][j]` stays at `[i][j]`.
 ///
 /// A source size known only at run time is read with `memref.dim`.
 ///

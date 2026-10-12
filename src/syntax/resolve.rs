@@ -22,7 +22,7 @@ use std::collections::HashMap;
 /// Everything the name-resolution walk needs to attach a GID to a nominal type: the *current*
 /// module's symbol table (local defs), the full cross-module symbol map, and this module's import
 /// index. Bundled into one reference so the recursive `resolve_names` walk threads a single value
-/// and cross-module lookup is centralized in [`ResolutionScope::resolve_nominal`] rather than
+/// and cross-module lookup is centralized in `ResolutionScope::resolve_nominal` rather than
 /// bolted onto each AST arm.
 pub struct ResolutionScope<'a> {
     current: Option<&'a SymbolTable>,
@@ -274,7 +274,7 @@ impl Expr {
                 }
             }
             Expr::UnsafeBlock(e) => {
-                resolve_names_in_block(&mut e.stmts, e.ret.as_deref_mut(), scope)
+                resolve_names_in_block(&mut e.stmts, e.ret.as_deref_mut(), scope);
             }
             Expr::ComptimeBlock(e) => {
                 resolve_names_in_block(&mut e.stmts, e.ret.as_deref_mut(), scope);

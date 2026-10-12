@@ -12,6 +12,8 @@
 // across all Vx projects.
 //
 //===----------------------------------------------------------------------===//
+
+//! The `vx-format` command line program: it rewrites Vx source files in the standard layout.
 use std::fs;
 use std::path::Path;
 
@@ -32,6 +34,11 @@ struct Cli {
     files: Vec<String>,
 }
 
+/// Formats one file in place and prints whether it changed.
+///
+/// # Errors
+///
+/// Returns an error when the file does not exist, cannot be read, or cannot be written.
 fn process_file(file_path: &str, indent_spaces: usize) -> anyhow::Result<()> {
     let path = Path::new(file_path);
     if !path.exists() {

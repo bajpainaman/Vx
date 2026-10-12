@@ -89,8 +89,11 @@ fn a_runtime_assert_emits_a_check() {
         .arg("emit-mlir")
         .output()
         .expect("run vxc");
-    let ir_text =
-        String::from_utf8_lossy(&ir.stdout).to_string() + &String::from_utf8_lossy(&ir.stderr);
+    let ir_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ir.stdout),
+        String::from_utf8_lossy(&ir.stderr)
+    );
     assert!(
         ir_text.contains("arith.cmpi slt"),
         "the condition the programmer wrote must be tested, not a stand-in:\n{ir_text}"
@@ -222,8 +225,11 @@ fn main() -> i32 {
             cmd.arg(f);
         }
         let out = cmd.output().expect("run vxc");
-        let ir = String::from_utf8_lossy(&out.stdout).to_string()
-            + &String::from_utf8_lossy(&out.stderr);
+        let ir = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
         let path = if flags.is_empty() { "flat" } else { "AST" };
         assert!(
             ir.contains("cf.assert"),

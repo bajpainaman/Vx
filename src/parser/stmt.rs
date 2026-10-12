@@ -525,7 +525,7 @@ impl<'a> Parser<'a> {
                     ty_ann,
                     expr,
                     span,
-                }))
+                }));
             }
             TuplePattern::Tuple(elems) => {
                 // The number of elements must match: counted here for a tuple literal, and

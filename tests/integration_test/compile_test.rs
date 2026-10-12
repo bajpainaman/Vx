@@ -12,6 +12,7 @@
 // successfully generates MLIR for positive tests.
 //
 //===----------------------------------------------------------------------===//
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, Once};
@@ -33,6 +34,9 @@ use rayon::prelude::*;
 
 use vxc::hir::TypeChecker;
 use vxc::jit::execute_mlir;
+use vxc::module_loader::ModuleError;
+use vxc::symbol::Symbol;
+use vxc::syntax::{Function, Program};
 
 // Whether the ANE/CoreML backend is actually available: the CoreML primitive models are
 // built by build.rs (needs coremltools + `xcrun coremlc`) into `ane-primitives/`. When they
@@ -57,7 +61,7 @@ pub(crate) fn expect_matches(out: &str, expect: &str) -> bool {
     while let Some(start) = rest.find("{{") {
         segments.push(&rest[..start]);
         if let Some(end) = rest[start..].find("}}") {
-            rest = &rest[start + end + 2..]
+            rest = &rest[start + end + 2..];
         } else {
             rest = "";
             break;
@@ -77,32 +81,32 @@ pub(crate) fn expect_matches(out: &str, expect: &str) -> bool {
     true
 }
 
-// Frontend Runner
-fn run_frontend_test(path: &Path, expect_pass: bool) -> Result<(), String> {
-    let source = fs::read_to_string(path).expect("Failed to read test file");
-
-    // A `pass` fixture written ahead of the compiler -- `// XFAIL: *` -- may not parse or
-    // check yet. That is the state it claims, so it is not a failure here; the RUN-line
-    // runner below reports the day it starts passing, which is the other half of the claim.
-    let xfail = source.contains("// XFAIL: *");
-
+/// Parse the fixture at `path` and every module it imports.
+///
+/// Returns the imported modules and the main module separately, since the runners check the
+/// main module and keep the imports as the environment it is checked in.
+fn load_program(path: &Path) -> Result<(Vec<Program>, Program), ModuleError> {
     let mut loader = vxc::module_loader::ModuleLoader::new();
-    if let Err(e) = loader.load_main(path.to_str().unwrap()) {
-        if !expect_pass || xfail {
-            return Ok(());
-        }
-        return Err(format!("Parse failed on {path:?}: {e}"));
-    }
+    loader.load_main(path.to_str().unwrap())?;
     let mut program_arr = loader.into_programs().expect("the fixture should load");
 
     let syntax_idx = program_arr
         .iter()
         .position(|p| p.module_path.as_ref() == path.to_str().unwrap())
         .unwrap();
-    let mut program = program_arr.remove(syntax_idx);
+    let program = program_arr.remove(syntax_idx);
+    Ok((program_arr, program))
+}
 
+/// Expand the macros in the imported modules and then in the main module, with every macro
+/// and trait default from any of them in scope.
+fn expand_macros(
+    path: &Path,
+    program_arr: &mut [Program],
+    program: &mut Program,
+) -> Result<(), String> {
     let mut global_macros = std::collections::HashMap::new();
-    for p in &program_arr {
+    for p in program_arr.iter() {
         for mac in &p.macros {
             global_macros.insert(mac.name.clone(), mac.rules.clone());
         }
@@ -113,24 +117,102 @@ fn run_frontend_test(path: &Path, expect_pass: bool) -> Result<(), String> {
     // The main module is held apart from its imports here, exactly as it is for the macro
     // table above, so the trait a default belongs to may be in either.
     let trait_defaults =
-        vxc::resolver::collect_trait_defaults(program_arr.iter().chain(std::iter::once(&program)));
+        vxc::resolver::collect_trait_defaults(program_arr.iter().chain(std::iter::once(&*program)));
     let expander = vxc::parser::MacroExpander::new(&global_macros, &trait_defaults);
-    for p in &mut program_arr {
+    for p in program_arr.iter_mut() {
         if let Err(e) = expander.expand_module(p) {
-            if !expect_pass || xfail {
-                return Ok(());
-            }
             return Err(format!(
                 "Macro expansion failed on {}: {}",
                 p.module_path, e
             ));
         }
     }
-    if let Err(e) = expander.expand_module(&mut program) {
+    if let Err(e) = expander.expand_module(program) {
+        return Err(format!("Macro expansion failed on {}: {e}", path.display()));
+    }
+    Ok(())
+}
+
+/// Type-check the main module, then the non-generic functions of its imports.
+///
+/// Checking the imports is what collects the generic instantiations they use, so codegen
+/// can monomorphize them. Mirrors `driver.rs::run_semantic_analysis`; library-internal
+/// diagnostics are dropped (this pass collects instantiations, it does not re-validate deps).
+fn check_program_and_imports(
+    checker: &mut TypeChecker<'_>,
+    program: &mut Program,
+    program_arr: &mut [Program],
+    path: &Path,
+) -> Result<(), String> {
+    for f in &mut program.functions {
+        checker.check_function(f);
+    }
+    let errors_before_imports = checker.errors.len();
+    for p in program_arr.iter_mut() {
+        for f in &mut p.functions {
+            if f.generics.is_empty() {
+                checker.check_function(f);
+            }
+        }
+    }
+    checker.errors.inner.truncate(errors_before_imports);
+    if checker
+        .errors
+        .iter()
+        .any(|d| d.level == vxc::diagnostic::DiagnosticLevel::Error)
+    {
+        return Err(format!(
+            "Semantic check failed on '{}':\n{:#?}",
+            path.display(),
+            checker.errors
+        ));
+    }
+    Ok(())
+}
+
+/// Replace the main module's functions with the checker's monomorphized copies plus the
+/// functions that had no generics to begin with.
+fn monomorphize(mut program: Program, mono_functions: Vec<(Function, u64)>) -> Program {
+    let mut orig_functions = program.functions;
+    orig_functions.retain(|f| f.generics.is_empty());
+
+    let mut new_functions: Vec<_> = mono_functions.into_iter().map(|(f, _)| f).collect();
+    new_functions.extend(orig_functions);
+    program.functions = new_functions;
+    program
+}
+
+/// An MLIR context with every dialect, the LLVM translations and the `vx` dialect loaded.
+fn mlir_context() -> melior::Context {
+    let context = melior::Context::new();
+    let registry = melior::dialect::DialectRegistry::new();
+    melior::utility::register_all_dialects(&registry);
+    context.append_dialect_registry(&registry);
+    context.load_all_available_dialects();
+    melior::utility::register_all_llvm_translations(&context);
+    vxc::codegen::register_vx_dialect(&context);
+    context
+}
+
+// Frontend Runner
+fn run_frontend_test(path: &Path, expect_pass: bool) -> Result<(), String> {
+    let source = fs::read_to_string(path).expect("Failed to read test file");
+
+    // A `pass` fixture written ahead of the compiler -- `// XFAIL: *` -- may not parse or
+    // check yet. That is the state it claims, so it is not a failure here; the RUN-line
+    // runner below reports the day it starts passing, which is the other half of the claim.
+    let xfail = source.contains("// XFAIL: *");
+
+    let (mut program_arr, mut program) = match load_program(path) {
+        Ok(loaded) => loaded,
+        Err(_) if !expect_pass || xfail => return Ok(()),
+        Err(e) => return Err(format!("Parse failed on {}: {e}", path.display())),
+    };
+    if let Err(e) = expand_macros(path, &mut program_arr, &mut program) {
         if !expect_pass || xfail {
             return Ok(());
         }
-        return Err(format!("Macro expansion failed on {path:?}: {e}"));
+        return Err(e);
     }
 
     let global_session = std::sync::Arc::new(vxc::session::GlobalSession::new(1));
@@ -157,13 +239,15 @@ fn run_frontend_test(path: &Path, expect_pass: bool) -> Result<(), String> {
                 return Ok(());
             }
             return Err(format!(
-                "Semantic analysis failed on {:?}:\n{:#?}",
-                path, checker.errors
+                "Semantic analysis failed on {}:\n{:#?}",
+                path.display(),
+                checker.errors
             ));
         }
     } else if is_valid {
         return Err(format!(
-            "Expected semantic failure on {path:?}, but it passed"
+            "Expected semantic failure on {}, but it passed",
+            path.display()
         ));
     }
 
@@ -212,8 +296,8 @@ fn filecheck(input: &str, match_file: &Path, prefix: Option<&str>) -> Result<(),
         return Ok(());
     }
     Err(format!(
-        "FileCheck failed on {:?}:\n{}{}",
-        match_file,
+        "FileCheck failed on {}:\n{}{}",
+        match_file.display(),
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     ))
@@ -229,43 +313,8 @@ fn run_middle_end_test(path: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut loader = vxc::module_loader::ModuleLoader::new();
-    loader
-        .load_main(path.to_str().unwrap())
-        .expect("Failed to parse");
-    let mut program_arr = loader.into_programs().expect("the fixture should load");
-
-    let syntax_idx = program_arr
-        .iter()
-        .position(|p| p.module_path.as_ref() == path.to_str().unwrap())
-        .unwrap();
-    let mut program = program_arr.remove(syntax_idx);
-
-    let mut global_macros = std::collections::HashMap::new();
-    for p in &program_arr {
-        for mac in &p.macros {
-            global_macros.insert(mac.name.clone(), mac.rules.clone());
-        }
-    }
-    for mac in &program.macros {
-        global_macros.insert(mac.name.clone(), mac.rules.clone());
-    }
-    // The main module is held apart from its imports here, exactly as it is for the macro
-    // table above, so the trait a default belongs to may be in either.
-    let trait_defaults =
-        vxc::resolver::collect_trait_defaults(program_arr.iter().chain(std::iter::once(&program)));
-    let expander = vxc::parser::MacroExpander::new(&global_macros, &trait_defaults);
-    for p in &mut program_arr {
-        if let Err(e) = expander.expand_module(p) {
-            return Err(format!(
-                "Macro expansion failed on {}: {}",
-                p.module_path, e
-            ));
-        }
-    }
-    if let Err(e) = expander.expand_module(&mut program) {
-        return Err(format!("Macro expansion failed on {path:?}: {e}"));
-    }
+    let (mut program_arr, mut program) = load_program(path).expect("Failed to parse");
+    expand_macros(path, &mut program_arr, &mut program)?;
 
     let global_session = std::sync::Arc::new(vxc::session::GlobalSession::new(1));
     let mut all_programs = program_arr.clone();
@@ -303,7 +352,11 @@ fn run_middle_end_test(path: &Path) -> Result<(), String> {
         .iter()
         .any(|d| d.level == vxc::diagnostic::DiagnosticLevel::Error)
     {
-        return Err(format!("Sema failed on {:?}: {:#?}", path, checker.errors));
+        return Err(format!(
+            "Sema failed on {}: {:#?}",
+            path.display(),
+            checker.errors
+        ));
     }
 
     // Structs generated during checking (e.g. a closure's `Closure_N` environment) must reach
@@ -311,23 +364,10 @@ fn run_middle_end_test(path: &Path) -> Result<(), String> {
     // Without this the harness cannot lower any closure, unlike the real compiler.
     let generated_structs = std::mem::take(&mut checker.mono.generated_structs);
 
-    let mut monomorphized_program = program;
-    let mut orig_functions = monomorphized_program.functions;
-    orig_functions.retain(|f| f.generics.is_empty());
-
-    let mut new_functions: Vec<_> = checker.mono.functions.into_iter().map(|(f, _)| f).collect();
-    new_functions.extend(orig_functions);
-    monomorphized_program.functions = new_functions;
+    let mut monomorphized_program = monomorphize(program, checker.mono.functions);
     monomorphized_program.structs.extend(generated_structs);
 
-    let context = melior::Context::new();
-    let registry = melior::dialect::DialectRegistry::new();
-    melior::utility::register_all_dialects(&registry);
-    context.append_dialect_registry(&registry);
-    context.load_all_available_dialects();
-    melior::utility::register_all_llvm_translations(&context);
-    vxc::codegen::register_vx_dialect(&context);
-
+    let context = mlir_context();
     let module_syntaxes = std::collections::HashMap::new();
 
     let mut codegen = vxc::codegen::MeliorGenerator::new(&context, "test".to_string());
@@ -339,36 +379,43 @@ fn run_middle_end_test(path: &Path) -> Result<(), String> {
     let mut module = codegen.into_module();
     let mlir_str = module.as_operation().to_string();
 
-    // Lower, as the compiler does. The harness used to stop at the MLIR text: a fixture could
-    // emit something that reads correctly, satisfy its CHECK lines, and be rejected by the real
-    // binary on the same input. Three fixtures were in exactly that state, each hiding a defect
-    // the suite reported as passing.
-    //
-    // `// XFAIL-LOWER:` marks one whose MLIR is what the fixture means to pin but which the
-    // lowering cannot yet accept. It is read in both directions, as the RUN-line XFAIL is: a
-    // marked fixture that starts lowering fails too, so the marker cannot outlive its bug.
+    lower_unless_marked_xfail(path, &source, &context, &mut module)?;
+
+    filecheck(&mlir_str, path, None)
+}
+
+/// Lower the module to LLVM, as the compiler does, and read the fixture's `XFAIL-LOWER`
+/// marker in both directions.
+///
+/// The harness used to stop at the MLIR text: a fixture could emit something that reads
+/// correctly, satisfy its CHECK lines, and be rejected by the real binary on the same input.
+/// Three fixtures were in exactly that state, each hiding a defect the suite reported as
+/// passing.
+///
+/// `// XFAIL-LOWER:` marks one whose MLIR is what the fixture means to pin but which the
+/// lowering cannot yet accept. It is read in both directions, as the RUN-line XFAIL is: a
+/// marked fixture that starts lowering fails too, so the marker cannot outlive its bug.
+fn lower_unless_marked_xfail<'c>(
+    path: &Path,
+    source: &str,
+    context: &'c melior::Context,
+    module: &mut melior::ir::Module<'c>,
+) -> Result<(), String> {
     let xfail_lower = source
         .lines()
         .find(|l| l.trim().starts_with("// XFAIL-LOWER:"))
         .map(|l| l.split_once("XFAIL-LOWER:").unwrap().1.trim().to_string());
-    match (
-        vxc::codegen::lower_to_llvm(&context, &mut module),
-        &xfail_lower,
-    ) {
-        (Err(e), None) => {
-            return Err(format!(
-                "{path:?} emits MLIR its own compiler cannot lower: {e}"
-            ))
-        }
-        (Ok(_), Some(reason)) => {
-            return Err(format!(
-                "{path:?} is marked `XFAIL-LOWER: {reason}`, but it lowers now. Remove the marker."
-            ))
-        }
-        _ => {}
+    match (vxc::codegen::lower_to_llvm(context, module), &xfail_lower) {
+        (Err(e), None) => Err(format!(
+            "{} emits MLIR its own compiler cannot lower: {e}",
+            path.display()
+        )),
+        (Ok(_), Some(reason)) => Err(format!(
+            "{} is marked `XFAIL-LOWER: {reason}`, but it lowers now. Remove the marker.",
+            path.display()
+        )),
+        _ => Ok(()),
     }
-
-    filecheck(&mlir_str, path, None)
 }
 
 // Warning Runner: type-checks the file (which must succeed with no errors) and asserts
@@ -383,7 +430,8 @@ fn run_warning_test(path: &Path) -> Result<(), String> {
         .collect();
     if want.is_empty() {
         return Err(format!(
-            "Warning test {path:?} has no `// WARN:` directives"
+            "Warning test {} has no `// WARN:` directives",
+            path.display()
         ));
     }
     // `// NO-WARN:` is the other direction: text that must NOT appear in any warning. A
@@ -396,39 +444,9 @@ fn run_warning_test(path: &Path) -> Result<(), String> {
         .map(|l| l.split_once("NO-WARN:").unwrap().1.trim().to_string())
         .collect();
 
-    let mut loader = vxc::module_loader::ModuleLoader::new();
-    loader
-        .load_main(path.to_str().unwrap())
-        .map_err(|e| format!("Parse failed on {path:?}: {e}"))?;
-    let mut program_arr = loader.into_programs().expect("the fixture should load");
-    let syntax_idx = program_arr
-        .iter()
-        .position(|p| p.module_path.as_ref() == path.to_str().unwrap())
-        .unwrap();
-    let mut program = program_arr.remove(syntax_idx);
-
-    let mut global_macros = std::collections::HashMap::new();
-    for p in &program_arr {
-        for mac in &p.macros {
-            global_macros.insert(mac.name.clone(), mac.rules.clone());
-        }
-    }
-    for mac in &program.macros {
-        global_macros.insert(mac.name.clone(), mac.rules.clone());
-    }
-    // The main module is held apart from its imports here, exactly as it is for the macro
-    // table above, so the trait a default belongs to may be in either.
-    let trait_defaults =
-        vxc::resolver::collect_trait_defaults(program_arr.iter().chain(std::iter::once(&program)));
-    let expander = vxc::parser::MacroExpander::new(&global_macros, &trait_defaults);
-    for p in &mut program_arr {
-        expander
-            .expand_module(p)
-            .map_err(|e| format!("Macro expansion failed on {}: {}", p.module_path, e))?;
-    }
-    expander
-        .expand_module(&mut program)
-        .map_err(|e| format!("Macro expansion failed on {path:?}: {e}"))?;
+    let (mut program_arr, mut program) =
+        load_program(path).map_err(|e| format!("Parse failed on {}: {e}", path.display()))?;
+    expand_macros(path, &mut program_arr, &mut program)?;
 
     let global_session = std::sync::Arc::new(vxc::session::GlobalSession::new(1));
     let mut all_programs = program_arr.clone();
@@ -452,8 +470,8 @@ fn run_warning_test(path: &Path) -> Result<(), String> {
         .collect();
     if !errors.is_empty() {
         return Err(format!(
-            "Warning test {:?} must type-check cleanly, but got errors:\n{}",
-            path,
+            "Warning test {} must type-check cleanly, but got errors:\n{}",
+            path.display(),
             errors.join("\n")
         ));
     }
@@ -464,21 +482,32 @@ fn run_warning_test(path: &Path) -> Result<(), String> {
         .filter(|d| d.level == vxc::diagnostic::DiagnosticLevel::Warning)
         .map(std::string::ToString::to_string)
         .collect();
-    for w in &want {
+    check_warning_directives(path, &want, &unwanted, &warnings)
+}
+
+/// Every `WARN:` text must appear in some warning, and no `NO-WARN:` text may.
+fn check_warning_directives(
+    path: &Path,
+    want: &[String],
+    unwanted: &[String],
+    warnings: &[String],
+) -> Result<(), String> {
+    for w in want {
         if !warnings.iter().any(|got| got.contains(w.as_str())) {
             return Err(format!(
-                "WARN check failed on {:?}: expected a warning containing `{}`.\nGot warnings:\n{}",
-                path,
+                "WARN check failed on {}: expected a warning containing `{}`.\nGot warnings:\n{}",
+                path.display(),
                 w,
                 warnings.join("\n")
             ));
         }
     }
-    for w in &unwanted {
+    for w in unwanted {
         if let Some(got) = warnings.iter().find(|got| got.contains(w.as_str())) {
             return Err(format!(
-                "NO-WARN check failed on {path:?}: `{w}` was not supposed to be warned about, \
-                 but got `{got}`."
+                "NO-WARN check failed on {}: `{w}` was not supposed to be warned about, \
+                 but got `{got}`.",
+                path.display()
             ));
         }
     }
@@ -504,47 +533,17 @@ fn run_backend_test(path: &Path) -> Result<(), String> {
         .map(|line| line.split_once("EXPECT:").unwrap().1.trim().to_string())
         .collect();
 
-    let mut loader = vxc::module_loader::ModuleLoader::new();
-    if let Err(e) = loader.load_main(path.to_str().unwrap()) {
-        return Err(format!(
-            "Frontend failed to parse '{}': {}",
-            path.display(),
-            e
-        ));
-    }
-    let mut program_arr = loader.into_programs().expect("the fixture should load");
-
-    let syntax_idx = program_arr
-        .iter()
-        .position(|p| p.module_path.as_ref() == path.to_str().unwrap())
-        .unwrap();
-    let mut program = program_arr.remove(syntax_idx);
-
-    let mut global_macros = std::collections::HashMap::new();
-    for p in &program_arr {
-        for mac in &p.macros {
-            global_macros.insert(mac.name.clone(), mac.rules.clone());
-        }
-    }
-    for mac in &program.macros {
-        global_macros.insert(mac.name.clone(), mac.rules.clone());
-    }
-    // The main module is held apart from its imports here, exactly as it is for the macro
-    // table above, so the trait a default belongs to may be in either.
-    let trait_defaults =
-        vxc::resolver::collect_trait_defaults(program_arr.iter().chain(std::iter::once(&program)));
-    let expander = vxc::parser::MacroExpander::new(&global_macros, &trait_defaults);
-    for p in &mut program_arr {
-        if let Err(e) = expander.expand_module(p) {
+    let (mut program_arr, mut program) = match load_program(path) {
+        Ok(loaded) => loaded,
+        Err(e) => {
             return Err(format!(
-                "Macro expansion failed on {}: {}",
-                p.module_path, e
-            ));
+                "Frontend failed to parse '{}': {}",
+                path.display(),
+                e
+            ))
         }
-    }
-    if let Err(e) = expander.expand_module(&mut program) {
-        return Err(format!("Macro expansion failed on {path:?}: {e}"));
-    }
+    };
+    expand_macros(path, &mut program_arr, &mut program)?;
 
     let global_session = std::sync::Arc::new(vxc::session::GlobalSession::new(1));
     let mut all_programs = program_arr.clone();
@@ -552,70 +551,15 @@ fn run_backend_test(path: &Path) -> Result<(), String> {
     let env = vxc::hir::GlobalAstEnv::build(&all_programs);
     let mut worker = vxc::session::LocalWorkerState::new(global_session.clone());
     let mut checker = TypeChecker::new(&env, &mut worker);
-    for f in &mut program.functions {
-        checker.check_function(f);
-    }
-    // #203: also check imported modules' non-generic bodies in place, so methods/generics they call
-    // only transitively get monomorphized for codegen (the env borrows `all_programs` clones, so
-    // `program_arr` is free to mutate). Mirrors `driver.rs::run_semantic_analysis`; library-internal
-    // diagnostics are dropped (this pass collects instantiations, it does not re-validate deps).
-    let errors_before_imports = checker.errors.len();
-    for p in &mut program_arr {
-        for f in &mut p.functions {
-            if f.generics.is_empty() {
-                checker.check_function(f);
-            }
-        }
-    }
-    checker.errors.inner.truncate(errors_before_imports);
-    if checker
-        .errors
-        .iter()
-        .any(|d| d.level == vxc::diagnostic::DiagnosticLevel::Error)
-    {
-        return Err(format!(
-            "Semantic check failed on '{}':\n{:#?}",
-            path.display(),
-            checker.errors
-        ));
-    }
-    let mut monomorphized_program = program;
-    let mut orig_functions = monomorphized_program.functions;
-    orig_functions.retain(|f| f.generics.is_empty());
-
-    let mut new_functions: Vec<_> = checker.mono.functions.into_iter().map(|(f, _)| f).collect();
-    new_functions.extend(orig_functions);
-    monomorphized_program.functions = new_functions;
+    // The env borrows `all_programs` clones, so `program_arr` is free to mutate.
+    check_program_and_imports(&mut checker, &mut program, &mut program_arr, path)?;
+    let mut monomorphized_program = monomorphize(program, checker.mono.functions);
     monomorphized_program
         .structs
         .extend(checker.mono.generated_structs);
-    let mut module_syntaxes = std::collections::HashMap::new();
-    for mut p in program_arr {
-        let before = p.functions.len();
-        p.functions.retain(|f| f.generics.is_empty());
-        let after = p.functions.len();
-        println!(
-            "Module {}: retained {} out of {} functions",
-            p.module_path, after, before
-        );
-        for f in &p.functions {
-            if f.name.as_ref() == "expect_eq" {
-                println!(
-                    "WARNING: expect_eq was retained! Generics: {:?}",
-                    f.generics
-                );
-            }
-        }
-        module_syntaxes.insert(p.module_path.clone(), p);
-    }
+    let module_syntaxes = retained_module_syntaxes(program_arr);
 
-    let context = melior::Context::new();
-    let registry = melior::dialect::DialectRegistry::new();
-    melior::utility::register_all_dialects(&registry);
-    context.append_dialect_registry(&registry);
-    context.load_all_available_dialects();
-    melior::utility::register_all_llvm_translations(&context);
-    vxc::codegen::register_vx_dialect(&context);
+    let context = mlir_context();
 
     println!("DEBUG: MeliorGenerator::new");
     let mut codegen = vxc::codegen::MeliorGenerator::new(&context, "test".to_string());
@@ -647,6 +591,43 @@ fn run_backend_test(path: &Path) -> Result<(), String> {
     let mlir_str = module.as_operation().to_string();
     println!("DEBUG: module_to_string ok");
 
+    run_and_check_expect_lines(path, &source, &mlir_str, expect_lines)
+}
+
+/// The imported modules keyed by path, with their generic functions dropped: those exist for
+/// codegen only as the monomorphized copies the checker collected.
+fn retained_module_syntaxes(program_arr: Vec<Program>) -> HashMap<Symbol, Program> {
+    let mut module_syntaxes = HashMap::new();
+    for mut p in program_arr {
+        let before = p.functions.len();
+        p.functions.retain(|f| f.generics.is_empty());
+        let after = p.functions.len();
+        println!(
+            "Module {}: retained {} out of {} functions",
+            p.module_path, after, before
+        );
+        for f in &p.functions {
+            if f.name.as_ref() == "expect_eq" {
+                println!(
+                    "WARNING: expect_eq was retained! Generics: {:?}",
+                    f.generics
+                );
+            }
+        }
+        module_syntaxes.insert(p.module_path.clone(), p);
+    }
+    module_syntaxes
+}
+
+/// Run the lowered module through the JIT and match each `EXPECT:` line against its output.
+///
+/// A file marked `NO_EXEC`, or one whose `REQUIRES:` the host does not meet, is not run.
+fn run_and_check_expect_lines(
+    path: &Path,
+    source: &str,
+    mlir_str: &str,
+    expect_lines: Vec<String>,
+) -> Result<(), String> {
     if source.contains("// NO_EXEC") {
         return Ok(());
     }
@@ -661,12 +642,13 @@ fn run_backend_test(path: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let out = execute_mlir(&mlir_str, vec![], 0, false).expect("JIT execution failed");
+    let out = execute_mlir(mlir_str, vec![], 0, false).expect("JIT execution failed");
 
     for expect in expect_lines {
         if !expect_matches(&out, &expect) {
             return Err(format!(
-                "Backend output mismatch on {path:?}.\nExpected to find: `{expect}`\nActual Output:\n{out}"
+                "Backend output mismatch on {}.\nExpected to find: `{expect}`\nActual Output:\n{out}",
+                path.display()
             ));
         }
     }
@@ -711,7 +693,7 @@ fn test_frontend_fail() -> Result<(), String> {
     // Everything else under here is walked, including the subdirectories that had no runner at
     // all: 39 fixtures that never executed, and so drifted.
     run_directory_tests_recursive(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/fail"),
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/fail"),
         &["formal_verification", "unimplemented_smt"],
         run_shell_tests,
     )
@@ -756,7 +738,7 @@ fn test_optimizations() -> Result<(), String> {
 /// `// XFAIL-RUN:` marks a fixture whose RUN line cannot pass yet. Read in both directions, as
 /// `XFAIL-LOWER` is: a marked fixture whose RUN line starts passing fails too.
 fn run_the_run_lines(path: &Path) -> Result<(), String> {
-    let source = fs::read_to_string(path).map_err(|e| format!("{path:?}: {e}"))?;
+    let source = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
 
     // The same gate the fixture runners apply. `run_middle_end_test` skipped a macOS-only file
     // and this ran its RUN line anyway, so a CHECK for IR that only a macOS-registered plugin
@@ -776,7 +758,8 @@ fn run_the_run_lines(path: &Path) -> Result<(), String> {
         .map(|l| l.split_once("XFAIL-RUN:").unwrap().1.trim().to_string());
     if runs.is_empty() {
         return Err(format!(
-            "{path:?} has no RUN line, so nothing states what the compiler should do with it"
+            "{} has no RUN line, so nothing states what the compiler should do with it",
+            path.display()
         ));
     }
 
@@ -797,11 +780,11 @@ fn run_the_run_lines(path: &Path) -> Result<(), String> {
             .arg("-c")
             .arg(&cmd)
             .output()
-            .map_err(|e| format!("{path:?}: could not run `{run}`: {e}"))?;
+            .map_err(|e| format!("{}: could not run `{run}`: {e}", path.display()))?;
         if !out.status.success() {
             failure = Some(format!(
-                "{:?}: RUN line failed: {}\n{}",
-                path,
+                "{}: RUN line failed: {}\n{}",
+                path.display(),
                 run,
                 String::from_utf8_lossy(&out.stderr)
                     .lines()
@@ -816,7 +799,8 @@ fn run_the_run_lines(path: &Path) -> Result<(), String> {
     match (failure, xfail_run) {
         (Some(why), None) => Err(why),
         (None, Some(reason)) => Err(format!(
-            "{path:?} is marked `XFAIL-RUN: {reason}`, but its RUN line passes now. Remove the marker."
+            "{} is marked `XFAIL-RUN: {reason}`, but its RUN line passes now. Remove the marker.",
+            path.display()
         )),
         _ => Ok(()),
     }
@@ -913,7 +897,7 @@ fn run_lit_test(path: &Path, force_legacy: bool) -> Result<(), String> {
         .filter(|l| l.trim_start().starts_with("// RUN:"))
         .collect();
     if run_lines.is_empty() {
-        return Err(format!("{path:?} has no // RUN: line"));
+        return Err(format!("{} has no // RUN: line", path.display()));
     }
 
     // `// XFAIL: *` marks a RUN line that cannot pass yet because the compiler is wrong,
@@ -922,18 +906,7 @@ fn run_lit_test(path: &Path, force_legacy: bool) -> Result<(), String> {
     // which deleting the RUN line would not do.
     let xfail = source.contains("// XFAIL: *");
 
-    // A file that states CHECK lines has to feed something into FileCheck, or the directives
-    // assert nothing. FileCheck itself catches the other half of this -- a prefix named on
-    // the command line with no directives behind it is an error, not an empty pass.
-    let states_checks = source
-        .lines()
-        .any(|l| l.trim_start().starts_with("// CHECK"));
-    if states_checks && !xfail && !run_lines.iter().any(|l| l.contains("FileCheck")) {
-        return Err(format!(
-            "{path:?} states CHECK lines, but no RUN line pipes into FileCheck, so nothing \
-             matches them."
-        ));
-    }
+    check_lines_reach_filecheck(&source, path, xfail, &run_lines)?;
 
     // The freshly built vxc/vx-opt lead; the rest of PATH is what carries FileCheck.
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_vxc")).parent().unwrap();
@@ -943,17 +916,7 @@ fn run_lit_test(path: &Path, force_legacy: bool) -> Result<(), String> {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    // %t: a scratch path unique to this file, inside the repo's own target directory.
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&path, &mut hasher);
-    let hash = std::hash::Hasher::finish(&hasher);
-    let tmp_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test_tmp");
-    std::fs::create_dir_all(&tmp_dir).unwrap_or_default();
-    let t_val = tmp_dir.join(format!(
-        "vxc_test_{}_{:x}",
-        path.file_stem().unwrap().to_string_lossy(),
-        hash
-    ));
+    let t_val = scratch_path_for(path);
 
     for run_line in run_lines {
         let mut cmd = run_line
@@ -971,26 +934,10 @@ fn run_lit_test(path: &Path, force_legacy: bool) -> Result<(), String> {
             && !cmd.contains("--legacy-codegen")
             && !source.contains("// REQUIRES: flat-codegen")
         {
-            let split = cmd.find('|').unwrap_or(cmd.len());
-            let (head, tail) = cmd.split_at(split);
-            let mut words = head.split_whitespace();
-            let first = words.next();
-            if first == Some("vxc") || (first == Some("not") && words.next() == Some("vxc")) {
-                cmd = format!("{} --legacy-codegen {}", head.trim_end(), tail);
-            }
+            cmd = with_legacy_codegen_flag(&cmd);
         }
 
-        // pipefail, because a RUN line fails if any stage fails. A shell reports only the
-        // last stage, so a compiler that crashed would still pass whenever its stderr
-        // happened to satisfy the CHECK lines.
-        let output = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(format!("set -o pipefail; {cmd}"))
-            .env("PATH", &path_var)
-            .env("RUST_BACKTRACE", "1")
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .output()
-            .expect("Failed to execute RUN line");
+        let output = run_shell_command(&cmd, &path_var);
 
         if xfail {
             if !output.status.success() {
@@ -1001,8 +948,8 @@ fn run_lit_test(path: &Path, force_legacy: bool) -> Result<(), String> {
 
         if !output.status.success() {
             return Err(format!(
-                "RUN line failed for {:?}:\n  {}\nStdout:\n{}\nStderr:\n{}",
-                path,
+                "RUN line failed for {}:\n  {}\nStdout:\n{}\nStderr:\n{}",
+                path.display(),
                 cmd.trim(),
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
@@ -1011,17 +958,85 @@ fn run_lit_test(path: &Path, force_legacy: bool) -> Result<(), String> {
     }
     if xfail {
         return Err(format!(
-            "{path:?} is marked XFAIL, but every RUN line succeeded. The bug it waits on is \
-             fixed: drop the XFAIL and restore the assertions."
+            "{} is marked XFAIL, but every RUN line succeeded. The bug it waits on is \
+             fixed: drop the XFAIL and restore the assertions.",
+            path.display()
         ));
     }
     Ok(())
 }
 
+/// A file that states CHECK lines has to feed something into `FileCheck`, or the directives
+/// assert nothing. `FileCheck` itself catches the other half of this -- a prefix named on
+/// the command line with no directives behind it is an error, not an empty pass.
+fn check_lines_reach_filecheck(
+    source: &str,
+    path: &Path,
+    xfail: bool,
+    run_lines: &[&str],
+) -> Result<(), String> {
+    let states_checks = source
+        .lines()
+        .any(|l| l.trim_start().starts_with("// CHECK"));
+    if states_checks && !xfail && !run_lines.iter().any(|l| l.contains("FileCheck")) {
+        return Err(format!(
+            "{} states CHECK lines, but no RUN line pipes into FileCheck, so nothing \
+             matches them.",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Runs one RUN line's command through bash, with `path_var` as its PATH.
+///
+/// pipefail, because a RUN line fails if any stage fails. A shell reports only the
+/// last stage, so a compiler that crashed would still pass whenever its stderr
+/// happened to satisfy the CHECK lines.
+fn run_shell_command(cmd: &str, path_var: &str) -> std::process::Output {
+    std::process::Command::new("bash")
+        .arg("-c")
+        .arg(format!("set -o pipefail; {cmd}"))
+        .env("PATH", path_var)
+        .env("RUST_BACKTRACE", "1")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Failed to execute RUN line")
+}
+
+/// The `%t` of a RUN line: a scratch path unique to this file, inside the repo's own target
+/// directory.
+fn scratch_path_for(path: &Path) -> std::path::PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&path, &mut hasher);
+    let hash = std::hash::Hasher::finish(&hasher);
+    let tmp_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test_tmp");
+    std::fs::create_dir_all(&tmp_dir).unwrap_or_default();
+    tmp_dir.join(format!(
+        "vxc_test_{}_{:x}",
+        path.file_stem().unwrap().to_string_lossy(),
+        hash
+    ))
+}
+
+/// Add `--legacy-codegen` to the `vxc` (or `not vxc`) command at the head of a RUN line's
+/// pipeline. A command that starts with anything else is returned unchanged.
+fn with_legacy_codegen_flag(cmd: &str) -> String {
+    let split = cmd.find('|').unwrap_or(cmd.len());
+    let (head, tail) = cmd.split_at(split);
+    let mut words = head.split_whitespace();
+    let first = words.next();
+    if first == Some("vxc") || (first == Some("not") && words.next() == Some("vxc")) {
+        format!("{} --legacy-codegen {}", head.trim_end(), tail)
+    } else {
+        cmd.to_string()
+    }
+}
+
 #[test]
 fn test_middle_end_fail() -> Result<(), String> {
     run_directory_tests(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/middle_end/fail"),
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/middle_end/fail"),
         |path| {
             // A fail test must fail AND fail for the declared reason: the error text has
             // to satisfy the file's CHECK directives. "Any error passes" let a test keep
@@ -1073,7 +1088,7 @@ fn test_crash() -> Result<(), String> {
 fn test_backend() -> Result<(), String> {
     std::env::set_var("RUST_BACKTRACE", "1");
     run_directory_tests(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/backend/pass"),
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/backend/pass"),
         |path| {
             println!("Running test_backend on {path:?}");
             run_backend_test(path)?;
@@ -1107,7 +1122,7 @@ fn test_frontend_pass_modules() -> Result<(), String> {
         "tests/frontend/pass/modules_basic",
         "tests/frontend/pass/modules_nested",
     ] {
-        run_directory_tests(Path::new(env!("CARGO_MANIFEST_DIR")).join(dir), |path| {
+        run_directory_tests(&Path::new(env!("CARGO_MANIFEST_DIR")).join(dir), |path| {
             println!("Running test_frontend_pass_modules on {path:?}");
             run_frontend_test(path, true)
         })?;
@@ -1125,7 +1140,7 @@ fn test_frontend_pass_formal_verification() -> Result<(), String> {
         return Err("z3 is not installed".to_string());
     }
     run_directory_tests(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/pass/formal_verification"),
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/pass/formal_verification"),
         |path| {
             println!("Running test_frontend_pass_formal_verification on {path:?}");
             run_frontend_test(path, true)
@@ -1143,7 +1158,7 @@ fn test_frontend_fail_formal_verification() -> Result<(), String> {
         return Err("z3 is not installed".to_string());
     }
     run_directory_tests(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/fail/formal_verification"),
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/fail/formal_verification"),
         |path| {
             println!("Running test_frontend_fail_formal_verification on {path:?}");
             run_shell_tests(path)
@@ -1154,7 +1169,7 @@ fn test_frontend_fail_formal_verification() -> Result<(), String> {
 #[test]
 fn test_frontend_fail_unimplemented_smt() -> Result<(), String> {
     run_directory_tests(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/fail/unimplemented_smt"),
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/fail/unimplemented_smt"),
         |path| {
             println!("Running test_frontend_fail_unimplemented_smt on {path:?}");
             run_shell_tests(path)
@@ -1167,7 +1182,7 @@ fn test_frontend_fail_unimplemented_smt() -> Result<(), String> {
 #[test]
 fn test_frontend_pass_packages() -> Result<(), String> {
     run_directory_tests(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/pass/packages"),
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/pass/packages"),
         |path| {
             println!("Running test_frontend_pass_packages on {path:?}");
             run_shell_tests(path)
@@ -1178,7 +1193,7 @@ fn test_frontend_pass_packages() -> Result<(), String> {
 #[test]
 fn test_backend_pass_autodiff() -> Result<(), String> {
     run_directory_tests(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/backend/pass/autodiff"),
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/backend/pass/autodiff"),
         |path| {
             println!("Running test_backend_pass_autodiff on {path:?}");
             run_backend_autodiff_test(path)
@@ -1196,47 +1211,17 @@ fn run_backend_autodiff_test(path: &Path) -> Result<(), String> {
         .map(|line| line.split_once("EXPECT:").unwrap().1.trim().to_string())
         .collect();
 
-    let mut loader = vxc::module_loader::ModuleLoader::new();
-    if let Err(e) = loader.load_main(path.to_str().unwrap()) {
-        return Err(format!(
-            "Frontend failed to parse '{}': {}",
-            path.display(),
-            e
-        ));
-    }
-    let mut program_arr = loader.into_programs().expect("the fixture should load");
-
-    let syntax_idx = program_arr
-        .iter()
-        .position(|p| p.module_path.as_ref() == path.to_str().unwrap())
-        .unwrap();
-    let mut program = program_arr.remove(syntax_idx);
-
-    let mut global_macros = std::collections::HashMap::new();
-    for p in &program_arr {
-        for mac in &p.macros {
-            global_macros.insert(mac.name.clone(), mac.rules.clone());
-        }
-    }
-    for mac in &program.macros {
-        global_macros.insert(mac.name.clone(), mac.rules.clone());
-    }
-    // The main module is held apart from its imports here, exactly as it is for the macro
-    // table above, so the trait a default belongs to may be in either.
-    let trait_defaults =
-        vxc::resolver::collect_trait_defaults(program_arr.iter().chain(std::iter::once(&program)));
-    let expander = vxc::parser::MacroExpander::new(&global_macros, &trait_defaults);
-    for p in &mut program_arr {
-        if let Err(e) = expander.expand_module(p) {
+    let (mut program_arr, mut program) = match load_program(path) {
+        Ok(loaded) => loaded,
+        Err(e) => {
             return Err(format!(
-                "Macro expansion failed on {}: {}",
-                p.module_path, e
-            ));
+                "Frontend failed to parse '{}': {}",
+                path.display(),
+                e
+            ))
         }
-    }
-    if let Err(e) = expander.expand_module(&mut program) {
-        return Err(format!("Macro expansion failed on {path:?}: {e}"));
-    }
+    };
+    expand_macros(path, &mut program_arr, &mut program)?;
 
     let global_session = std::sync::Arc::new(vxc::session::GlobalSession::new(1));
     let mut all_programs = program_arr.clone();
@@ -1244,54 +1229,17 @@ fn run_backend_autodiff_test(path: &Path) -> Result<(), String> {
     let env = vxc::hir::GlobalAstEnv::build(&all_programs);
     let mut worker = vxc::session::LocalWorkerState::new(global_session.clone());
     let mut checker = TypeChecker::new(&env, &mut worker);
-    for f in &mut program.functions {
-        checker.check_function(f);
-    }
-    // #203: also check imported modules' non-generic bodies in place, so methods/generics they call
-    // only transitively get monomorphized for codegen (the env borrows `all_programs` clones, so
-    // `program_arr` is free to mutate). Mirrors `driver.rs::run_semantic_analysis`; library-internal
-    // diagnostics are dropped (this pass collects instantiations, it does not re-validate deps).
-    let errors_before_imports = checker.errors.len();
-    for p in &mut program_arr {
-        for f in &mut p.functions {
-            if f.generics.is_empty() {
-                checker.check_function(f);
-            }
-        }
-    }
-    checker.errors.inner.truncate(errors_before_imports);
-    if checker
-        .errors
-        .iter()
-        .any(|d| d.level == vxc::diagnostic::DiagnosticLevel::Error)
-    {
-        return Err(format!(
-            "Semantic check failed on '{}':\n{:#?}",
-            path.display(),
-            checker.errors
-        ));
-    }
-    let mut monomorphized_program = program;
-    let mut orig_functions = monomorphized_program.functions;
-    orig_functions.retain(|f| f.generics.is_empty());
+    // The env borrows `all_programs` clones, so `program_arr` is free to mutate.
+    check_program_and_imports(&mut checker, &mut program, &mut program_arr, path)?;
+    let monomorphized_program = monomorphize(program, checker.mono.functions);
 
-    let mut new_functions: Vec<_> = checker.mono.functions.into_iter().map(|(f, _)| f).collect();
-    new_functions.extend(orig_functions);
-    monomorphized_program.functions = new_functions;
-
-    let mut module_syntaxes = std::collections::HashMap::new();
+    let mut module_syntaxes = HashMap::new();
     for mut p in program_arr {
         p.functions.retain(|f| f.generics.is_empty());
         module_syntaxes.insert(p.module_path.clone(), p);
     }
 
-    let context = melior::Context::new();
-    let registry = melior::dialect::DialectRegistry::new();
-    melior::utility::register_all_dialects(&registry);
-    context.append_dialect_registry(&registry);
-    context.load_all_available_dialects();
-    melior::utility::register_all_llvm_translations(&context);
-    vxc::codegen::register_vx_dialect(&context);
+    let context = mlir_context();
 
     let mut codegen = vxc::codegen::MeliorGenerator::new(&context, "test".to_string());
     codegen
@@ -1319,11 +1267,23 @@ fn run_backend_autodiff_test(path: &Path) -> Result<(), String> {
         filecheck(&mlir_str, path, None)?;
     }
 
+    check_autodiff_expect_lines(path, &source, &mlir_str, expect_lines)
+}
+
+/// Match each `EXPECT:` line against the MLIR, or against the JIT's output too when the file
+/// is run. A `NO_EXEC` file is matched against the MLIR only, and the JIT needs Enzyme.
+fn check_autodiff_expect_lines(
+    path: &Path,
+    source: &str,
+    mlir_str: &str,
+    expect_lines: Vec<String>,
+) -> Result<(), String> {
     if source.contains("// NO_EXEC") {
         for expect in expect_lines {
             if !mlir_str.contains(&expect) {
                 return Err(format!(
-                    "MLIR Output mismatch on {path:?}.\nExpected to find: `{expect}`\nActual MLIR:\n{mlir_str}"
+                    "MLIR Output mismatch on {}.\nExpected to find: `{expect}`\nActual MLIR:\n{mlir_str}",
+                    path.display()
                 ));
             }
         }
@@ -1338,12 +1298,13 @@ fn run_backend_autodiff_test(path: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let out = execute_mlir(&mlir_str, vec![], 0, false).expect("JIT execution failed");
+    let out = execute_mlir(mlir_str, vec![], 0, false).expect("JIT execution failed");
 
     for expect in expect_lines {
         if !mlir_str.contains(&expect) && !out.contains(&expect) {
             return Err(format!(
-                "Output mismatch on {path:?}.\nExpected to find: `{expect}`\nActual Output:\n{out}\nMLIR:\n{mlir_str}"
+                "Output mismatch on {}.\nExpected to find: `{expect}`\nActual Output:\n{out}\nMLIR:\n{mlir_str}",
+                path.display()
             ));
         }
     }
@@ -1353,7 +1314,7 @@ fn run_backend_autodiff_test(path: &Path) -> Result<(), String> {
 #[test]
 fn test_backend_fail() -> Result<(), String> {
     run_directory_tests(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/backend/fail"),
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/backend/fail"),
         run_shell_tests,
     )
 }
@@ -1385,7 +1346,7 @@ fn vx_files_under(dir: &Path, skip: &[&str], out: &mut Vec<std::path::PathBuf>) 
     }
 }
 
-fn run_directory_tests<F>(dir: std::path::PathBuf, test_fn: F) -> Result<(), String>
+fn run_directory_tests<F>(dir: &Path, test_fn: F) -> Result<(), String>
 where
     F: Fn(&std::path::Path) -> Result<(), String> + Sync + Send,
 {
@@ -1393,11 +1354,7 @@ where
 }
 
 /// As [`run_directory_tests`], but walking subdirectories too, except those named in `skip`.
-fn run_directory_tests_recursive<F>(
-    dir: std::path::PathBuf,
-    skip: &[&str],
-    test_fn: F,
-) -> Result<(), String>
+fn run_directory_tests_recursive<F>(dir: &Path, skip: &[&str], test_fn: F) -> Result<(), String>
 where
     F: Fn(&std::path::Path) -> Result<(), String> + Sync + Send,
 {
@@ -1405,7 +1362,7 @@ where
 }
 
 fn run_directory_tests_inner<F>(
-    dir: std::path::PathBuf,
+    dir: &Path,
     skip: &[&str],
     recurse: bool,
     test_fn: F,
@@ -1419,10 +1376,10 @@ where
     if dir.exists() {
         let entries: Vec<std::path::PathBuf> = if recurse {
             let mut v = Vec::new();
-            vx_files_under(&dir, skip, &mut v);
+            vx_files_under(dir, skip, &mut v);
             v
         } else {
-            fs::read_dir(&dir)
+            fs::read_dir(dir)
                 .unwrap()
                 .map(|e| e.unwrap().path())
                 .collect()
@@ -1434,7 +1391,9 @@ where
                     let result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test_fn(&path)));
                     match result {
-                        Ok(Err(msg)) => return Some(format!("Test {path:?} failed: {msg}")),
+                        Ok(Err(msg)) => {
+                            return Some(format!("Test {} failed: {msg}", path.display()))
+                        }
                         Err(e) => {
                             let msg = if let Some(s) = e.downcast_ref::<&str>() {
                                 s.to_string()
@@ -1443,7 +1402,7 @@ where
                             } else {
                                 "Unknown panic".to_string()
                             };
-                            return Some(format!("Test {path:?} panicked: {msg}"));
+                            return Some(format!("Test {} panicked: {msg}", path.display()));
                         }
                         Ok(Ok(())) => {}
                     }
@@ -1492,7 +1451,7 @@ fn test_melior_matmul() -> Result<(), String> {
         vxc::resolver::collect_trait_defaults(program_arr.iter().chain(std::iter::once(&program)));
     let expander = vxc::parser::MacroExpander::new(&global_macros, &trait_defaults);
     if let Err(e) = expander.expand_module(&mut program) {
-        return Err(format!("Macro expansion failed on {path:?}: {e}"));
+        return Err(format!("Macro expansion failed on {}: {e}", path.display()));
     }
 
     let global_session = std::sync::Arc::new(vxc::session::GlobalSession::new(1));
@@ -1510,7 +1469,11 @@ fn test_melior_matmul() -> Result<(), String> {
         .iter()
         .any(|d| d.level == vxc::diagnostic::DiagnosticLevel::Error)
     {
-        return Err(format!("Sema failed on {:?}: {:#?}", path, checker.errors));
+        return Err(format!(
+            "Sema failed on {}: {:#?}",
+            path.display(),
+            checker.errors
+        ));
     }
 
     let registry = melior::dialect::DialectRegistry::new();
@@ -1535,11 +1498,17 @@ extern "C" {
 }
 
 #[test]
+#[allow(
+    unsafe_code,
+    reason = "registering the dialect goes through the C API the vx dialect library exports"
+)]
 fn test_vx_dialect_registration() -> Result<(), String> {
     let registry = melior::dialect::DialectRegistry::new();
     let context = melior::Context::new();
 
     // Register our custom dialect using the FFI
+    // SAFETY: `context` is a live MLIR context and `registerVxDialect` only registers a
+    // dialect in it, the same call `vxc::codegen::register_vx_dialect` makes.
     unsafe {
         registerVxDialect(context.to_raw());
     }

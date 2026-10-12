@@ -182,10 +182,12 @@ fn state_smt(post: &AbsState) -> String {
             }
             // TOP: tag fixed, value left free so z3 can exhibit the stale read.
             Tag::Top => {
-                writeln!(s, "(assert (= tag_{name} TOP))").expect("writing to a String cannot fail")
+                writeln!(s, "(assert (= tag_{name} TOP))")
+                    .expect("writing to a String cannot fail");
             }
             Tag::Bot => {
-                writeln!(s, "(assert (= tag_{name} BOT))").expect("writing to a String cannot fail")
+                writeln!(s, "(assert (= tag_{name} BOT))")
+                    .expect("writing to a String cannot fail");
             }
         }
     }

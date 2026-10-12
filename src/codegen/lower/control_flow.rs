@@ -158,7 +158,7 @@ fn lower_comptime_statements<'c>(
             }
         }
         if let Some(b) = gen.generate_statement(stmt, cur)? {
-            cur = b
+            cur = b;
         } else {
             terminated = true;
             break;

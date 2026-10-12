@@ -543,6 +543,82 @@ impl FnEmit<'_> {
         Ok(())
     }
 
+    /// The buffer an op's result goes in: the caller's slot when the result is returned straight
+    /// into it, otherwise a fresh `memref.alloc` of `memty` named `%v{idx}`, with `sizes` as the
+    /// operands for its run-time extents.
+    fn result_buffer(&mut self, idx: usize, memty: &str, sizes: &[String]) -> String {
+        if let Some(slot) = self.nrvo_slot(idx, memty) {
+            return slot;
+        }
+        let n = format!("%v{idx}");
+        let _ = writeln!(
+            self.body,
+            "  {n} = memref.alloc({}) : {memty}",
+            sizes.join(", ")
+        );
+        n
+    }
+
+    /// The SSA name and memref type of the tensor in register `r`.
+    ///
+    /// # Errors
+    ///
+    /// Declines when `r` is not a register the emitter knows, or holds a value that is not a
+    /// tensor.
+    fn operand_memref(&self, r: usize) -> Lowered<(String, String)> {
+        let name = self.names.get(r).ok_or(crate::emitter_gap!())?.clone();
+        let memty = self
+            .mem_of
+            .get(r)
+            .cloned()
+            .flatten()
+            .ok_or(crate::emitter_gap!())?;
+        Ok((name, memty))
+    }
+
+    /// The target of `TensorPad`'s copy when each axis is padded: a view of the result buffer
+    /// `dst` (its name and memref type) with the source's sizes and the result's strides, so
+    /// the copy lands in the result's leading corner. Returns the view's name and type.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the result has a run-time size or a different rank from the source.
+    fn pad_each_axis_target(
+        &mut self,
+        idx: usize,
+        view: &ViewSource,
+        dst: (&str, &str),
+        el: &str,
+    ) -> Lowered<(String, String)> {
+        let (dst, memty) = dst;
+        let tgt_sizes: Vec<i64> = view
+            .shape
+            .iter()
+            // The parse error is dropped: a size that is not a number is a run-time size.
+            .map(|d| d.parse().ok().ok_or(crate::emitter_gap!()))
+            .collect::<Lowered<_>>()?;
+        if tgt_sizes.len() != view.src_sizes.len() {
+            return Err(crate::emitter_gap!());
+        }
+        let strides = contiguous_strides(&tgt_sizes);
+        let dims: Vec<String> = view
+            .src_sizes
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        let corner_ty = format!(
+            "memref<{}x{el}, strided<[{}], offset: 0>>",
+            dims.join("x"),
+            i64_list(&strides)
+        );
+        let _ = writeln!(self.body,
+            "  %tpd{idx} = memref.reinterpret_cast {dst} to offset: [0], sizes: [{}], strides: [{}] : {memty} to {corner_ty}",
+            i64_list(&view.src_sizes),
+            i64_list(&strides)
+        );
+        Ok((format!("%tpd{idx}"), corner_ty))
+    }
+
     /// `TensorPad`: a fresh buffer of the result shape filled with zeros, with the source copied
     /// into it, the way the oracle lowers a `PadMode::Pad` reshape and `pad`.
     ///
@@ -551,53 +627,20 @@ impl FnEmit<'_> {
     /// Declines when the source cannot be viewed (see `view_operands`), or when padding each
     /// axis and the result has a run-time size or a different rank.
     pub(crate) fn op_tensor_pad(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
-        let ViewSource {
-            elem,
-            shape,
-            src,
-            src_mem,
-            src_sizes,
-        } = self.view_operands(ins)?;
-        let n: i64 = src_sizes.iter().product();
-        let el = mlir_scalar(&elem).ok_or(crate::emitter_gap!())?;
-        let memty = tensor_memref_ty(&elem, &shape).ok_or(crate::emitter_gap!())?;
-        let dst = if let Some(slot) = self.nrvo_slot(idx, &memty) {
-            slot
-        } else {
-            let d = format!("%v{idx}");
-            let _ = writeln!(self.body, "  {d} = memref.alloc() : {memty}");
-            d
-        };
+        let view = self.view_operands(ins)?;
+        let n: i64 = view.src_sizes.iter().product();
+        let el = mlir_scalar(&view.elem).ok_or(crate::emitter_gap!())?;
+        let memty = tensor_memref_ty(&view.elem, &view.shape).ok_or(crate::emitter_gap!())?;
+        let dst = self.result_buffer(idx, &memty, &[]);
         let zero = zero_literal(el);
         // The copy goes from `from` to `to`. Flat: both seen as `n` elements in a row. Each
         // axis: the source as it is, into a view of the new buffer with the source's sizes and
         // the new buffer's strides.
         let (from, from_ty, to, to_ty) = if ins.imm & crate::bytecode::TENSOR_PAD_EACH_AXIS != 0 {
-            let tgt_sizes: Vec<i64> = shape
-                .iter()
-                // The parse error is dropped: a size that is not a number is a run-time size.
-                .map(|d| d.parse().ok().ok_or(crate::emitter_gap!()))
-                .collect::<Lowered<_>>()?;
-            if tgt_sizes.len() != src_sizes.len() {
-                return Err(crate::emitter_gap!());
-            }
-            let strides = contiguous_strides(&tgt_sizes);
-            let dims: Vec<String> = src_sizes
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect();
-            let corner_ty = format!(
-                "memref<{}x{el}, strided<[{}], offset: 0>>",
-                dims.join("x"),
-                i64_list(&strides)
-            );
-            let _ = writeln!(self.body,
-                "  %tpd{idx} = memref.reinterpret_cast {dst} to offset: [0], sizes: [{}], strides: [{}] : {memty} to {corner_ty}",
-                i64_list(&src_sizes),
-                i64_list(&strides)
-            );
-            (src, src_mem, format!("%tpd{idx}"), corner_ty)
+            let (to, to_ty) = self.pad_each_axis_target(idx, &view, (&dst, &memty), el)?;
+            (view.src, view.src_mem, to, to_ty)
         } else {
+            let ViewSource { src, src_mem, .. } = view;
             let flat_ty = format!("memref<{n}x{el}>");
             let _ = writeln!(self.body,
                 "  %tps{idx} = memref.reinterpret_cast {src} to offset: [0], sizes: [{n}], strides: [1] : {src_mem} to {flat_ty}"
@@ -681,14 +724,7 @@ impl FnEmit<'_> {
             .clone();
         let memty = tensor_memref_ty(&elem, &shape).ok_or(crate::emitter_gap!())?;
         let el = mlir_scalar(&elem).ok_or(crate::emitter_gap!())?;
-        let s = ins.operand1.0 as usize;
-        let src = self.names.get(s).ok_or(crate::emitter_gap!())?.clone();
-        let src_mem = self
-            .mem_of
-            .get(s)
-            .cloned()
-            .flatten()
-            .ok_or(crate::emitter_gap!())?;
+        let (src, src_mem) = self.operand_memref(ins.operand1.0 as usize)?;
         let ClosureAdapter {
             env,
             name,
@@ -706,17 +742,7 @@ impl FnEmit<'_> {
             }
         }
         // A returned map writes its elements straight into the caller's buffer.
-        let n = if let Some(slot) = self.nrvo_slot(idx, &memty) {
-            slot
-        } else {
-            let n = format!("%v{idx}");
-            let _ = writeln!(
-                self.body,
-                "  {n} = memref.alloc({}) : {memty}",
-                sizes.join(", ")
-            );
-            n
-        };
+        let n = self.result_buffer(idx, &memty, &sizes);
         let dims: Vec<String> = (0..shape.len()).map(|i| format!("d{i}")).collect();
         let map = format!("affine_map<({0}) -> ({0})>", dims.join(", "));
         let iters: Vec<&str> = shape.iter().map(|_| "\"parallel\"").collect();
@@ -1394,28 +1420,8 @@ impl FnEmit<'_> {
     /// Declines when an operand or the result type is not a tensor the emitter knows, or the
     /// element type is not a float.
     pub(crate) fn op_matmul(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
-        let a = self
-            .names
-            .get(ins.operand1.0 as usize)
-            .ok_or(crate::emitter_gap!())?
-            .clone();
-        let ma = self
-            .mem_of
-            .get(ins.operand1.0 as usize)
-            .ok_or(crate::emitter_gap!())?
-            .clone()
-            .ok_or(crate::emitter_gap!())?;
-        let b = self
-            .names
-            .get(ins.operand2.0 as usize)
-            .ok_or(crate::emitter_gap!())?
-            .clone();
-        let mb = self
-            .mem_of
-            .get(ins.operand2.0 as usize)
-            .ok_or(crate::emitter_gap!())?
-            .clone()
-            .ok_or(crate::emitter_gap!())?;
+        let (a, ma) = self.operand_memref(ins.operand1.0 as usize)?;
+        let (b, mb) = self.operand_memref(ins.operand2.0 as usize)?;
         let gid = *self
             .types
             .get(ins.type_idx.0 as usize)
@@ -1444,17 +1450,7 @@ impl FnEmit<'_> {
         }
         // A returned product accumulates straight into the caller's buffer -- the biggest of the
         // buffers this saves, since a matmul result is the whole output matrix.
-        let n = if let Some(slot) = self.nrvo_slot(idx, &md) {
-            slot
-        } else {
-            let n = format!("%v{idx}");
-            let _ = writeln!(
-                self.body,
-                "  {n} = memref.alloc({}) : {md}",
-                sizes.join(", ")
-            );
-            n
-        };
+        let n = self.result_buffer(idx, &md, &sizes);
         let _ = writeln!(self.body, "  %mz{idx} = arith.constant 0.0 : {et}");
         let _ = writeln!(
             self.body,

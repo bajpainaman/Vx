@@ -266,6 +266,11 @@ fn a_count_that_overflows_is_reported_as_absent_not_clamped() {
 /// detect is worse than no figure.
 #[test]
 fn a_sub_byte_element_type_is_refused_rather_than_rounded() {
+    // The fixture's own tensors have to be retyped too -- the substituted body borrows them.
+    // Checked rather than replaced blind: a respelling in the corpus file would otherwise leave
+    // this test measuring f32 while claiming to measure i4, which is exactly what happened when
+    // the constructor syntax changed (Vx#429).
+    const F32_TILE: &str = "Tensor<f32, [2, 2]>";
     let src = with_body(
         "  fn move_tile(src: &Tensor<i4, [2, 2]>, dst: &mut Tensor<i4, [2, 2]>) -> i32 {\n\
          \x20   for i in 0..raw::extent(src) {\n\
@@ -275,11 +280,6 @@ fn a_sub_byte_element_type_is_refused_rather_than_rounded() {
          \x20   return 0;\n\
          \x20 }",
     );
-    // The fixture's own tensors have to be retyped too -- the substituted body borrows them.
-    // Checked rather than replaced blind: a respelling in the corpus file would otherwise leave
-    // this test measuring f32 while claiming to measure i4, which is exactly what happened when
-    // the constructor syntax changed (Vx#429).
-    const F32_TILE: &str = "Tensor<f32, [2, 2]>";
     assert!(
         src.contains(F32_TILE),
         "the fixture no longer spells its tensors `{F32_TILE}`, so this test would measure f32"
@@ -324,24 +324,8 @@ fn a_comptime_branch_is_counted_as_the_arm_that_survives() {
     );
 }
 
-/// Two machines declare the same edge and move it differently. Which lowering
-/// runs is decided by the topology in force at the site -- and the reported
-/// traffic is what says which one ran, because the counter reads the body that
-/// was chosen.
-///
-/// This program was a hard error until the `for Topology::X` clause existed
-/// (Vx#353): a lowering was keyed on the edge pair alone, so the second
-/// `Memory::GPU_HBM -> Memory::SMEM` implementation in a compilation was
-/// refused no matter which part it was written for. That is the shape the
-/// fleet directory is built to describe -- Ampere fills shared memory with
-/// cp.async, Hopper with a different engine -- so it had to become writable.
-///
-/// The two bodies compute a bit-identical answer (x + x halved is exact in
-/// IEEE for any value), so nothing but the byte count distinguishes them. A
-/// selection bug that took the first candidate rather than the active
-/// topology's would report 32 where this asserts 16.
-fn two_machines(active: &str) -> String {
-    let spaces = "\
+/// The memory spaces, the two topologies and the two lowerings `two_machines` builds on.
+const TWO_MACHINE_DECLARATIONS: &str = "\
 Memory CPU_DRAM {}
 Memory GPU_HBM {
   within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s, managed: cached
@@ -383,6 +367,25 @@ impl Transfer<Memory::GPU_HBM, Memory::SMEM> for Topology::Wasteful {
   }
 }
 ";
+
+/// Two machines declare the same edge and move it differently. Which lowering
+/// runs is decided by the topology in force at the site -- and the reported
+/// traffic is what says which one ran, because the counter reads the body that
+/// was chosen.
+///
+/// This program was a hard error until the `for Topology::X` clause existed
+/// (Vx#353): a lowering was keyed on the edge pair alone, so the second
+/// `Memory::GPU_HBM -> Memory::SMEM` implementation in a compilation was
+/// refused no matter which part it was written for. That is the shape the
+/// fleet directory is built to describe -- Ampere fills shared memory with
+/// cp.async, Hopper with a different engine -- so it had to become writable.
+///
+/// The two bodies compute a bit-identical answer (x + x halved is exact in
+/// IEEE for any value), so nothing but the byte count distinguishes them. A
+/// selection bug that took the first candidate rather than the active
+/// topology's would report 32 where this asserts 16.
+fn two_machines(active: &str) -> String {
+    let spaces = TWO_MACHINE_DECLARATIONS;
     format!(
         "{spaces}
 fn main() -> i32 {{

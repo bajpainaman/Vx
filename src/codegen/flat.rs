@@ -916,7 +916,7 @@ pub struct EmitCtx {
 
 /// The declared properties of a memory sub-space the flat emitter re-attaches to a `vx.transfer`,
 /// keyed in `EmitCtx.subspaces` by the space's dispatch id. Mirrors the fields the AST path reads off
-/// `MemoryDecl` ([`src/codegen/lower/tensors.rs`]). The frozen registry has no memory decls, so this is
+/// `MemoryDecl` (`src/codegen/lower/tensors.rs`). The frozen registry has no memory decls, so this is
 /// built in `build_flat_module` from the per-compilation env and passed into `emit_module_mlir`.
 #[derive(Clone, Debug, Default)]
 pub struct SubspaceInfo {

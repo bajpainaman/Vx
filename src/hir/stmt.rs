@@ -1675,6 +1675,7 @@ impl<'a> TypeChecker<'a> {
         match expr {
             Expr::Number(NumberExpr {
                 value: n_str,
+                text: _,
                 ty,
                 span: _,
             }) => {

@@ -1451,6 +1451,7 @@ impl<'a> TypeChecker<'a> {
                     value: v.to_string().into(),
                     ty: None,
                     span: d.span(),
+                    text: None,
                 });
                 self.check_expr_type_flag(d, false);
             }
@@ -1476,6 +1477,7 @@ impl<'a> TypeChecker<'a> {
                             value: v.to_string().into(),
                             ty: None,
                             span: Span::default(),
+                            text: None,
                         })));
                     }
                 }
@@ -1499,6 +1501,7 @@ impl<'a> TypeChecker<'a> {
             };
             **expr = Expr::Number(NumberExpr {
                 value: value.into(),
+                text: None,
                 ty: None,
                 span: Span::default(),
             });
@@ -3937,6 +3940,7 @@ impl<'a> TypeChecker<'a> {
                     let mut new_dims = vec![
                         Dim::Static(Expr::Number(NumberExpr {
                             value: "0".into(),
+                            text: None,
                             ty: Some(ElementType::I32),
                             span: Span::default()
                         }));

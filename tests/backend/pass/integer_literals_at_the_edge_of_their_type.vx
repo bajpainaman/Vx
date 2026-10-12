@@ -9,7 +9,7 @@
 // front of `128`, which an `i8` cannot hold by itself, so the two are checked as one number.
 // `0bf16` is zero as a `bf16`, not a binary literal.
 //
-// EXPECT: -128 -128 127 -9223372036854775808 18446744073709551615 0
+// EXPECT: -128 -128 127 -9223372036854775808 18446744073709551615 0 -128
 
 fn main() -> i32 {
   let typed : i8 = -128;
@@ -18,6 +18,8 @@ fn main() -> i32 {
   let lowest : i64 = -9223372036854775808;
   let highest : u64 = 0xFFFF_FFFF_FFFF_FFFF;
   let zero = 0bf16;
+  // Three minuses leave the sign negative, so this is -128 and fits.
+  let thrice : i8 = ---128;
   print(typed);
   print!(" ");
   print(suffixed);
@@ -29,5 +31,7 @@ fn main() -> i32 {
   print(highest);
   print!(" ");
   print(zero);
+  print!(" ");
+  print(thrice);
   return 0;
 }

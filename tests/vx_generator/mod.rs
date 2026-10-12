@@ -20,7 +20,7 @@ impl StructBuilder {
     pub fn build(&self) -> String {
         let mut s = format!("struct {} {{\n", self.name);
         for (f, t) in &self.fields {
-            s.push_str(&format!("  {}: {},\n", f, t));
+            s.push_str(&format!("  {f}: {t},\n"));
         }
         s.push_str("}\n");
         s
@@ -66,7 +66,7 @@ impl FunctionBuilder {
         let args_str = self
             .args
             .iter()
-            .map(|(n, t)| format!("{}: {}", n, t))
+            .map(|(n, t)| format!("{n}: {t}"))
             .collect::<Vec<_>>()
             .join(", ");
 

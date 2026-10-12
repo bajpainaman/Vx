@@ -29,7 +29,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::{
+    decl, AssignStmt, BinaryOp, BorrowExpr, DropStmt, ElementType, Expr, FunctionCallExpr,
+    IdentifierExpr, LetDeclStmt, MatchArm, MatchExpr, MemberAccessExpr, Pattern, ReturnStmt, Span,
+    Statement, Type, TypeChecker,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Left in a block's uses by a `Statement::Drop`, so a body already rewritten is known: a
@@ -61,6 +65,20 @@ struct Owner {
     glue: Vec<GluePart>,
 }
 
+/// An owner as `drops_mark_move` left it.
+struct MarkedOwner {
+    /// The index of the block frame that holds the owner.
+    frame: usize,
+    /// Whether the owner's value is moved now.
+    moved: Moved,
+    /// The owner's `flag`.
+    flag: Option<String>,
+    /// The owner's `decl`.
+    decl: Option<usize>,
+    /// The owner's `moved_at`.
+    moved_at: Option<usize>,
+}
+
 /// One step of dropping a value: a `Drop` impl's `drop` to call, or a tensor to free, at a
 /// field path inside it.
 #[derive(Clone)]
@@ -78,8 +96,12 @@ pub(crate) struct EnumGlue {
     /// The enum's type as a pattern names it: `Opt<Noisy>`.
     name: String,
     /// The variants with something to drop: each payload element's glue, or `None`.
-    arms: Vec<(crate::symbol::Symbol, Vec<Option<Vec<GluePart>>>)>,
+    arms: Vec<(crate::symbol::Symbol, PayloadGlue)>,
 }
+
+/// What dropping each element of one variant's payload does; `None` for an element with nothing
+/// to drop.
+type PayloadGlue = Vec<Option<Vec<GluePart>>>;
 
 impl GluePart {
     /// Whether dropping this runs a `Drop` impl anywhere.
@@ -301,7 +323,7 @@ fn glue_drops(name: &str, glue: &[GluePart], flag: Option<&str>) -> Vec<Statemen
         .collect()
 }
 
-impl<'a> TypeChecker<'a> {
+impl TypeChecker<'_> {
     /// Whether drops are written into the function being checked.
     fn drops_rewriting(&self) -> bool {
         !self.speculating
@@ -340,6 +362,11 @@ impl<'a> TypeChecker<'a> {
         self.drops_glue_at(ty, 0)
     }
 
+    /// [`Self::drops_glue`] for a type found `depth` structs inside the type first asked about.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `depth` reaches 64, which means a struct holds itself by value.
     fn drops_glue_at(&mut self, ty: &Type, depth: usize) -> Vec<GluePart> {
         assert!(depth < 64, "a struct that holds itself: {ty:?}");
         match ty {
@@ -407,6 +434,34 @@ impl<'a> TypeChecker<'a> {
         Some((decl, args))
     }
 
+    /// Whether two variants of the enum put a plain value (a number, a pointer or a borrow) and
+    /// some other kind of value at the same payload position.
+    fn drops_payload_kinds_differ(
+        decl: &decl::EnumDecl,
+        mapping: &HashMap<crate::symbol::Symbol, Type>,
+    ) -> bool {
+        let arity = decl
+            .variants
+            .iter()
+            .filter_map(|(_, p)| p.as_ref().map(Vec::len))
+            .max()
+            .unwrap_or(0);
+        for position in 0..arity {
+            let mut kinds = decl
+                .variants
+                .iter()
+                .filter_map(|(_, p)| p.as_ref()?.get(position))
+                .map(|t| t.substitute(mapping))
+                .map(|t| matches!(t, Type::Scalar(_) | Type::Pointer(..) | Type::Borrow { .. }));
+            if let Some(first) = kinds.next() {
+                if kinds.any(|k| k != first) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// An enum's glue: its `Drop` impl's `drop`, then the active variant's payload.
     fn drops_enum_glue(&mut self, ty: &Type, depth: usize) -> Vec<GluePart> {
         if self.is_copy(ty) {
@@ -424,28 +479,12 @@ impl<'a> TypeChecker<'a> {
         // The legacy code generator gives each payload position one slot of one type, so a
         // `match` on an enum whose variants put a number and a struct at the same position does
         // not compile there. Such an enum is not dropped yet; it leaks, as before.
-        let arity = decl
-            .variants
-            .iter()
-            .filter_map(|(_, p)| p.as_ref().map(Vec::len))
-            .max()
-            .unwrap_or(0);
-        for position in 0..arity {
-            let mut kinds = decl
-                .variants
-                .iter()
-                .filter_map(|(_, p)| p.as_ref()?.get(position))
-                .map(|t| t.substitute(&mapping))
-                .map(|t| matches!(t, Type::Scalar(_) | Type::Pointer(..) | Type::Borrow { .. }));
-            if let Some(first) = kinds.next() {
-                if kinds.any(|k| k != first) {
-                    return Vec::new();
-                }
-            }
+        if Self::drops_payload_kinds_differ(&decl, &mapping) {
+            return Vec::new();
         }
         let mut arms = Vec::new();
         for (variant, payload) in &decl.variants {
-            let elems: Vec<Option<Vec<GluePart>>> = payload
+            let elems: PayloadGlue = payload
                 .iter()
                 .flatten()
                 .map(|t| {
@@ -586,6 +625,11 @@ impl<'a> TypeChecker<'a> {
         self.borrow.drops.frames.push(FrameKind::Spawn);
     }
 
+    /// The spawn region ends.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the innermost frame was not opened by `drops_enter_spawn`.
     pub(crate) fn drops_exit_spawn(&mut self) {
         let popped = self.borrow.drops.frames.pop();
         assert!(
@@ -594,6 +638,11 @@ impl<'a> TypeChecker<'a> {
         );
     }
 
+    /// The loop ends.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the innermost frame was not opened by `drops_enter_loop`.
     pub(crate) fn drops_exit_loop(&mut self) {
         let popped = self.borrow.drops.frames.pop();
         assert!(
@@ -678,22 +727,13 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// `name` was moved, or (`again`) given a new value after a move.
-    pub(crate) fn drops_note_move(&mut self, name: &str, again: bool) {
-        // A speculative check only asks what a type is; it moves nothing.
-        if self.speculating {
-            return;
-        }
-        let here = self.scopes.len() - 1;
-        let rewriting = self.drops_rewriting();
-        if !again {
-            self.borrow.drops.moved_now.insert(name.to_string());
-        }
-        let top = self.borrow.drops.frames.len();
-        let mut found = None;
+    /// Marks the owner `name` as moved, or (`again`) as given a new value, in the nearest block
+    /// that holds it. `here` is the scope the move happens in. `None` when no block of the
+    /// current function or spawn region owns `name`.
+    fn drops_mark_move(&mut self, name: &str, again: bool, here: usize) -> Option<MarkedOwner> {
         for (k, f) in self.borrow.drops.frames.iter_mut().enumerate().rev() {
             match f {
-                FrameKind::Function { .. } | FrameKind::Spawn => return,
+                FrameKind::Function { .. } | FrameKind::Spawn => return None,
                 FrameKind::Loop => {}
                 FrameKind::Block { owners, stmt, .. } => {
                     if let Some(o) = owners.iter_mut().rev().find(|o| o.name == name) {
@@ -711,35 +751,61 @@ impl<'a> TypeChecker<'a> {
                         } else {
                             Moved::Maybe
                         };
-                        found = Some((k, o.moved, o.flag.clone(), o.decl, o.moved_at));
-                        break;
+                        return Some(MarkedOwner {
+                            frame: k,
+                            moved: o.moved,
+                            flag: o.flag.clone(),
+                            decl: o.decl,
+                            moved_at: o.moved_at,
+                        });
                     }
                 }
             }
         }
-        let Some((k, Moved::Maybe, flag, decl, moved_at)) = found else {
+        None
+    }
+
+    /// `name` was moved, or (`again`) given a new value after a move.
+    pub(crate) fn drops_note_move(&mut self, name: &str, again: bool) {
+        // A speculative check only asks what a type is; it moves nothing.
+        if self.speculating {
+            return;
+        }
+        let here = self.scopes.len() - 1;
+        let rewriting = self.drops_rewriting();
+        if !again {
+            self.borrow.drops.moved_now.insert(name.to_string());
+        }
+        let top = self.borrow.drops.frames.len();
+        let Some(MarkedOwner {
+            frame: k,
+            moved: Moved::Maybe,
+            flag,
+            decl,
+            moved_at,
+        }) = self.drops_mark_move(name, again, here)
+        else {
             return;
         };
         if !rewriting || (again && flag.is_some()) {
             return;
         }
         // The first move inside a nested block gives the owner a flag, declared beside it.
-        let flag = match flag {
-            Some(f) => f,
-            None => {
-                let f = self.drops_fresh("moved");
-                let declare = let_stmt(&f, true, Type::Scalar(ElementType::Bool), ident("false"));
-                if let FrameKind::Block { owners, edits, .. } = &mut self.borrow.drops.frames[k] {
-                    if let Some(o) = owners.iter_mut().rev().find(|o| o.name == name) {
-                        o.flag = Some(f.clone());
-                    }
-                    match decl {
-                        Some(i) => edits.after.entry(i).or_default().push(declare),
-                        None => edits.before.entry(0).or_default().insert(0, declare),
-                    }
+        let flag = if let Some(f) = flag {
+            f
+        } else {
+            let f = self.drops_fresh("moved");
+            let declare = let_stmt(&f, true, Type::Scalar(ElementType::Bool), ident("false"));
+            if let FrameKind::Block { owners, edits, .. } = &mut self.borrow.drops.frames[k] {
+                if let Some(o) = owners.iter_mut().rev().find(|o| o.name == name) {
+                    o.flag = Some(f.clone());
                 }
-                f
+                match decl {
+                    Some(i) => edits.after.entry(i).or_default().push(declare),
+                    None => edits.before.entry(0).or_default().insert(0, declare),
+                }
             }
+            f
         };
         // Given a value again in a nested block after a certain move: the flag is set at that
         // move, and the assignment clears it.
@@ -816,6 +882,45 @@ impl<'a> TypeChecker<'a> {
         None
     }
 
+    /// Removes the drop of `name` that a tensor operator queued after the current statement, and
+    /// says whether there was one to remove.
+    fn drops_unqueue_operand_drop(&mut self, name: &str) -> bool {
+        !self.speculating
+            && self.drops_rewriting()
+            && self.borrow.drops.moved_now.contains(name)
+            && match self.borrow.drops.frames.last_mut() {
+                Some(FrameKind::Block { stmt, edits, .. }) => {
+                    let queued = edits.after.entry(*stmt).or_default();
+                    let n = queued.len();
+                    queued.retain(|s| !matches!(s, Statement::Drop(d) if d.name.as_ref() == name));
+                    queued.len() != n
+                }
+                _ => false,
+            }
+    }
+
+    /// Whether `rhs` is `a @ b` where `a` and `b` are plain variables and neither is `name`.
+    fn drops_matmul_writes_into(&self, name: &str, rhs: &Expr) -> bool {
+        if let Expr::BinaryOp(b) = rhs {
+            if matches!(b.op, BinaryOp::MatMul) {
+                let plain_root = |e: &Expr| -> Option<String> {
+                    let r = crate::syntax::matmul_operand_root(e)?;
+                    let through = matches!(
+                        self.lookup(r).map(|(t, _)| t),
+                        Some(Type::Borrow { .. } | Type::Pointer(..))
+                    );
+                    (!through).then(|| r.to_string())
+                };
+                if let (Some(l), Some(r)) = (plain_root(&b.lhs), plain_root(&b.rhs)) {
+                    if l != name && r != name {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// `name = rhs` on `line`, where `before` is what `drops_owner_state` said first: the old
     /// value is dropped once `rhs` is computed, before it is stored.
     pub(crate) fn drops_note_assign(
@@ -830,18 +935,7 @@ impl<'a> TypeChecker<'a> {
         };
         // `t = t + b` moved the old value into the operator, which queued its drop after the
         // statement, where it would free the new value. The drop moves before the store.
-        let operand_drop = !self.speculating
-            && self.drops_rewriting()
-            && self.borrow.drops.moved_now.contains(name)
-            && match self.borrow.drops.frames.last_mut() {
-                Some(FrameKind::Block { stmt, edits, .. }) => {
-                    let queued = edits.after.entry(*stmt).or_default();
-                    let n = queued.len();
-                    queued.retain(|s| !matches!(s, Statement::Drop(d) if d.name.as_ref() == name));
-                    queued.len() != n
-                }
-                _ => false,
-            };
+        let operand_drop = self.drops_unqueue_operand_drop(name);
         // `t = f(t)` moved the old value into the call; a flag still has to be cleared.
         if !operand_drop && (moved == Moved::Yes || self.borrow.drops.moved_now.contains(name)) {
             if self.speculating || !self.drops_rewriting() {
@@ -857,22 +951,8 @@ impl<'a> TypeChecker<'a> {
         }
         // `c = a @ b` with neither operand `c`: the product is written into `c`'s buffer, the
         // same test the code generators make.
-        if let Expr::BinaryOp(b) = rhs {
-            if matches!(b.op, BinaryOp::MatMul) {
-                let plain_root = |e: &Expr| -> Option<String> {
-                    let r = crate::syntax::matmul_operand_root(e)?;
-                    let through = matches!(
-                        self.lookup(r).map(|(t, _)| t),
-                        Some(Type::Borrow { .. } | Type::Pointer(..))
-                    );
-                    (!through).then(|| r.to_string())
-                };
-                if let (Some(l), Some(r)) = (plain_root(&b.lhs), plain_root(&b.rhs)) {
-                    if l != name && r != name {
-                        return;
-                    }
-                }
-            }
+        if self.drops_matmul_writes_into(name, rhs) {
+            return;
         }
         if self.speculating {
             return;
@@ -970,7 +1050,8 @@ impl<'a> TypeChecker<'a> {
             .max()
     }
 
-    fn drops_print(&self, owner: &Owner, at: String) {
+    /// Prints that `owner` is dropped `at` that place, when drops are being printed.
+    fn drops_print(&self, owner: &Owner, at: &str) {
         if !printing() {
             return;
         }
@@ -988,6 +1069,10 @@ impl<'a> TypeChecker<'a> {
     /// The block ends. `terminated_at` is its `return`, `break` or `continue`, whose own drops
     /// were found when it was checked. When drops are written into the program, the block's
     /// edits are made now.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the innermost frame was not opened by `drops_enter_block`.
     pub(crate) fn drops_exit_block(
         &mut self,
         body: &mut Vec<Statement>,
@@ -1018,7 +1103,7 @@ impl<'a> TypeChecker<'a> {
                 if terminated_at.is_some() {
                     continue;
                 }
-                self.drops_print(owner, "at the end of its block".to_string());
+                self.drops_print(owner, "at the end of its block");
                 // An empty block, as `fn drop<T>(_x : T) {}` has, drops it where it starts.
                 body.len().checked_sub(1)
             } else {
@@ -1027,16 +1112,16 @@ impl<'a> TypeChecker<'a> {
                     Some(i) => {
                         self.drops_print(
                             owner,
-                            format!("after the statement on line {}", lines[i]),
+                            &format!("after the statement on line {}", lines[i]),
                         );
                         Some(i)
                     }
                     None if owner.is_param => {
-                        self.drops_print(owner, "at the start of the function".to_string());
+                        self.drops_print(owner, "at the start of the function");
                         None
                     }
                     None => {
-                        self.drops_print(owner, "where it is made".to_string());
+                        self.drops_print(owner, "where it is made");
                         owner.decl
                     }
                 }
@@ -1048,7 +1133,7 @@ impl<'a> TypeChecker<'a> {
             }
         }
         if rewriting {
-            self.drops_apply(body, *edits);
+            Self::drops_apply(body, *edits);
         }
     }
 
@@ -1123,7 +1208,7 @@ impl<'a> TypeChecker<'a> {
             // An iterator the loop makes, `for n in v.into_iter()`, lives until the loop ends.
             Statement::ForLoop(f) => {
                 let iterator = f.next_fn.is_some();
-                self.drops_scan_temps(&mut f.iterable, iterator, scan)
+                self.drops_scan_temps(&mut f.iterable, iterator, scan);
             }
             _ => {}
         }
@@ -1132,16 +1217,21 @@ impl<'a> TypeChecker<'a> {
     /// Walk `e` in the order it is evaluated, counting its calls. Probing (`scan.upto` is
     /// `None`), note the last temporary every call before which could move out; otherwise move
     /// out each call up to that one. `borrowed`: `e`'s value is only read or discarded.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a call to move out has no known type. The probing walk stops at the first
+    /// such call, so the second walk never reaches one.
     fn drops_scan_temps(&mut self, e: &mut Expr, borrowed: bool, scan: &mut TempScan) {
         let ty = match e {
             Expr::FunctionCall(fc) => {
-                for arg in fc.args.iter_mut() {
+                for arg in &mut fc.args {
                     self.drops_scan_temps(arg, false, scan);
                 }
                 self.drops_return_type(&fc.name)
             }
             Expr::StructInit(si) => {
-                for (_, field) in si.fields.iter_mut() {
+                for (_, field) in &mut si.fields {
                     self.drops_scan_temps(field, false, scan);
                 }
                 Some(Type::Struct(si.name.clone(), None))
@@ -1210,7 +1300,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Make a block's edits, from its last statement back so the indices hold.
-    fn drops_apply(&mut self, body: &mut Vec<Statement>, mut edits: Edits) {
+    fn drops_apply(body: &mut Vec<Statement>, mut edits: Edits) {
         if body.is_empty() {
             body.extend(edits.before.remove(&0).unwrap_or_default());
             return;
@@ -1307,7 +1397,7 @@ impl<'a> TypeChecker<'a> {
                         {
                             continue;
                         }
-                        self.drops_print(owner, format!("before the {what} on line {line}"));
+                        self.drops_print(owner, &format!("before the {what} on line {line}"));
                         dropped.extend(owner_drop(owner));
                     }
                 }

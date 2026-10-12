@@ -166,7 +166,7 @@ fn main_loop(connection: Connection) -> Result<(), Box<dyn Error + Sync + Send>>
                                 vxc::formatter::format_file(text, params.options.tab_size as usize);
                             let lines: Vec<&str> = text.lines().collect();
                             let last_line = lines.len().saturating_sub(1) as u32;
-                            let last_col = lines.last().map(|s| s.len() as u32).unwrap_or(0);
+                            let last_col = lines.last().map_or(0, |s| s.len() as u32);
 
                             let edit = lsp_types::TextEdit {
                                 range: Range {
@@ -237,7 +237,7 @@ where
     R::Params: serde::de::DeserializeOwned,
 {
     req.extract(R::METHOD)
-        .map_err(|e| format!("cast failed: {:?}", e).into())
+        .map_err(|e| format!("cast failed: {e:?}").into())
 }
 
 fn send_diagnostics(

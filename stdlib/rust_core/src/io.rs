@@ -18,16 +18,18 @@ use crate::{instantiate_file_ffi, instantiate_stdio_ffi};
 instantiate_file_ffi!();
 instantiate_stdio_ffi!();
 
+/// Prints an `i32` to standard output with no newline, and returns 0.
 #[no_mangle]
 pub extern "C" fn print_i32(val: i32) -> i32 {
-    print!("{}", val);
+    print!("{val}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     0
 }
 
+/// Prints an `i64` to standard output with no newline, and returns 0.
 #[no_mangle]
 pub extern "C" fn print_i64(val: i64) -> i32 {
-    print!("{}", val);
+    print!("{val}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     0
 }
@@ -38,28 +40,31 @@ pub extern "C" fn print_i64(val: i64) -> i32 {
 /// number. One per width, so the element type alone decides the call.
 #[no_mangle]
 pub extern "C" fn print_u8(val: u8) -> i32 {
-    print!("{}", val);
+    print!("{val}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     0
 }
 
+/// Prints a `u16` to standard output with no newline, and returns 0.
 #[no_mangle]
 pub extern "C" fn print_u16(val: u16) -> i32 {
-    print!("{}", val);
+    print!("{val}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     0
 }
 
+/// Prints a `u32` to standard output with no newline, and returns 0.
 #[no_mangle]
 pub extern "C" fn print_u32(val: u32) -> i32 {
-    print!("{}", val);
+    print!("{val}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     0
 }
 
+/// Prints a `u64` to standard output with no newline, and returns 0.
 #[no_mangle]
 pub extern "C" fn print_u64(val: u64) -> i32 {
-    print!("{}", val);
+    print!("{val}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     0
 }
@@ -72,32 +77,38 @@ pub extern "C" fn print_bool(val: i32) -> i32 {
     0
 }
 
+/// Prints an `f32` to standard output with no newline, and returns 0.
 #[no_mangle]
 pub extern "C" fn print_f32(val: f32) -> i32 {
-    print!("{}", val);
+    print!("{val}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     0
 }
 
+/// Prints an `f64` to standard output with no newline, and returns 0.
 #[no_mangle]
 pub extern "C" fn print_f64(val: f64) -> i32 {
-    print!("{}", val);
+    print!("{val}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     0
 }
 
+/// Prints a C string to standard output with no newline, and returns 0. Prints nothing
+/// when the pointer is null or the bytes are not valid UTF-8.
 #[no_mangle]
 pub extern "C" fn print_str(piece: *const libc::c_char) -> i32 {
     if piece.is_null() {
         return 0;
     }
+    // SAFETY: the caller passes a NUL-terminated C string that stays alive for this call.
     if let Ok(s) = unsafe { std::ffi::CStr::from_ptr(piece) }.to_str() {
-        print!("{}", s);
+        print!("{s}");
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
     0
 }
 
+/// Prints a newline to standard output, and returns 0.
 #[no_mangle]
 pub extern "C" fn println() -> i32 {
     println!();

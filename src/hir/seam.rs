@@ -35,6 +35,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -46,8 +47,11 @@ const VAL_BITS: u32 = 64;
 /// Constant-propagation lattice tag, encoded as 2 bits (BOT=00, CONST=01, TOP=11).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tag {
+    /// No value has reached the location.
     Bot,
+    /// The location holds one known value.
     Const,
+    /// The location may hold any value.
     Top,
 }
 
@@ -55,17 +59,23 @@ pub enum Tag {
 /// meaningful only when `tag == Const`.
 #[derive(Clone, Debug)]
 pub struct Cell {
+    /// What is known about the location.
     pub tag: Tag,
+    /// The known value. Read it only when `tag` is `Const`.
     pub value: u64,
 }
 
 impl Cell {
+    /// A cell that is known to hold `v`.
+    #[must_use]
     pub fn constant(v: u64) -> Self {
         Cell {
             tag: Tag::Const,
             value: v,
         }
     }
+    /// A cell that may hold any value.
+    #[must_use]
     pub fn top() -> Self {
         Cell {
             tag: Tag::Top,
@@ -78,6 +88,7 @@ impl Cell {
 /// locations and their cells (the relevant slice of the bit-packed GID stream).
 #[derive(Clone, Debug)]
 pub struct AbsState {
+    /// Each location's name and its cell.
     pub cells: Vec<(String, Cell)>,
 }
 
@@ -92,29 +103,39 @@ pub enum Transfer {
     /// The synchronization signal a consumer keys on (e.g. the flag) is *not*
     /// listed here — it stays observable; it is the data it was meant to protect
     /// that goes stale.
-    Relaxed { published: Vec<String> },
+    Relaxed {
+        /// The names of the locations that go stale.
+        published: Vec<String>,
+    },
 }
 
 /// A contract clause: `premise.0 == const premise.1`  implies
 /// `conclusion.0 == const conclusion.1`. (E.g. flag==1 ⇒ data==42.)
 #[derive(Clone, Debug)]
 pub struct Contract {
+    /// The location and the value it must hold for the clause to apply.
     pub premise: (String, u64),
+    /// The location and the value it must then hold.
     pub conclusion: (String, u64),
 }
 
 /// The compiler's verdict at a seam.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
+    /// The contract holds after the transfer.
     Accept,
-    Reject { counterexample: String },
+    /// The contract can be broken after the transfer.
+    Reject {
+        /// The values `z3` found that break it.
+        counterexample: String,
+    },
 }
 
 /// Apply the seam's transfer function to the reached state.
 fn apply_transfer(state: &AbsState, t: &Transfer) -> AbsState {
     let mut out = state.clone();
     if let Transfer::Relaxed { published } = t {
-        for (name, cell) in out.cells.iter_mut() {
+        for (name, cell) in &mut out.cells {
             if published.iter().any(|p| p == name) {
                 *cell = Cell::top();
             }
@@ -135,7 +156,7 @@ fn hex(v: u64) -> String {
     format!("#x{:0width$x}", v & mask, width = nybbles)
 }
 
-/// One-time QF_BV preamble: model production, logic, and the lattice-tag definitions.
+/// One-time `QF_BV` preamble: model production, logic, and the lattice-tag definitions.
 /// Installed once per persistent solver (or prepended to each one-shot script).
 const PREAMBLE: &str = "(set-option :produce-models true)\n\
 (set-logic QF_BV)\n\
@@ -148,18 +169,24 @@ const PREAMBLE: &str = "(set-option :produce-models true)\n\
 fn state_smt(post: &AbsState) -> String {
     let mut s = String::new();
     for (name, cell) in &post.cells {
-        s.push_str(&format!("(declare-const tag_{name} (_ BitVec 2))\n"));
-        s.push_str(&format!(
-            "(declare-const val_{name} (_ BitVec {VAL_BITS}))\n"
-        ));
+        writeln!(s, "(declare-const tag_{name} (_ BitVec 2))")
+            .expect("writing to a String cannot fail");
+        writeln!(s, "(declare-const val_{name} (_ BitVec {VAL_BITS}))")
+            .expect("writing to a String cannot fail");
         match cell.tag {
             Tag::Const => {
-                s.push_str(&format!("(assert (= tag_{name} CONST))\n"));
-                s.push_str(&format!("(assert (= val_{name} {}))\n", hex(cell.value)));
+                writeln!(s, "(assert (= tag_{name} CONST))")
+                    .expect("writing to a String cannot fail");
+                writeln!(s, "(assert (= val_{name} {}))", hex(cell.value))
+                    .expect("writing to a String cannot fail");
             }
             // TOP: tag fixed, value left free so z3 can exhibit the stale read.
-            Tag::Top => s.push_str(&format!("(assert (= tag_{name} TOP))\n")),
-            Tag::Bot => s.push_str(&format!("(assert (= tag_{name} BOT))\n")),
+            Tag::Top => {
+                writeln!(s, "(assert (= tag_{name} TOP))").expect("writing to a String cannot fail")
+            }
+            Tag::Bot => {
+                writeln!(s, "(assert (= tag_{name} BOT))").expect("writing to a String cannot fail")
+            }
         }
     }
     s
@@ -171,16 +198,20 @@ fn value_goal_smt(c: &Contract) -> String {
     let (pn, pv) = &c.premise;
     let (cn, cv) = &c.conclusion;
     let mut s = String::new();
-    s.push_str(&format!(
-        "(assert (and (= tag_{pn} CONST) (= val_{pn} {})))\n",
+    writeln!(
+        s,
+        "(assert (and (= tag_{pn} CONST) (= val_{pn} {})))",
         hex(*pv)
-    ));
-    s.push_str(&format!(
-        "(assert (not (and (= tag_{cn} CONST) (= val_{cn} {}))))\n",
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        s,
+        "(assert (not (and (= tag_{cn} CONST) (= val_{cn} {}))))",
         hex(*cv)
-    ));
+    )
+    .expect("writing to a String cannot fail");
     s.push_str("(check-sat)\n");
-    s.push_str(&format!("(get-value (val_{cn} tag_{cn}))\n"));
+    writeln!(s, "(get-value (val_{cn} tag_{cn}))").expect("writing to a String cannot fail");
     s
 }
 
@@ -194,7 +225,7 @@ fn buffers_goal_smt(consumed: &[String]) -> String {
         .join(" ");
     let mut s = format!("(assert (or {disj}))\n(check-sat)\n");
     for b in consumed {
-        s.push_str(&format!("(get-value (tag_{b} val_{b}))\n"));
+        writeln!(s, "(get-value (tag_{b} val_{b}))").expect("writing to a String cannot fail");
     }
     s
 }
@@ -212,7 +243,11 @@ fn value1_goal_smt(buffer: &str, expected: u64) -> String {
     )
 }
 
-/// Run a QF_BV script through z3 (mirrors `prover.rs`). Returns (sat?, model-text).
+/// Run a `QF_BV` script through z3 (mirrors `prover.rs`). Returns (sat?, model-text).
+///
+/// # Errors
+/// When `z3` is not installed, cannot be started or written to, or prints neither `sat` nor
+/// `unsat`.
 fn run_z3(script: &str) -> Result<(bool, String), String> {
     let mut child = match Command::new("z3")
         .arg("-in")
@@ -257,6 +292,9 @@ fn run_z3(script: &str) -> Result<(bool, String), String> {
 
 /// Discharge the per-seam value-contract obligation: does the contract survive
 /// the transfer? (E.g. the message-passing `flag == 1 => data == 42`.)
+///
+/// # Errors
+/// When `z3` cannot be run or gives no verdict.
 pub fn check_seam(reached: &AbsState, t: &Transfer, c: &Contract) -> Result<Verdict, String> {
     let post = apply_transfer(reached, t);
     let script = format!("{PREAMBLE}{}{}", state_smt(&post), value_goal_smt(c));
@@ -275,6 +313,9 @@ pub fn check_seam(reached: &AbsState, t: &Transfer, c: &Contract) -> Result<Verd
 /// local-completeness obligation for the coarsest abstraction (definite vs ⊤),
 /// instantiated from the actual buffer names crossing the seam — a sync transfer
 /// keeps each `CONST`; a relaxed transfer sends published buffers to `TOP`.
+///
+/// # Errors
+/// When `z3` cannot be run or gives no verdict.
 pub fn check_seam_buffers(
     reached: &AbsState,
     t: &Transfer,
@@ -303,7 +344,7 @@ pub fn check_seam_buffers(
 /// preamble are paid **once** (`new`); each obligation is one `(push)`/`(check-sat)`/
 /// `(pop)` round-trip (`check`/`check_buffers`), so the per-seam cost the compiler
 /// reports is solving time, not process-startup time. If z3 is absent the solver is
-/// `unavailable` and every obligation fails open (Accept), matching `prover.rs`.
+/// unavailable and every obligation is an error, as in `prover.rs`.
 pub struct Solver {
     pipe: Option<Pipe>,
 }
@@ -321,12 +362,18 @@ impl Solver {
     /// Spawn the persistent solver and install the one-time preamble. Never fails here:
     /// if z3 cannot be started the solver is unavailable, and `query` reports each obligation
     /// as undischarged rather than certifying it (Vx#374).
+    #[must_use]
     pub fn new() -> Self {
         Solver {
             pipe: Self::start().ok(),
         }
     }
 
+    /// Starts `z3` and sends it the preamble.
+    ///
+    /// # Errors
+    /// When `z3` cannot be started, its input or output cannot be opened, or the preamble cannot
+    /// be written.
     fn start() -> Result<Pipe, String> {
         use std::io::{BufReader, Write};
         use std::process::{Command, Stdio};
@@ -349,18 +396,18 @@ impl Solver {
 
     /// Run one obligation body (state + goal) inside a fresh assertion scope. Returns
     /// `(violable, model)`; an unavailable solver is an error, not a verdict (Vx#374).
+    ///
+    /// # Errors
+    /// When the solver was never started, stops answering, or gives no verdict.
     fn query(&mut self, body: &str) -> Result<(bool, String), String> {
         use std::io::{BufRead, Write};
-        let pipe = match &mut self.pipe {
-            Some(p) => p,
-            None => {
-                // `(false, _)` here means "not violable", i.e. the seam is safe -- so an
-                // unavailable solver used to certify every obligation it was handed (Vx#374).
-                // The caller's Err arm reports an undischarged obligation instead.
-                return Err(crate::hir::solver::missing_message(
-                    "the persistent solver could not be started",
-                ));
-            }
+        let Some(pipe) = &mut self.pipe else {
+            // `(false, _)` here means "not violable", i.e. the seam is safe -- so an
+            // unavailable solver used to certify every obligation it was handed (Vx#374).
+            // The caller's Err arm reports an undischarged obligation instead.
+            return Err(crate::hir::solver::missing_message(
+                "the persistent solver could not be started",
+            ));
         };
         let script = format!("(push 1)\n{body}(pop 1)\n(echo \"{SENTINEL}\")\n");
         pipe.stdin
@@ -400,6 +447,9 @@ impl Solver {
     }
 
     /// Persistent-solver counterpart of [`check_seam`].
+    ///
+    /// # Errors
+    /// When the solver is not running or gives no verdict.
     pub fn check_seam(
         &mut self,
         reached: &AbsState,
@@ -419,6 +469,9 @@ impl Solver {
     }
 
     /// Persistent-solver counterpart of [`check_seam_buffers`].
+    ///
+    /// # Errors
+    /// When the solver is not running or gives no verdict.
     pub fn check_seam_buffers(
         &mut self,
         reached: &AbsState,
@@ -446,6 +499,9 @@ impl Solver {
     /// Per-seam *value* obligation for a buffer whose producer value `expected` is
     /// statically known: can the buffer fail to hold `expected` after the transfer?
     /// Stronger than [`check_seam_buffers`] (pins the value, not just definiteness).
+    ///
+    /// # Errors
+    /// When the solver is not running or gives no verdict.
     pub fn check_seam_value(
         &mut self,
         reached: &AbsState,
@@ -488,6 +544,11 @@ impl Drop for Solver {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 
@@ -634,8 +695,8 @@ mod tests {
         for _ in 0..100 {
             let _ = s.check_seam_buffers(&st, &sync, &consumed).unwrap();
         }
-        let n = 2000usize;
-        let mut us = Vec::with_capacity(n);
+        let n: u32 = 2000;
+        let mut us = Vec::new();
         for _ in 0..n {
             let t = std::time::Instant::now();
             let _ = s.check_seam_buffers(&st, &sync, &consumed).unwrap();
@@ -643,9 +704,9 @@ mod tests {
         }
         us.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let min = us[0];
-        let median = us[n / 2];
-        let mean = us.iter().sum::<f64>() / n as f64;
-        let p99 = us[(n as f64 * 0.99) as usize];
+        let median = us[us.len() / 2];
+        let mean = us.iter().sum::<f64>() / f64::from(n);
+        let p99 = us[us.len() * 99 / 100];
         println!(
             "[bench] marginal per-seam over {n} obligations (warm, persistent solver): \
              min={min:.1}us median={median:.1}us mean={mean:.1}us p99={p99:.1}us"

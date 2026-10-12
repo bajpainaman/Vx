@@ -96,8 +96,10 @@ fn capture(cmd: &str, args: &[&str]) -> String {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+        .map_or_else(
+            || "unknown".to_string(),
+            |o| String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        )
 }
 
 /// What a number has to carry to be comparable with another one: which commit
@@ -275,12 +277,12 @@ mod compare {
 
     fn median(v: &[f64]) -> f64 {
         let mut s = v.to_vec();
-        s.sort_by(|a, b| a.total_cmp(b));
+        s.sort_by(f64::total_cmp);
         let n = s.len();
         if n % 2 == 1 {
             s[n / 2]
         } else {
-            (s[n / 2 - 1] + s[n / 2]) / 2.0
+            f64::midpoint(s[n / 2 - 1], s[n / 2])
         }
     }
 

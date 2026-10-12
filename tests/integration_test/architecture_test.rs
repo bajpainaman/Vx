@@ -28,7 +28,7 @@ fn test_pipeline_architecture_hooks() -> Result<(), String> {
     let file1_path = dir.join("module_a.vx");
     fs::write(
         &file1_path,
-        r#"
+        r"
         struct Config {
             id: i32,
             active: bool,
@@ -46,7 +46,7 @@ fn test_pipeline_architecture_hooks() -> Result<(), String> {
             let _ref = process_config(10i32, &c, count, limit, ratio);
             return c;
         }
-        "#,
+        ",
     )
     .unwrap();
 
@@ -55,7 +55,7 @@ fn test_pipeline_architecture_hooks() -> Result<(), String> {
     let file2_path = dir.as_path().join("module_b.vx");
     fs::write(
         &file2_path,
-        r#"
+        r"
         fn compute_heavy(
             p1: &Tensor<f32, [?, ?]>, p2: &Tensor<f32, [?, ?]>, p3: &Tensor<f32, [?, ?]>, p4: &Tensor<f32, [?, ?]>,
             p5: &Tensor<f32, [?, ?]>, p6: &Tensor<f32, [?, ?]>, p7: &Tensor<f32, [?, ?]>, p8: &Tensor<f32, [?, ?]>,
@@ -70,7 +70,7 @@ fn test_pipeline_architecture_hooks() -> Result<(), String> {
             compute_heavy(&result, &result, &result, &result, &result, &result, &result, &result, &result, &result, &mut result2);
             return result;
         }
-        "#,
+        ",
     )
     .unwrap();
 
@@ -110,7 +110,7 @@ fn compile_pipeline_gid_stream_is_deterministic() -> Result<(), String> {
     let modules = [
         (
             "alpha.vx",
-            r#"
+            r"
             struct Widget { id: i32, active: bool }
             fn identity<T>(v: T) -> T { return v; }
             fn run_alpha() -> Widget {
@@ -118,15 +118,15 @@ fn compile_pipeline_gid_stream_is_deterministic() -> Result<(), String> {
                 let _r = identity(7i32);
                 return w;
             }
-            "#,
+            ",
         ),
         (
             "beta.vx",
-            r#"
+            r"
             struct Widget { id: i32, active: bool }
             fn combine(a: i32, b: i32, c: i32, d: i32, e: i32, f: u64) -> i32 { return a; }
             fn run_beta() -> i32 { return combine(1i32, 2i32, 3i32, 4i32, 5i32, 6u64); }
-            "#,
+            ",
         ),
     ];
 
@@ -139,7 +139,7 @@ fn compile_pipeline_gid_stream_is_deterministic() -> Result<(), String> {
 
     let run = || -> Result<Vec<[u64; 4]>, String> {
         let mut stream = vxc::pipeline::compile_pipeline_type_stream(&paths)
-            .map_err(|e| format!("pipeline failed: {:?}", e))?
+            .map_err(|e| format!("pipeline failed: {e:?}"))?
             .into_iter()
             .map(|id| id.words)
             .collect::<Vec<_>>();
@@ -163,7 +163,7 @@ fn compile_pipeline_gid_stream_is_deterministic() -> Result<(), String> {
 }
 
 /// The core parallel-architecture guarantee: compilations are isolated because the compiler holds
-/// no process-global *mutable* state (docs/parallel_compiler_architecture.md §2.7). Many threads
+/// no process-global *mutable* state (`docs/parallel_compiler_architecture.md` §2.7). Many threads
 /// each compile a program that declares a topology with the *same name* `Dev` but a *different*
 /// default memory. Each thread must see only its own declaration in its own per-compilation
 /// `TransferCostGraph`. A global registry (the old `RwLock`, or the `thread_local` stopgap) would

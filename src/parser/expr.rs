@@ -10,7 +10,17 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::*;
+use super::{
+    tuple_match, ArrayExpr, AsCastExpr, BinaryOp, BinaryOpExpr, BorrowExpr, ClosureExpr,
+    ComptimeBlockExpr, DereferenceExpr, ElementType, EnumVariantExpr, Expr, ExprStmtStmt,
+    FunctionCallExpr, GradExpr, IdentifierExpr, IfExpr, IndexAccessExpr, IndirectCallExpr, JvpExpr,
+    LogicalOp, LogicalOpExpr, MacroCallExpr, MatchArm, MatchExpr, MemberAccessExpr,
+    MemorySpaceExpr, MethodCallExpr, NumberExpr, ParseResult, Parser, Pattern, RangeExpr,
+    RelationalOp, RelationalOpExpr, SizeOfExpr, Span, SpawnOnExpr, Statement, StringLiteralExpr,
+    StructInitExpr, TokenType, TopologyExpr, TransferExpr, TransferPredicateExpr, Type, UnaryOp,
+    UnaryOpExpr, UnsafeBlockExpr, VjpExpr,
+};
+use crate::lexer::Token;
 
 /// Split a numeric literal token into its numeric part and *explicit* element type.
 ///
@@ -19,6 +29,10 @@ use super::*;
 /// type-checking, falling back to [`default_number_elem`] when no context supplies one. This
 /// keeps implicit numeric conversion out of the language: the literal is born at the right type
 /// rather than silently coerced.
+///
+/// # Errors
+///
+/// Returns a message when the suffix is not the name of an element type.
 pub(crate) fn infer_number_literal(s: &str) -> Result<(&str, Option<ElementType>), String> {
     let idx = s.find(|c: char| c.is_alphabetic() || c == '_');
     let (num_part, suffix_part) = match idx {
@@ -26,10 +40,10 @@ pub(crate) fn infer_number_literal(s: &str) -> Result<(&str, Option<ElementType>
         None => (s, ""),
     };
 
-    let el_ty = if !suffix_part.is_empty() {
-        Some(suffix_part.parse::<ElementType>()?)
-    } else {
+    let el_ty = if suffix_part.is_empty() {
         None
+    } else {
+        Some(suffix_part.parse::<ElementType>()?)
     };
     Ok((num_part, el_ty))
 }
@@ -91,7 +105,78 @@ pub(crate) fn stamp_dim_literals(expr: &mut Expr) {
 /// is written as two.
 const SHIFT_PRECEDENCE: u8 = 65;
 
+/// The kind of node a one-token binary operator builds.
+enum InfixOp {
+    /// `||` or `&&`.
+    Logical(LogicalOp),
+    /// A comparison such as `==` or `<`.
+    Relational(RelationalOp),
+    /// An arithmetic or bitwise operator such as `+` or `&`.
+    Binary(BinaryOp),
+    /// `..`, which builds a range.
+    Range,
+}
+
+impl InfixOp {
+    /// The operator a token stands for, or `None` when the token is not a binary operator.
+    fn from_token(kind: &TokenType<'_>) -> Option<Self> {
+        Some(match kind {
+            TokenType::OrOr => Self::Logical(LogicalOp::Or),
+            TokenType::AndAnd => Self::Logical(LogicalOp::And),
+            TokenType::EqEq => Self::Relational(RelationalOp::Eq),
+            TokenType::NotEq => Self::Relational(RelationalOp::NotEq),
+            TokenType::LessEq => Self::Relational(RelationalOp::Le),
+            TokenType::GreaterEq => Self::Relational(RelationalOp::Ge),
+            TokenType::LeftAngle => Self::Relational(RelationalOp::Lt),
+            TokenType::RightAngle => Self::Relational(RelationalOp::Gt),
+            TokenType::Plus => Self::Binary(BinaryOp::Add),
+            TokenType::Minus => Self::Binary(BinaryOp::Sub),
+            TokenType::Star => Self::Binary(BinaryOp::Mul),
+            TokenType::At => Self::Binary(BinaryOp::MatMul),
+            TokenType::Slash => Self::Binary(BinaryOp::Div),
+            TokenType::Percent => Self::Binary(BinaryOp::Rem),
+            TokenType::Ampersand => Self::Binary(BinaryOp::BitAnd),
+            TokenType::Pipe => Self::Binary(BinaryOp::BitOr),
+            TokenType::Caret => Self::Binary(BinaryOp::BitXor),
+            TokenType::DoubleDot => Self::Range,
+            _ => return None,
+        })
+    }
+
+    /// Builds the expression `lhs <operator> rhs`, with `span` pointing at the operator.
+    fn build(self, lhs: Expr, rhs: Expr, span: Span) -> Expr {
+        let (lhs, rhs) = (Box::new(lhs), Box::new(rhs));
+        match self {
+            Self::Logical(op) => Expr::LogicalOp(LogicalOpExpr { lhs, op, rhs, span }),
+            Self::Relational(op) => Expr::RelationalOp(RelationalOpExpr {
+                lhs,
+                op,
+                rhs,
+                span,
+                operand_ty: None,
+            }),
+            Self::Binary(op) => Expr::BinaryOp(BinaryOpExpr {
+                lhs,
+                op,
+                rhs,
+                span,
+                operand_ty: None,
+            }),
+            Self::Range => Expr::Range(RangeExpr {
+                start: lhs,
+                end: rhs,
+                span,
+            }),
+        }
+    }
+}
+
 impl<'a> Parser<'a> {
+    /// Parses one whole expression.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the tokens do not form an expression.
     pub(crate) fn parse_expr(&mut self) -> ParseResult<'a, Expr> {
         self.parse_binary_expr(0)
     }
@@ -137,6 +222,11 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parses operands joined by binary operators that bind at least as tightly as `precedence`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when an operand is not a valid expression.
     pub(crate) fn parse_binary_expr(&mut self, precedence: u8) -> ParseResult<'a, Expr> {
         let mut left = self.parse_primary_expr()?;
 
@@ -161,7 +251,7 @@ impl<'a> Parser<'a> {
             let shift = self.shift_at();
             let op_prec = match shift {
                 Some(_) => SHIFT_PRECEDENCE,
-                None => match self.get_operator_precedence(&self.peek().kind) {
+                None => match Self::get_operator_precedence(&self.peek().kind) {
                     Some(p) => p,
                     None => break,
                 },
@@ -182,192 +272,19 @@ impl<'a> Parser<'a> {
                 });
                 continue;
             }
-            let token = self.advance().clone();
-            match token.kind {
-                TokenType::OrOr => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::LogicalOp(LogicalOpExpr {
-                        lhs: Box::new(left),
-                        op: LogicalOp::Or,
-                        rhs: Box::new(right),
-                        span: op_span,
-                    });
-                }
-                TokenType::AndAnd => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::LogicalOp(LogicalOpExpr {
-                        lhs: Box::new(left),
-                        op: LogicalOp::And,
-                        rhs: Box::new(right),
-                        span: op_span,
-                    });
-                }
-                TokenType::EqEq => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::RelationalOp(RelationalOpExpr {
-                        lhs: Box::new(left),
-                        op: RelationalOp::Eq,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::NotEq => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::RelationalOp(RelationalOpExpr {
-                        lhs: Box::new(left),
-                        op: RelationalOp::NotEq,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::LessEq => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::RelationalOp(RelationalOpExpr {
-                        lhs: Box::new(left),
-                        op: RelationalOp::Le,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::GreaterEq => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::RelationalOp(RelationalOpExpr {
-                        lhs: Box::new(left),
-                        op: RelationalOp::Ge,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::LeftAngle => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::RelationalOp(RelationalOpExpr {
-                        lhs: Box::new(left),
-                        op: RelationalOp::Lt,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::RightAngle => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::RelationalOp(RelationalOpExpr {
-                        lhs: Box::new(left),
-                        op: RelationalOp::Gt,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::Plus => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::BinaryOp(BinaryOpExpr {
-                        lhs: Box::new(left),
-                        op: BinaryOp::Add,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::Minus => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::BinaryOp(BinaryOpExpr {
-                        lhs: Box::new(left),
-                        op: BinaryOp::Sub,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::Star => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::BinaryOp(BinaryOpExpr {
-                        lhs: Box::new(left),
-                        op: BinaryOp::Mul,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::At => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::BinaryOp(BinaryOpExpr {
-                        lhs: Box::new(left),
-                        op: BinaryOp::MatMul,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::Slash => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::BinaryOp(BinaryOpExpr {
-                        lhs: Box::new(left),
-                        op: BinaryOp::Div,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::Percent => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::BinaryOp(BinaryOpExpr {
-                        lhs: Box::new(left),
-                        op: BinaryOp::Rem,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::Ampersand => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::BinaryOp(BinaryOpExpr {
-                        lhs: Box::new(left),
-                        op: BinaryOp::BitAnd,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::Pipe => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::BinaryOp(BinaryOpExpr {
-                        lhs: Box::new(left),
-                        op: BinaryOp::BitOr,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::Caret => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::BinaryOp(BinaryOpExpr {
-                        lhs: Box::new(left),
-                        op: BinaryOp::BitXor,
-                        rhs: Box::new(right),
-                        span: op_span,
-                        operand_ty: None,
-                    });
-                }
-                TokenType::DoubleDot => {
-                    let right = self.parse_binary_expr(op_prec + 1)?;
-                    left = Expr::Range(RangeExpr {
-                        start: Box::new(left),
-                        end: Box::new(right),
-                        span: op_span,
-                    });
-                }
-                _ => return Err(self.error("Unknown binary operator")),
+            let Some(op) = InfixOp::from_token(&self.advance().kind) else {
+                return Err(self.error("Unknown binary operator"));
             };
+            let right = self.parse_binary_expr(op_prec + 1)?;
+            left = op.build(left, right, op_span);
         }
 
         Ok(left)
     }
 
-    pub(crate) fn get_operator_precedence(&self, kind: &TokenType) -> Option<u8> {
+    /// How tightly a one-token binary operator binds; a larger number binds tighter. `None` when
+    /// the token is not a binary operator.
+    pub(crate) fn get_operator_precedence(kind: &TokenType<'_>) -> Option<u8> {
         match kind {
             TokenType::OrOr => Some(10),
             TokenType::AndAnd => Some(20),
@@ -393,6 +310,11 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parses a `match` arm pattern: `_`, a literal, a name, or an enum variant with its payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the tokens do not form a pattern.
     pub(crate) fn parse_pattern(&mut self) -> ParseResult<'a, Pattern> {
         if self.match_token(&TokenType::Identifier("_")) {
             return Ok(Pattern::Wildcard);
@@ -453,77 +375,38 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parses what follows a name: a call, a struct literal, an enum variant, or the name alone.
+    ///
+    /// `call_name` is the identifier that was just consumed and `span` is where it is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the tokens after the name do not form an expression.
     pub(crate) fn parse_identifier_expr(
         &mut self,
         mut call_name: String,
         span: Span,
     ) -> ParseResult<'a, Expr> {
         if call_name == "sizeof" {
-            self.consume(&TokenType::LeftAngle, "Expected '<' after sizeof")?;
-            let target_ty = self.parse_type()?;
-            self.consume(&TokenType::RightAngle, "Expected '>' after sizeof type")?;
-            self.consume(&TokenType::LeftParen, "Expected '(' after sizeof<...>")?;
-            self.consume(&TokenType::RightParen, "Expected ')' after sizeof<...>(")?;
-            return Ok(Expr::SizeOf(SizeOfExpr {
-                target_ty,
-                span: Span::default(),
-            }));
+            return self.parse_sizeof_expr();
         }
 
         // `Tensor<f32, [4, 4], Memory::X>::uninit()`: the type says what to build, and the
         // constructor says whether it arrives initialized.
-        //
-        // Read with the real type parser rather than `parse_generic_type_args`, because a tensor
-        // type's arguments are not all types -- `[4, 4]` is a shape and `Memory::X` a placement --
-        // so the generic-argument parser cannot read them at all. Falls through to the older
-        // `Tensor<f32>([4, 4])` spelling when the type does not parse or no `::` follows.
         if (call_name == "Tensor" || call_name == "DynTensor") && self.check(&TokenType::LeftAngle)
         {
-            let saved = self.pos;
-            self.pos -= 1; // back onto the identifier, which `parse_named_type` consumes
-            match self.parse_named_type() {
-                Ok(ty) if self.check(&TokenType::DoubleColon) => {
-                    return self.parse_tensor_constructor(ty, span);
-                }
-                // `Tensor<f32, [2, 2]>()` would fall through to the older spelling, which takes
-                // the shape from the arguments and so built a tensor with no dimensions.
-                Ok(ty) if self.check(&TokenType::LeftParen) => {
-                    return Err(self.error(&format!(
-                        "`{ty}` is built with `{ty}::new()` for zeroed storage or `{ty}::uninit()` \
-                         for storage left as it was found"
-                    )));
-                }
-                _ => self.pos = saved,
+            if let Some(expr) = self.parse_typed_tensor_constructor(span)? {
+                return Ok(expr);
             }
         }
 
-        // `Reachable<A, B>` as a value: a comptime transferability predicate. Same constraint
-        // as the `where` clause of the same name, usable in `if comptime`. Spelled
-        // `Transfer<A, B>` until Vx#353; see the `where` parser for why it moved.
         if call_name == "Reachable" && self.check(&TokenType::LeftAngle) {
-            self.advance(); // consume '<'
-            let from = self.parse_topology_operand()?;
-            self.consume(&TokenType::Comma, "Expected ',' in Reachable<A, B>")?;
-            let to = self.parse_topology_operand()?;
-            self.consume(&TokenType::RightAngle, "Expected '>' after Reachable<A, B>")?;
-            return Ok(Expr::TransferPredicate(TransferPredicateExpr {
-                from,
-                to,
-                span,
-            }));
+            return self.parse_reachable_predicate(span);
         }
 
         let mut parsed_type_args = None;
         if self.check(&TokenType::LeftAngle) {
-            let saved_pos = self.pos;
-            self.advance(); // consume '<'
-            if let Ok(type_args) = self.parse_generic_type_args() {
-                if !type_args.is_empty() {
-                    parsed_type_args = Some(type_args);
-                }
-            } else {
-                self.pos = saved_pos;
-            }
+            parsed_type_args = self.try_parse_type_args();
         }
         // `Self::Item::default()`, `I::Item::default()`: the associated type is the owner of the
         // call, so its segment joins the name before the method's does.
@@ -548,106 +431,18 @@ impl<'a> Parser<'a> {
             call_name = format!("{call_name}::{assoc}");
         }
         if self.check(&TokenType::DoubleColon) {
-            let t1 = self.tokens.get(self.pos + 1).map(|t| &t.kind);
-            let t2 = self.tokens.get(self.pos + 2).map(|t| &t.kind);
-            let has_paren = matches!(
-                (t1, t2),
-                (Some(TokenType::Identifier(_)), Some(TokenType::LeftParen))
-                    | (Some(TokenType::Identifier(_)), Some(TokenType::LeftAngle))
-            );
-
-            if has_paren {
-                Self::apply_type_args(&mut call_name, parsed_type_args.take());
-
-                self.advance(); // consume '::'
-                if let TokenType::Identifier(method_name) = self.peek().kind.clone() {
-                    self.advance(); // consume method name
-                    call_name = format!("{}::{}", call_name, method_name);
-
-                    if self.check(&TokenType::LeftAngle) {
-                        let saved_pos = self.pos;
-                        self.advance(); // consume '<'
-                        if let Ok(type_args) = self.parse_generic_type_args() {
-                            if !type_args.is_empty() {
-                                parsed_type_args = Some(type_args);
-                            }
-                        } else {
-                            self.pos = saved_pos;
-                        }
-                    }
-                }
-            }
+            self.parse_path_method(&mut call_name, &mut parsed_type_args);
         }
         if self.match_token(&TokenType::LeftParen) {
-            let mut args = Vec::new();
-            if !self.check(&TokenType::RightParen) {
-                loop {
-                    args.push(self.parse_expr()?);
-                    if !self.match_token(&TokenType::Comma) {
-                        break;
-                    }
-                }
-            }
-            self.consume(&TokenType::RightParen, "Expected ')'")?;
+            let args = self.parse_call_args("Expected ')'")?;
             Ok(Expr::FunctionCall(FunctionCallExpr {
                 name: call_name.into(),
                 type_args: parsed_type_args,
                 args,
                 span,
             }))
-        } else if self.check(&TokenType::LeftBrace) {
-            let is_struct_init = matches!(
-                (
-                    self.tokens.get(self.pos).map(|t| &t.kind),
-                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
-                    self.tokens.get(self.pos + 2).map(|t| &t.kind),
-                ),
-                (Some(TokenType::LeftBrace), Some(TokenType::RightBrace), _)
-                    | (
-                        Some(TokenType::LeftBrace),
-                        Some(TokenType::Identifier(_)),
-                        Some(TokenType::Colon),
-                    )
-            );
-
-            if is_struct_init {
-                self.advance(); // consume '{'
-                let mut fields = Vec::new();
-                while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
-                    let token_kind = self.advance().kind.clone();
-                    let f_name = match token_kind {
-                        TokenType::Identifier(f) => f.to_string(),
-                        _ => {
-                            return Err(self.error(&format!(
-                                "Expected field name in struct init, found {:?}",
-                                token_kind
-                            )))
-                        }
-                    };
-                    self.consume(&TokenType::Colon, "Expected ':'")?;
-                    let f_expr = self.parse_expr()?;
-                    fields.push((f_name.into(), f_expr));
-                    if !self.match_token(&TokenType::Comma) {
-                        break;
-                    }
-                }
-                self.consume(&TokenType::RightBrace, "Expected '}'")?;
-                Self::apply_type_args(&mut call_name, parsed_type_args);
-                Ok(Expr::StructInit(StructInitExpr {
-                    name: call_name.into(),
-                    fields,
-                    type_id: None,
-                    span: Span::default(),
-                }))
-            } else if self.match_token(&TokenType::DoubleColon) {
-                self.parse_enum_variant_expr(&mut call_name, parsed_type_args)
-            } else {
-                Self::apply_type_args(&mut call_name, parsed_type_args);
-                Ok(Expr::Identifier(IdentifierExpr {
-                    name: call_name.into(),
-                    span,
-                }))
-            }
+        } else if self.struct_init_follows() {
+            self.parse_struct_init(call_name, parsed_type_args)
         } else if self.match_token(&TokenType::DoubleColon) {
             self.parse_enum_variant_expr(&mut call_name, parsed_type_args)
         } else {
@@ -659,6 +454,206 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parses the rest of `sizeof<T>()`, after the word `sizeof`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when `<T>()` does not follow.
+    fn parse_sizeof_expr(&mut self) -> ParseResult<'a, Expr> {
+        self.consume(&TokenType::LeftAngle, "Expected '<' after sizeof")?;
+        let target_ty = self.parse_type()?;
+        self.consume(&TokenType::RightAngle, "Expected '>' after sizeof type")?;
+        self.consume(&TokenType::LeftParen, "Expected '(' after sizeof<...>")?;
+        self.consume(&TokenType::RightParen, "Expected ')' after sizeof<...>(")?;
+        Ok(Expr::SizeOf(SizeOfExpr {
+            target_ty,
+            span: Span::default(),
+        }))
+    }
+
+    /// Tries to read `Tensor<...>::new(..)`, with the parser just after the word `Tensor` or
+    /// `DynTensor`. Returns `None`, with the position restored, when the older spelling
+    /// `Tensor<f32>([4, 4])` should be tried instead.
+    ///
+    /// Read with the real type parser rather than `parse_generic_type_args`, because a tensor
+    /// type's arguments are not all types -- `[4, 4]` is a shape and `Memory::X` a placement --
+    /// so the generic-argument parser cannot read them at all. Falls through to the older
+    /// `Tensor<f32>([4, 4])` spelling when the type does not parse or no `::` follows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the type is followed by `(`, or when the constructor after
+    /// `::` is not valid.
+    fn parse_typed_tensor_constructor(&mut self, span: Span) -> ParseResult<'a, Option<Expr>> {
+        let saved = self.pos;
+        self.pos -= 1; // back onto the identifier, which `parse_named_type` consumes
+        match self.parse_named_type() {
+            Ok(ty) if self.check(&TokenType::DoubleColon) => {
+                self.parse_tensor_constructor(ty, span).map(Some)
+            }
+            // `Tensor<f32, [2, 2]>()` would fall through to the older spelling, which takes
+            // the shape from the arguments and so built a tensor with no dimensions.
+            Ok(ty) if self.check(&TokenType::LeftParen) => Err(self.error(&format!(
+                "`{ty}` is built with `{ty}::new()` for zeroed storage or `{ty}::uninit()` \
+                 for storage left as it was found"
+            ))),
+            _ => {
+                self.pos = saved;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Parses the rest of `Reachable<A, B>` used as a value, with the parser at the `<`.
+    ///
+    /// It is a comptime transferability predicate: the same constraint as the `where` clause of
+    /// the same name, usable in `if comptime`. It used to be spelled `Transfer<A, B>`; see the
+    /// `where` parser for why it moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when `<A, B>` is not two topology operands.
+    fn parse_reachable_predicate(&mut self, span: Span) -> ParseResult<'a, Expr> {
+        self.advance(); // consume '<'
+        let from = self.parse_topology_operand()?;
+        self.consume(&TokenType::Comma, "Expected ',' in Reachable<A, B>")?;
+        let to = self.parse_topology_operand()?;
+        self.consume(&TokenType::RightAngle, "Expected '>' after Reachable<A, B>")?;
+        Ok(Expr::TransferPredicate(TransferPredicateExpr {
+            from,
+            to,
+            span,
+        }))
+    }
+
+    /// Tries to read generic arguments, with the parser at a `<`. Returns the arguments when
+    /// there is at least one. When the tokens are not generic arguments (the `<` is a
+    /// comparison), the position is restored and `None` is returned.
+    fn try_parse_type_args(&mut self) -> Option<Vec<Type>> {
+        let saved_pos = self.pos;
+        self.advance(); // consume '<'
+        if let Ok(type_args) = self.parse_generic_type_args() {
+            if !type_args.is_empty() {
+                return Some(type_args);
+            }
+        } else {
+            self.pos = saved_pos;
+        }
+        None
+    }
+
+    /// Reads `::method` after a type name, when a `(` or `<` follows the method name, and joins
+    /// it onto `call_name`. The type's own generic arguments are folded into the name, and
+    /// `parsed_type_args` is left holding the method's generic arguments, if it has any.
+    fn parse_path_method(
+        &mut self,
+        call_name: &mut String,
+        parsed_type_args: &mut Option<Vec<Type>>,
+    ) {
+        let t1 = self.tokens.get(self.pos + 1).map(|t| &t.kind);
+        let t2 = self.tokens.get(self.pos + 2).map(|t| &t.kind);
+        let has_paren = matches!(
+            (t1, t2),
+            (
+                Some(TokenType::Identifier(_)),
+                Some(TokenType::LeftParen | TokenType::LeftAngle)
+            )
+        );
+
+        if has_paren {
+            Self::apply_type_args(call_name, parsed_type_args.take());
+
+            self.advance(); // consume '::'
+            if let TokenType::Identifier(method_name) = self.peek().kind.clone() {
+                self.advance(); // consume method name
+                *call_name = format!("{call_name}::{method_name}");
+
+                if self.check(&TokenType::LeftAngle) {
+                    if let Some(type_args) = self.try_parse_type_args() {
+                        *parsed_type_args = Some(type_args);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parses call arguments up to and including the closing `)`. The `(` is already consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when an argument is not an expression, or `close_msg` when the
+    /// `)` is missing.
+    fn parse_call_args(&mut self, close_msg: &str) -> ParseResult<'a, Vec<Expr>> {
+        let mut args = Vec::new();
+        if !self.check(&TokenType::RightParen) {
+            loop {
+                args.push(self.parse_expr()?);
+                if !self.match_token(&TokenType::Comma) {
+                    break;
+                }
+            }
+        }
+        self.consume(&TokenType::RightParen, close_msg)?;
+        Ok(args)
+    }
+
+    /// Whether the next tokens open a struct literal: `{}` or `{ name:`. A `{` followed by
+    /// anything else is the start of a block, as in `if x { ... }`.
+    fn struct_init_follows(&self) -> bool {
+        matches!(
+            (
+                self.tokens.get(self.pos).map(|t| &t.kind),
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                self.tokens.get(self.pos + 2).map(|t| &t.kind),
+            ),
+            (Some(TokenType::LeftBrace), Some(TokenType::RightBrace), _)
+                | (
+                    Some(TokenType::LeftBrace),
+                    Some(TokenType::Identifier(_)),
+                    Some(TokenType::Colon),
+                )
+        )
+    }
+
+    /// Parses the `{ field: value, ... }` of a struct literal named `call_name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when a field is not `name: expression` or the `}` is missing.
+    fn parse_struct_init(
+        &mut self,
+        mut call_name: String,
+        parsed_type_args: Option<Vec<Type>>,
+    ) -> ParseResult<'a, Expr> {
+        self.advance(); // consume '{'
+        let mut fields = Vec::new();
+        while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
+            let token_kind = self.advance().kind.clone();
+            let f_name = match token_kind {
+                TokenType::Identifier(f) => f.to_string(),
+                _ => {
+                    return Err(self.error(&format!(
+                        "Expected field name in struct init, found {token_kind:?}"
+                    )))
+                }
+            };
+            self.consume(&TokenType::Colon, "Expected ':'")?;
+            let f_expr = self.parse_expr()?;
+            fields.push((f_name.into(), f_expr));
+            if !self.match_token(&TokenType::Comma) {
+                break;
+            }
+        }
+        self.consume(&TokenType::RightBrace, "Expected '}'")?;
+        Self::apply_type_args(&mut call_name, parsed_type_args);
+        Ok(Expr::StructInit(StructInitExpr {
+            name: call_name.into(),
+            fields,
+            type_id: None,
+            span: Span::default(),
+        }))
+    }
+
     /// `<tensor type>::new(..)` or `::uninit(..)`, with the type already parsed.
     ///
     /// The two differ only in whether the storage arrives zeroed. Both are spelled out because
@@ -668,6 +663,11 @@ impl<'a> Parser<'a> {
     /// The parsed type rides on `type_args` rather than being re-derived downstream from the
     /// call's name and arguments, which is what the older spelling forces three separate places to
     /// do -- and which cannot carry a placement at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the constructor is not `new`, `uninit` or `fill`, or its
+    /// argument list is not valid.
     fn parse_tensor_constructor(&mut self, ty: Type, span: Span) -> ParseResult<'a, Expr> {
         self.consume(&TokenType::DoubleColon, "Expected '::' after a tensor type")?;
         let ctor = self.expect_identifier("Expected a constructor after a tensor type")?;
@@ -702,15 +702,20 @@ impl<'a> Parser<'a> {
         if let Some(tys) = type_args {
             let ty_args_str = tys
                 .iter()
-                .map(|t| t.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
-            *call_name = format!("{}<{}>", call_name, ty_args_str);
+            *call_name = format!("{call_name}<{ty_args_str}>");
         }
     }
 
     /// Parses an enum variant expression after `::` has been consumed.
     /// Expects `VariantName` optionally followed by `(args...)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when no variant name follows the `::`, or the payload is not a
+    /// valid argument list.
     fn parse_enum_variant_expr(
         &mut self,
         call_name: &mut String,
@@ -718,9 +723,8 @@ impl<'a> Parser<'a> {
     ) -> ParseResult<'a, Expr> {
         let variant_line = self.peek().line;
         let variant_column = self.peek().column;
-        let variant = match self.advance().kind.clone() {
-            TokenType::Identifier(v) => v,
-            _ => return Err(self.error("Expected enum variant after ::")),
+        let TokenType::Identifier(variant) = self.advance().kind.clone() else {
+            return Err(self.error("Expected enum variant after ::"));
         };
         let mut payload = None;
         if self.match_token(&TokenType::LeftParen) {
@@ -749,626 +753,733 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    /// Parses one operand of a binary operator: a prefix form such as `-x`, `&x` or `if`, or a
+    /// single value followed by any number of `.member`, `.method()`, `(args)`, `[index]` and
+    /// `as T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the tokens do not form an operand.
     pub(crate) fn parse_primary_expr(&mut self) -> ParseResult<'a, Expr> {
+        if let Some(expr) = self.parse_prefix_expr()? {
+            return Ok(expr);
+        }
+        let expr = self.parse_atom_expr()?;
+        self.parse_postfix_ops(expr)
+    }
+
+    /// Parses an expression that starts with a prefix operator or keyword: `!`, `-`, `&`, `&&`,
+    /// `*`, `unsafe`, `if` or `match`. Returns `None`, with nothing consumed, when the next
+    /// token is none of these.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when what follows the prefix is not valid.
+    fn parse_prefix_expr(&mut self) -> ParseResult<'a, Option<Expr>> {
         // Where the `!` or `-` is, so a refused operand is reported at it rather than at 0:0.
         let (bang_line, bang_column) = (self.peek().line, self.peek().column);
-        if self.match_token(&TokenType::Bang) {
-            let inner = self.parse_primary_expr()?;
-            return Ok(Expr::UnaryOp(UnaryOpExpr {
-                op: UnaryOp::Not,
-                expr: Box::new(inner),
-                span: Span {
-                    line: bang_line,
-                    column: bang_column,
-                    length: 1,
-                },
-            }));
+        let expr = if self.match_token(&TokenType::Bang) {
+            self.parse_unary_operand(UnaryOp::Not, bang_line, bang_column)?
         } else if self.match_token(&TokenType::Minus) {
-            let inner = self.parse_primary_expr()?;
-            return Ok(Expr::UnaryOp(UnaryOpExpr {
-                op: UnaryOp::Neg,
-                expr: Box::new(inner),
-                span: Span {
-                    line: bang_line,
-                    column: bang_column,
-                    length: 1,
-                },
-            }));
+            self.parse_unary_operand(UnaryOp::Neg, bang_line, bang_column)?
         } else if self.check(&TokenType::Ampersand) {
-            // The `&` token, so a borrow conflict is reported where the borrow is written.
-            let amp_span = crate::syntax::Span {
-                line: self.peek().line,
-                column: self.peek().column,
-                length: self.peek().length,
-            };
-            self.advance();
-            let is_mut = self.match_token(&TokenType::Mut);
-            let inner = self.parse_primary_expr()?;
-            return Ok(Expr::Borrow(BorrowExpr {
+            self.parse_borrow()?
+        } else if self.check(&TokenType::AndAnd) {
+            self.parse_double_borrow()?
+        } else if self.check(&TokenType::Star) {
+            self.parse_dereference()?
+        } else if self.match_token(&TokenType::Unsafe) {
+            self.parse_unsafe_block()?
+        } else if self.check(&TokenType::If) {
+            self.parse_if_expr()?
+        } else if self.match_token(&TokenType::Match) {
+            self.parse_match_expr()?
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(expr))
+    }
+
+    /// Parses the operand of `!` or `-`. The operator, written at `line` and `column`, is
+    /// already consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the operand is not an expression.
+    fn parse_unary_operand(
+        &mut self,
+        op: UnaryOp,
+        line: usize,
+        column: usize,
+    ) -> ParseResult<'a, Expr> {
+        let inner = self.parse_primary_expr()?;
+        Ok(Expr::UnaryOp(UnaryOpExpr {
+            op,
+            expr: Box::new(inner),
+            span: Span {
+                line,
+                column,
+                length: 1,
+            },
+        }))
+    }
+
+    /// Parses `&x` or `&mut x`, with the parser at the `&`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the borrowed operand is not an expression.
+    fn parse_borrow(&mut self) -> ParseResult<'a, Expr> {
+        // The `&` token, so a borrow conflict is reported where the borrow is written.
+        let amp_span = crate::syntax::Span {
+            line: self.peek().line,
+            column: self.peek().column,
+            length: self.peek().length,
+        };
+        self.advance();
+        let is_mut = self.match_token(&TokenType::Mut);
+        let inner = self.parse_primary_expr()?;
+        Ok(Expr::Borrow(BorrowExpr {
+            expr: Box::new(inner),
+            is_mut,
+            span: amp_span,
+        }))
+    }
+
+    /// Parses `&&x`, with the parser at the `&&`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the borrowed operand is not an expression.
+    fn parse_double_borrow(&mut self) -> ParseResult<'a, Expr> {
+        // `&&x` borrows a borrow; the lexer made the two `&`s one token. The outer borrow is
+        // the first `&` and the inner one the second.
+        let (line, column) = (self.peek().line, self.peek().column);
+        self.advance();
+        let is_mut = self.match_token(&TokenType::Mut);
+        let inner = self.parse_primary_expr()?;
+        Ok(Expr::Borrow(BorrowExpr {
+            expr: Box::new(Expr::Borrow(BorrowExpr {
                 expr: Box::new(inner),
                 is_mut,
-                span: amp_span,
-            }));
-        } else if self.check(&TokenType::AndAnd) {
-            // `&&x` borrows a borrow; the lexer made the two `&`s one token. The outer borrow is
-            // the first `&` and the inner one the second.
-            let (line, column) = (self.peek().line, self.peek().column);
-            self.advance();
-            let is_mut = self.match_token(&TokenType::Mut);
-            let inner = self.parse_primary_expr()?;
-            return Ok(Expr::Borrow(BorrowExpr {
-                expr: Box::new(Expr::Borrow(BorrowExpr {
-                    expr: Box::new(inner),
-                    is_mut,
-                    span: Span {
-                        line,
-                        column: column + 1,
-                        length: 1,
-                    },
-                })),
-                is_mut: false,
                 span: Span {
                     line,
-                    column,
+                    column: column + 1,
                     length: 1,
                 },
-            }));
-        } else if self.check(&TokenType::Star) {
-            // The `*` token, so a diagnostic about the dereference points at it.
-            let star_span = crate::syntax::Span {
-                line: self.peek().line,
-                column: self.peek().column,
-                length: self.peek().length,
-            };
-            self.advance();
-            let inner = self.parse_primary_expr()?;
-            return Ok(Expr::Dereference(DereferenceExpr {
-                expr: Box::new(inner),
-                ty: None,
-                span: star_span,
-            }));
-        } else if self.match_token(&TokenType::Unsafe) {
-            self.consume(&TokenType::LeftBrace, "Expected '{' after unsafe")?;
-            let mut stmts = Vec::new();
-            while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
-                self.parse_statement_into(&mut stmts)?;
-            }
-            let mut ret = None;
-            if let Some(Statement::ExprStmt(ExprStmtStmt {
-                expr,
-                has_semi,
-                span: _,
-            })) = stmts.last().cloned()
-            {
-                if !has_semi {
-                    stmts.pop();
-                    ret = Some(Box::new(expr));
-                }
-            }
-            self.consume(&TokenType::RightBrace, "Expected '}'")?;
-            // Only `as` may follow the block: a `(` or `[` on the next line starts a new
-            // statement, and `as` cannot.
-            return self.parse_as_casts(Expr::UnsafeBlock(UnsafeBlockExpr {
-                stmts,
-                ret,
-                span: Span::default(),
-            }));
-        } else if self.check(&TokenType::If) {
-            // The `if` token, so a diagnostic about the `if` points at it.
-            let if_span = crate::syntax::Span {
-                line: self.peek().line,
-                column: self.peek().column,
-                length: self.peek().length,
-            };
-            self.advance();
-            let is_comptime = self.match_token(&TokenType::Comptime);
-            let cond = self.parse_expr()?;
-            self.consume(&TokenType::LeftBrace, "Expected '{'")?;
-            let mut then_block = Vec::new();
-            while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
-                self.parse_statement_into(&mut then_block)?;
-            }
-            self.consume(&TokenType::RightBrace, "Expected '}'")?;
+            })),
+            is_mut: false,
+            span: Span {
+                line,
+                column,
+                length: 1,
+            },
+        }))
+    }
 
-            let mut else_block = None;
-            if self.match_token(&TokenType::Else) {
-                if self.check(&TokenType::If) {
-                    // `else if`
-                    let inner_if = self.parse_primary_expr()?;
-                    else_block = Some(vec![Statement::ExprStmt(ExprStmtStmt {
-                        expr: inner_if,
-                        has_semi: false,
-                        span: Span::default(),
-                    })]);
-                } else {
-                    self.consume(&TokenType::LeftBrace, "Expected '{'")?;
-                    let mut block = Vec::new();
-                    while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
-                        self.parse_statement_into(&mut block)?;
-                    }
-                    self.consume(&TokenType::RightBrace, "Expected '}'")?;
-                    else_block = Some(block);
-                }
-            }
-            return Ok(Expr::If(IfExpr {
-                is_comptime,
-                cond: Box::new(cond),
-                then_block,
-                else_block,
-                span: if_span,
-            }));
-        } else if self.match_token(&TokenType::Match) {
-            let at_statement = std::mem::take(&mut self.match_is_statement);
-            let expr = self.parse_expr()?;
-            self.consume(&TokenType::LeftBrace, "Expected '{' after match expr")?;
-            let mut arms = Vec::new();
-            let mut tuple_arms = Vec::new();
-            while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
-                let arm_token = self.peek().clone();
-                let pattern = self.parse_arm_pattern()?;
-                self.consume(&TokenType::FatArrow, "Expected '=>' after pattern")?;
-                let mut body = Vec::new();
-                if self.match_token(&TokenType::LeftBrace) {
-                    while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
-                        self.parse_statement_into(&mut body)?;
-                    }
-                    self.consume(&TokenType::RightBrace, "Expected '}'")?;
-                    self.match_token(&TokenType::Comma); // optional comma
-                } else {
-                    self.parse_statement_into(&mut body)?;
-                    self.match_token(&TokenType::Comma); // optional comma
-                }
-                tuple_arms.push((pattern, body, arm_token));
-            }
-            self.consume(&TokenType::RightBrace, "Expected '}'")?;
-            if tuple_arms
-                .iter()
-                .any(|(p, _, _)| matches!(p, tuple_match::ArmPattern::Tuple(_)))
-            {
-                return self.lower_tuple_match(expr, tuple_arms, at_statement);
-            }
-            for (pattern, body, arm_token) in tuple_arms {
-                let tuple_match::ArmPattern::Plain(pattern) = pattern else {
-                    unreachable!("a tuple pattern is lowered above")
-                };
-                arms.push(MatchArm {
-                    pattern: *pattern,
-                    body,
-                    span: Span {
-                        line: arm_token.line,
-                        column: arm_token.column,
-                        length: arm_token.length,
-                    },
-                });
-            }
-            return Ok(Expr::Match(MatchExpr {
-                expr: Box::new(expr),
-                arms,
-                span: Span::default(),
-            }));
+    /// Parses `*x`, with the parser at the `*`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the operand is not an expression.
+    fn parse_dereference(&mut self) -> ParseResult<'a, Expr> {
+        // The `*` token, so a diagnostic about the dereference points at it.
+        let star_span = crate::syntax::Span {
+            line: self.peek().line,
+            column: self.peek().column,
+            length: self.peek().length,
+        };
+        self.advance();
+        let inner = self.parse_primary_expr()?;
+        Ok(Expr::Dereference(DereferenceExpr {
+            expr: Box::new(inner),
+            ty: None,
+            span: star_span,
+        }))
+    }
+
+    /// Parses the `{ ... }` of an `unsafe` block and any `as` casts after it. The word `unsafe`
+    /// is already consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the braces are missing or a statement inside is not valid.
+    fn parse_unsafe_block(&mut self) -> ParseResult<'a, Expr> {
+        self.consume(&TokenType::LeftBrace, "Expected '{' after unsafe")?;
+        let mut stmts = Vec::new();
+        while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
+            self.parse_statement_into(&mut stmts)?;
         }
+        let mut ret = None;
+        if let Some(Statement::ExprStmt(ExprStmtStmt {
+            expr,
+            has_semi,
+            span: _,
+        })) = stmts.last().cloned()
+        {
+            if !has_semi {
+                stmts.pop();
+                ret = Some(Box::new(expr));
+            }
+        }
+        self.consume(&TokenType::RightBrace, "Expected '}'")?;
+        // Only `as` may follow the block: a `(` or `[` on the next line starts a new
+        // statement, and `as` cannot.
+        self.parse_as_casts(Expr::UnsafeBlock(UnsafeBlockExpr {
+            stmts,
+            ret,
+            span: Span::default(),
+        }))
+    }
 
-        let peeked_token = self.peek().clone();
-        let mut expr = match peeked_token.kind {
-            TokenType::Transfer => {
-                self.advance();
-                self.consume(&TokenType::LeftParen, "Expected '(' after transfer")?;
-                let inner = self.parse_expr()?;
-                self.consume(&TokenType::Comma, "Expected ','")?;
-                let mem = self.parse_memory_space()?;
-                self.consume(&TokenType::RightParen, "Expected ')'")?;
-                Expr::Transfer(TransferExpr {
-                    expr: Box::new(inner),
-                    space: mem,
-                    cost: None,
-                    lowering: None,
-                    span: Span {
-                        line: peeked_token.line,
-                        column: peeked_token.column,
-                        length: peeked_token.length,
-                    },
-                })
-            }
-            TokenType::LeftBracket => {
-                self.advance();
-                let mut elements = Vec::new();
-                if !self.check(&TokenType::RightBracket) {
-                    loop {
-                        elements.push(self.parse_expr()?);
-                        if !self.match_token(&TokenType::Comma) {
-                            break;
-                        }
-                    }
-                }
-                self.consume(&TokenType::RightBracket, "Expected ']'")?;
-                Expr::Array(ArrayExpr {
-                    elements,
+    /// Parses `if cond { ... }` with its optional `else`, with the parser at the `if`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the condition, a brace or a statement in a block is not valid.
+    fn parse_if_expr(&mut self) -> ParseResult<'a, Expr> {
+        // The `if` token, so a diagnostic about the `if` points at it.
+        let if_span = crate::syntax::Span {
+            line: self.peek().line,
+            column: self.peek().column,
+            length: self.peek().length,
+        };
+        self.advance();
+        let is_comptime = self.match_token(&TokenType::Comptime);
+        let cond = self.parse_expr()?;
+        self.consume(&TokenType::LeftBrace, "Expected '{'")?;
+        let mut then_block = Vec::new();
+        while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
+            self.parse_statement_into(&mut then_block)?;
+        }
+        self.consume(&TokenType::RightBrace, "Expected '}'")?;
+
+        let mut else_block = None;
+        if self.match_token(&TokenType::Else) {
+            if self.check(&TokenType::If) {
+                // `else if`
+                let inner_if = self.parse_primary_expr()?;
+                else_block = Some(vec![Statement::ExprStmt(ExprStmtStmt {
+                    expr: inner_if,
+                    has_semi: false,
                     span: Span::default(),
-                })
+                })]);
+            } else {
+                self.consume(&TokenType::LeftBrace, "Expected '{'")?;
+                let mut block = Vec::new();
+                while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
+                    self.parse_statement_into(&mut block)?;
+                }
+                self.consume(&TokenType::RightBrace, "Expected '}'")?;
+                else_block = Some(block);
             }
-            TokenType::Memory => Expr::MemorySpace(MemorySpaceExpr {
+        }
+        Ok(Expr::If(IfExpr {
+            is_comptime,
+            cond: Box::new(cond),
+            then_block,
+            else_block,
+            span: if_span,
+        }))
+    }
+
+    /// Parses the matched value and the arms of a `match`. The word `match` is already consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the matched value, a pattern or an arm body is not valid.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a tuple pattern is still among the arms after the check that sends every
+    /// `match` with a tuple pattern to `lower_tuple_match`.
+    fn parse_match_expr(&mut self) -> ParseResult<'a, Expr> {
+        let at_statement = std::mem::take(&mut self.match_is_statement);
+        let expr = self.parse_expr()?;
+        self.consume(&TokenType::LeftBrace, "Expected '{' after match expr")?;
+        let mut arms = Vec::new();
+        let mut tuple_arms = Vec::new();
+        while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
+            let arm_token = self.peek().clone();
+            let pattern = self.parse_arm_pattern()?;
+            self.consume(&TokenType::FatArrow, "Expected '=>' after pattern")?;
+            let mut body = Vec::new();
+            if self.match_token(&TokenType::LeftBrace) {
+                while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
+                    self.parse_statement_into(&mut body)?;
+                }
+                self.consume(&TokenType::RightBrace, "Expected '}'")?;
+                self.match_token(&TokenType::Comma); // optional comma
+            } else {
+                self.parse_statement_into(&mut body)?;
+                self.match_token(&TokenType::Comma); // optional comma
+            }
+            tuple_arms.push((pattern, body, arm_token));
+        }
+        self.consume(&TokenType::RightBrace, "Expected '}'")?;
+        if tuple_arms
+            .iter()
+            .any(|(p, _, _)| matches!(p, tuple_match::ArmPattern::Tuple(_)))
+        {
+            return self.lower_tuple_match(expr, tuple_arms, at_statement);
+        }
+        for (pattern, body, arm_token) in tuple_arms {
+            let tuple_match::ArmPattern::Plain(pattern) = pattern else {
+                unreachable!("a tuple pattern is lowered above")
+            };
+            arms.push(MatchArm {
+                pattern: *pattern,
+                body,
+                span: Span {
+                    line: arm_token.line,
+                    column: arm_token.column,
+                    length: arm_token.length,
+                },
+            });
+        }
+        Ok(Expr::Match(MatchExpr {
+            expr: Box::new(expr),
+            arms,
+            span: Span::default(),
+        }))
+    }
+
+    /// Parses one value with no prefix operator and no postfix operator: a literal, a name, a
+    /// call, a parenthesized expression, or one of the keyword forms such as `transfer(..)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the next token cannot start an expression, or the form it
+    /// starts is not complete.
+    fn parse_atom_expr(&mut self) -> ParseResult<'a, Expr> {
+        let peeked_token = self.peek().clone();
+        match peeked_token.kind {
+            TokenType::Transfer => self.parse_transfer_expr(&peeked_token),
+            TokenType::LeftBracket => self.parse_array_literal(),
+            TokenType::Memory => Ok(Expr::MemorySpace(MemorySpaceExpr {
                 space: self.parse_memory_space()?,
                 span: Span::default(),
-            }),
-            TokenType::Topology => Expr::Topology(TopologyExpr {
+            })),
+            TokenType::Topology => Ok(Expr::Topology(TopologyExpr {
                 top: self.parse_topology()?,
                 span: Span::default(),
-            }),
-            TokenType::Verified => {
-                self.advance();
-                self.consume(&TokenType::LeftParen, "Expected '(' after Verified")?;
-                let inner = self.parse_expr()?;
-                self.consume(&TokenType::RightParen, "Expected ')'")?;
-                Expr::FunctionCall(FunctionCallExpr {
-                    name: "Verified".to_string().into(),
-                    type_args: None,
-                    args: vec![inner],
-                    span: Span::default(),
-                })
-            }
-            TokenType::Grad => {
-                self.advance();
-                self.consume(&TokenType::LeftParen, "Expected '(' after 'grad'")?;
-                let target_fn = match self.advance().kind.clone() {
-                    TokenType::Identifier(s) => s.to_string(),
-                    _ => {
-                        return Err(
-                            self.error("Expected function identifier as first argument to grad")
-                        )
-                    }
-                };
-                let mut args = Vec::new();
-                if self.match_token(&TokenType::Comma) && !self.check(&TokenType::RightParen) {
-                    loop {
-                        args.push(self.parse_expr()?);
-                        if !self.match_token(&TokenType::Comma) {
-                            break;
-                        }
-                    }
-                }
-                self.consume(&TokenType::RightParen, "Expected ')'")?;
-                Expr::Grad(GradExpr {
-                    target_fn: target_fn.into(),
-                    args,
-                    span: Span::default(),
-                })
-            }
-            TokenType::Vjp => {
-                self.advance();
-                self.consume(&TokenType::LeftParen, "Expected '(' after 'vjp'")?;
-                let target_fn = match self.advance().kind.clone() {
-                    TokenType::Identifier(s) => s.to_string(),
-                    _ => {
-                        return Err(
-                            self.error("Expected function identifier as first argument to vjp")
-                        )
-                    }
-                };
-                self.consume(&TokenType::Comma, "Expected comma after function name")?;
-                let mut all_args = Vec::new();
-                if !self.check(&TokenType::RightParen) {
-                    loop {
-                        all_args.push(self.parse_expr()?);
-                        if !self.match_token(&TokenType::Comma) {
-                            break;
-                        }
-                    }
-                }
-                self.consume(&TokenType::RightParen, "Expected ')'")?;
-                if all_args.is_empty() {
-                    return Err(self.error("Expected cotangent argument for vjp"));
-                }
-                let cotangent = all_args.pop().unwrap();
-                Expr::Vjp(VjpExpr {
-                    target_fn: target_fn.into(),
-                    args: all_args,
-                    cotangent: Box::new(cotangent),
-                    span: Span::default(),
-                })
-            }
-            TokenType::Jvp => {
-                self.advance();
-                self.consume(&TokenType::LeftParen, "Expected '(' after 'jvp'")?;
-                let target_fn = match self.advance().kind.clone() {
-                    TokenType::Identifier(s) => s.to_string(),
-                    _ => {
-                        return Err(
-                            self.error("Expected function identifier as first argument to jvp")
-                        )
-                    }
-                };
-                self.consume(&TokenType::Comma, "Expected comma after function name")?;
-                let mut all_args = Vec::new();
-                if !self.check(&TokenType::RightParen) {
-                    loop {
-                        all_args.push(self.parse_expr()?);
-                        if !self.match_token(&TokenType::Comma) {
-                            break;
-                        }
-                    }
-                }
-                self.consume(&TokenType::RightParen, "Expected ')'")?;
-                if all_args.is_empty() {
-                    return Err(self.error("Expected tangent argument for jvp"));
-                }
-                let tangent = all_args.pop().unwrap();
-                Expr::Jvp(JvpExpr {
-                    target_fn: target_fn.into(),
-                    args: all_args,
-                    tangent: Box::new(tangent),
-                    span: Span::default(),
-                })
-            }
-            _ => {
-                let token = self.advance().clone();
-                match token.kind {
-                    TokenType::LeftParen => {
-                        let expr = self.parse_expr()?;
-                        if self.check(&TokenType::Comma) {
-                            // `(a, b)`: a tuple, which is the struct `core::tuple` declares for
-                            // its length, its type arguments inferred from `a` and `b`.
-                            let mut elems = vec![expr];
-                            while self.match_token(&TokenType::Comma) {
-                                if self.check(&TokenType::RightParen) {
-                                    break;
-                                }
-                                elems.push(self.parse_expr()?);
-                            }
-                            self.consume(&TokenType::RightParen, "Expected ')' after a tuple")?;
-                            let name = self.tuple_struct(elems.len())?;
-                            Expr::StructInit(StructInitExpr {
-                                name: name.into(),
-                                fields: elems
-                                    .into_iter()
-                                    .enumerate()
-                                    .map(|(i, e)| (format!("_{i}").into(), e))
-                                    .collect(),
-                                type_id: None,
-                                span: Span::default(),
-                            })
-                        } else {
-                            self.consume(&TokenType::RightParen, "Expected ')' after expression")?;
-                            expr
-                        }
-                    }
-                    TokenType::Identifier(s) => {
-                        let ident_line = token.line;
-                        let ident_end_col = token.column + token.length;
+            })),
+            TokenType::Verified => self.parse_verified_expr(),
+            TokenType::Grad => self.parse_grad_expr(),
+            TokenType::Vjp => self.parse_vjp_expr(),
+            TokenType::Jvp => self.parse_jvp_expr(),
+            _ => self.parse_simple_atom(),
+        }
+    }
 
-                        let mut is_macro = false;
-                        if self.check(&TokenType::Bang) {
-                            let bang_token = self.peek();
-                            if bang_token.line == ident_line && bang_token.column == ident_end_col {
-                                is_macro = true;
-                            } else {
-                                return Err(self.error_at(&token, &format!("Macro invocations must not have spaces between the macro name and '!'. Did you mean `{}!`?", s)));
-                            }
-                        }
+    /// Parses `transfer(value, memory space)`, with the parser at the `transfer` token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the parentheses, the value or the memory space is not valid.
+    fn parse_transfer_expr(&mut self, transfer_token: &Token<'a>) -> ParseResult<'a, Expr> {
+        self.advance();
+        self.consume(&TokenType::LeftParen, "Expected '(' after transfer")?;
+        let inner = self.parse_expr()?;
+        self.consume(&TokenType::Comma, "Expected ','")?;
+        let mem = self.parse_memory_space()?;
+        self.consume(&TokenType::RightParen, "Expected ')'")?;
+        Ok(Expr::Transfer(TransferExpr {
+            expr: Box::new(inner),
+            space: mem,
+            cost: None,
+            lowering: None,
+            span: Span {
+                line: transfer_token.line,
+                column: transfer_token.column,
+                length: transfer_token.length,
+            },
+        }))
+    }
 
-                        if is_macro {
-                            self.advance(); // consume Bang
-                            let token_tree = self.parse_token_tree()?;
-                            let mut block_tree = None;
-                            if self.check(&TokenType::LeftBrace) {
-                                block_tree = Some(self.parse_token_tree()?);
-                            }
-                            Expr::MacroCall(MacroCallExpr {
-                                name: s.to_string().into(),
-                                token_tree,
-                                block_tree,
-                                span: Span::default(),
-                            })
-                        } else {
-                            let span = crate::syntax::Span {
-                                line: token.line,
-                                column: token.column,
-                                length: token.length,
-                            };
-                            self.parse_identifier_expr(s.to_string(), span)?
-                        }
-                    }
-                    TokenType::Return => self.parse_identifier_expr(
-                        "return".to_string(),
-                        crate::syntax::Span {
-                            line: token.line,
-                            column: token.column,
-                            length: token.length,
-                        },
-                    )?,
-                    TokenType::Number(s) => {
-                        let (num_str, el_ty) =
-                            infer_number_literal(s).map_err(|e| self.error_at(&token, &e))?;
-
-                        Expr::Number(NumberExpr {
-                            value: num_str.into(),
-                            ty: el_ty,
-                            span: Span::default(),
-                        })
-                    }
-                    TokenType::StringLiteral(s) => Expr::StringLiteral(StringLiteralExpr {
-                        value: s.into(),
-                        span: Span::default(),
-                    }),
-
-                    TokenType::Comptime => {
-                        self.consume(&TokenType::LeftBrace, "Expected '{' for comptime block")?;
-                        let mut stmts = Vec::new();
-                        let mut ret_expr = None;
-                        while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
-                            let stmt = self.parse_statement()?;
-                            if self.check(&TokenType::RightBrace) {
-                                if let Statement::ExprStmt(ExprStmtStmt {
-                                    expr: e,
-                                    has_semi,
-                                    span: _,
-                                }) = stmt
-                                {
-                                    if !has_semi {
-                                        ret_expr = Some(Box::new(e));
-                                    }
-                                    break;
-                                }
-                            }
-                            stmts.push(stmt);
-                            stmts.append(&mut self.pending_stmts);
-                        }
-                        self.consume(&TokenType::RightBrace, "Expected '}'")?;
-                        Expr::ComptimeBlock(ComptimeBlockExpr {
-                            stmts,
-                            ret: ret_expr,
-                            span: Span {
-                                line: token.line,
-                                column: token.column,
-                                length: token.length,
-                            },
-                        })
-                    }
-                    TokenType::Pipe | TokenType::OrOr => {
-                        let mut params = Vec::new();
-                        if token.kind == TokenType::Pipe {
-                            if !self.check(&TokenType::Pipe) {
-                                loop {
-                                    let name = match self.advance().kind.clone() {
-                                        TokenType::Identifier(s) => s.to_string(),
-                                        _ => {
-                                            return Err(
-                                                self.error("Expected identifier in closure params")
-                                            )
-                                        }
-                                    };
-                                    let ty = if self.match_token(&TokenType::Colon) {
-                                        self.parse_type()?
-                                    } else {
-                                        Type::Unknown
-                                    };
-                                    params.push((name.into(), ty));
-                                    if !self.match_token(&TokenType::Comma) {
-                                        break;
-                                    }
-                                }
-                            }
-                            self.consume(&TokenType::Pipe, "Expected '|' after closure params")?;
-                        }
-                        let body = Box::new(self.parse_expr()?);
-                        Expr::Closure(ClosureExpr {
-                            params,
-                            body,
-                            ret_ty: None,
-                            captures: vec![],
-                            span: Span::default(),
-                        })
-                    }
-                    TokenType::Spawn => {
-                        self.consume(&TokenType::On, "Expected 'on' after 'spawn'")?;
-                        self.consume(&TokenType::LeftParen, "Expected '('")?;
-                        let top = self.parse_topology()?;
-                        self.consume(&TokenType::RightParen, "Expected ')'")?;
-                        self.consume(&TokenType::LeftBrace, "Expected '{'")?;
-                        let mut stmts = Vec::new();
-                        let mut ret_expr = None;
-                        while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
-                            let stmt = self.parse_statement()?;
-                            if self.check(&TokenType::RightBrace) {
-                                if let Statement::ExprStmt(ExprStmtStmt {
-                                    expr: e,
-                                    has_semi,
-                                    span: _,
-                                }) = &stmt
-                                {
-                                    if !*has_semi {
-                                        ret_expr = Some(Box::new(e.clone()));
-                                        break;
-                                    }
-                                }
-                            }
-                            stmts.push(stmt);
-                            stmts.append(&mut self.pending_stmts);
-                        }
-                        self.consume(&TokenType::RightBrace, "Expected '}'")?;
-                        Expr::SpawnOn(SpawnOnExpr {
-                            top,
-                            stmts,
-                            ret: ret_expr,
-                            span: Span {
-                                line: token.line,
-                                column: token.column,
-                                length: token.length,
-                            },
-                        })
-                    }
-                    _ => {
-                        return Err(self.error_at(
-                            &token,
-                            &format!("Expected expression, found {:?}", token.kind),
-                        ))
-                    }
+    /// Parses an array literal `[a, b, c]`, with the parser at the `[`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when an element is not an expression or the `]` is missing.
+    fn parse_array_literal(&mut self) -> ParseResult<'a, Expr> {
+        self.advance();
+        let mut elements = Vec::new();
+        if !self.check(&TokenType::RightBracket) {
+            loop {
+                elements.push(self.parse_expr()?);
+                if !self.match_token(&TokenType::Comma) {
+                    break;
                 }
             }
+        }
+        self.consume(&TokenType::RightBracket, "Expected ']'")?;
+        Ok(Expr::Array(ArrayExpr {
+            elements,
+            span: Span::default(),
+        }))
+    }
+
+    /// Parses `Verified(value)`, with the parser at the `Verified` token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the parentheses or the value is not valid.
+    fn parse_verified_expr(&mut self) -> ParseResult<'a, Expr> {
+        self.advance();
+        self.consume(&TokenType::LeftParen, "Expected '(' after Verified")?;
+        let inner = self.parse_expr()?;
+        self.consume(&TokenType::RightParen, "Expected ')'")?;
+        Ok(Expr::FunctionCall(FunctionCallExpr {
+            name: "Verified".to_string().into(),
+            type_args: None,
+            args: vec![inner],
+            span: Span::default(),
+        }))
+    }
+
+    /// Parses `grad(function, args...)`, with the parser at the `grad` token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the first argument is not a function name, or an argument or
+    /// a parenthesis is not valid.
+    fn parse_grad_expr(&mut self) -> ParseResult<'a, Expr> {
+        self.advance();
+        self.consume(&TokenType::LeftParen, "Expected '(' after 'grad'")?;
+        let target_fn = match self.advance().kind.clone() {
+            TokenType::Identifier(s) => s.to_string(),
+            _ => return Err(self.error("Expected function identifier as first argument to grad")),
         };
+        let mut args = Vec::new();
+        if self.match_token(&TokenType::Comma) && !self.check(&TokenType::RightParen) {
+            loop {
+                args.push(self.parse_expr()?);
+                if !self.match_token(&TokenType::Comma) {
+                    break;
+                }
+            }
+        }
+        self.consume(&TokenType::RightParen, "Expected ')'")?;
+        Ok(Expr::Grad(GradExpr {
+            target_fn: target_fn.into(),
+            args,
+            span: Span::default(),
+        }))
+    }
 
-        // Postfix operators: .member, .method(), [index]
+    /// Parses `vjp(function, args..., cotangent)`, with the parser at the `vjp` token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the first argument is not a function name, when there is no
+    /// cotangent argument, or when an argument or a parenthesis is not valid.
+    fn parse_vjp_expr(&mut self) -> ParseResult<'a, Expr> {
+        self.advance();
+        self.consume(&TokenType::LeftParen, "Expected '(' after 'vjp'")?;
+        let target_fn = match self.advance().kind.clone() {
+            TokenType::Identifier(s) => s.to_string(),
+            _ => return Err(self.error("Expected function identifier as first argument to vjp")),
+        };
+        self.consume(&TokenType::Comma, "Expected comma after function name")?;
+        let mut all_args = self.parse_call_args("Expected ')'")?;
+        let Some(cotangent) = all_args.pop() else {
+            return Err(self.error("Expected cotangent argument for vjp"));
+        };
+        Ok(Expr::Vjp(VjpExpr {
+            target_fn: target_fn.into(),
+            args: all_args,
+            cotangent: Box::new(cotangent),
+            span: Span::default(),
+        }))
+    }
+
+    /// Parses `jvp(function, args..., tangent)`, with the parser at the `jvp` token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the first argument is not a function name, when there is no
+    /// tangent argument, or when an argument or a parenthesis is not valid.
+    fn parse_jvp_expr(&mut self) -> ParseResult<'a, Expr> {
+        self.advance();
+        self.consume(&TokenType::LeftParen, "Expected '(' after 'jvp'")?;
+        let target_fn = match self.advance().kind.clone() {
+            TokenType::Identifier(s) => s.to_string(),
+            _ => return Err(self.error("Expected function identifier as first argument to jvp")),
+        };
+        self.consume(&TokenType::Comma, "Expected comma after function name")?;
+        let mut all_args = self.parse_call_args("Expected ')'")?;
+        let Some(tangent) = all_args.pop() else {
+            return Err(self.error("Expected tangent argument for jvp"));
+        };
+        Ok(Expr::Jvp(JvpExpr {
+            target_fn: target_fn.into(),
+            args: all_args,
+            tangent: Box::new(tangent),
+            span: Span::default(),
+        }))
+    }
+
+    /// Parses a value that starts with the next token: a parenthesized expression or tuple, a
+    /// name, a number, a string, a `comptime` block, a closure or a `spawn on` block.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the token cannot start an expression, or the form it starts
+    /// is not complete.
+    fn parse_simple_atom(&mut self) -> ParseResult<'a, Expr> {
+        let token = self.advance().clone();
+        match token.kind {
+            TokenType::LeftParen => self.parse_paren_or_tuple(),
+            TokenType::Identifier(s) => self.parse_name_or_macro(&token, s),
+            TokenType::Return => self.parse_identifier_expr(
+                "return".to_string(),
+                crate::syntax::Span {
+                    line: token.line,
+                    column: token.column,
+                    length: token.length,
+                },
+            ),
+            TokenType::Number(s) => {
+                let (num_str, el_ty) =
+                    infer_number_literal(s).map_err(|e| self.error_at(&token, &e))?;
+
+                Ok(Expr::Number(NumberExpr {
+                    value: num_str.into(),
+                    ty: el_ty,
+                    span: Span::default(),
+                }))
+            }
+            TokenType::StringLiteral(s) => Ok(Expr::StringLiteral(StringLiteralExpr {
+                value: s.into(),
+                span: Span::default(),
+            })),
+            TokenType::Comptime => self.parse_comptime_block(&token),
+            TokenType::Pipe | TokenType::OrOr => self.parse_closure(&token),
+            TokenType::Spawn => self.parse_spawn_on(&token),
+            _ => Err(self.error_at(
+                &token,
+                &format!("Expected expression, found {:?}", token.kind),
+            )),
+        }
+    }
+
+    /// Parses `(expr)` or a tuple `(a, b)`. The `(` is already consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when an element is not an expression, the `)` is missing, or no
+    /// tuple struct exists for the number of elements.
+    fn parse_paren_or_tuple(&mut self) -> ParseResult<'a, Expr> {
+        let expr = self.parse_expr()?;
+        if self.check(&TokenType::Comma) {
+            // `(a, b)`: a tuple, which is the struct `core::tuple` declares for
+            // its length, its type arguments inferred from `a` and `b`.
+            let mut elems = vec![expr];
+            while self.match_token(&TokenType::Comma) {
+                if self.check(&TokenType::RightParen) {
+                    break;
+                }
+                elems.push(self.parse_expr()?);
+            }
+            self.consume(&TokenType::RightParen, "Expected ')' after a tuple")?;
+            let name = self.tuple_struct(elems.len())?;
+            Ok(Expr::StructInit(StructInitExpr {
+                name: name.into(),
+                fields: elems
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, e)| (format!("_{i}").into(), e))
+                    .collect(),
+                type_id: None,
+                span: Span::default(),
+            }))
+        } else {
+            self.consume(&TokenType::RightParen, "Expected ')' after expression")?;
+            Ok(expr)
+        }
+    }
+
+    /// Parses an expression that starts with the name `s`: a macro call `name!(...)`, or
+    /// whatever `parse_identifier_expr` reads. `token` is the name's token, already consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when a `!` follows the name after a space, or when the rest of
+    /// the expression is not valid.
+    fn parse_name_or_macro(&mut self, token: &Token<'a>, s: &str) -> ParseResult<'a, Expr> {
+        let ident_line = token.line;
+        let ident_end_col = token.column + token.length;
+
+        let mut is_macro = false;
+        if self.check(&TokenType::Bang) {
+            let bang_token = self.peek();
+            if bang_token.line == ident_line && bang_token.column == ident_end_col {
+                is_macro = true;
+            } else {
+                return Err(self.error_at(token, &format!("Macro invocations must not have spaces between the macro name and '!'. Did you mean `{s}!`?")));
+            }
+        }
+
+        if is_macro {
+            self.advance(); // consume Bang
+            let token_tree = self.parse_token_tree()?;
+            let mut block_tree = None;
+            if self.check(&TokenType::LeftBrace) {
+                block_tree = Some(self.parse_token_tree()?);
+            }
+            Ok(Expr::MacroCall(MacroCallExpr {
+                name: s.to_string().into(),
+                token_tree,
+                block_tree,
+                span: Span::default(),
+            }))
+        } else {
+            let span = crate::syntax::Span {
+                line: token.line,
+                column: token.column,
+                length: token.length,
+            };
+            self.parse_identifier_expr(s.to_string(), span)
+        }
+    }
+
+    /// Parses the `{ ... }` of a `comptime` block. `token` is the `comptime` token, already
+    /// consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when a brace is missing or a statement inside is not valid.
+    fn parse_comptime_block(&mut self, token: &Token<'a>) -> ParseResult<'a, Expr> {
+        self.consume(&TokenType::LeftBrace, "Expected '{' for comptime block")?;
+        let mut stmts = Vec::new();
+        let mut ret_expr = None;
+        while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
+            let stmt = self.parse_statement()?;
+            if self.check(&TokenType::RightBrace) {
+                if let Statement::ExprStmt(ExprStmtStmt {
+                    expr: e,
+                    has_semi,
+                    span: _,
+                }) = stmt
+                {
+                    if !has_semi {
+                        ret_expr = Some(Box::new(e));
+                    }
+                    break;
+                }
+            }
+            stmts.push(stmt);
+            stmts.append(&mut self.pending_stmts);
+        }
+        self.consume(&TokenType::RightBrace, "Expected '}'")?;
+        Ok(Expr::ComptimeBlock(ComptimeBlockExpr {
+            stmts,
+            ret: ret_expr,
+            span: Span {
+                line: token.line,
+                column: token.column,
+                length: token.length,
+            },
+        }))
+    }
+
+    /// Parses a closure `|a, b: T| body` or `|| body`. `token` is the opening `|` or `||`,
+    /// already consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when a parameter is not a name, the closing `|` is missing, or
+    /// the body is not an expression.
+    fn parse_closure(&mut self, token: &Token<'a>) -> ParseResult<'a, Expr> {
+        let mut params = Vec::new();
+        if token.kind == TokenType::Pipe {
+            if !self.check(&TokenType::Pipe) {
+                loop {
+                    let name = match self.advance().kind.clone() {
+                        TokenType::Identifier(s) => s.to_string(),
+                        _ => return Err(self.error("Expected identifier in closure params")),
+                    };
+                    let ty = if self.match_token(&TokenType::Colon) {
+                        self.parse_type()?
+                    } else {
+                        Type::Unknown
+                    };
+                    params.push((name.into(), ty));
+                    if !self.match_token(&TokenType::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.consume(&TokenType::Pipe, "Expected '|' after closure params")?;
+        }
+        let body = Box::new(self.parse_expr()?);
+        Ok(Expr::Closure(ClosureExpr {
+            params,
+            body,
+            ret_ty: None,
+            captures: vec![],
+            span: Span::default(),
+        }))
+    }
+
+    /// Parses `on (topology) { ... }` after `spawn`. `token` is the `spawn` token, already
+    /// consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when `on`, the topology, a brace or a statement inside is not valid.
+    fn parse_spawn_on(&mut self, token: &Token<'a>) -> ParseResult<'a, Expr> {
+        self.consume(&TokenType::On, "Expected 'on' after 'spawn'")?;
+        self.consume(&TokenType::LeftParen, "Expected '('")?;
+        let top = self.parse_topology()?;
+        self.consume(&TokenType::RightParen, "Expected ')'")?;
+        self.consume(&TokenType::LeftBrace, "Expected '{'")?;
+        let mut stmts = Vec::new();
+        let mut ret_expr = None;
+        while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
+            let stmt = self.parse_statement()?;
+            if self.check(&TokenType::RightBrace) {
+                if let Statement::ExprStmt(ExprStmtStmt {
+                    expr: e,
+                    has_semi,
+                    span: _,
+                }) = &stmt
+                {
+                    if !*has_semi {
+                        ret_expr = Some(Box::new(e.clone()));
+                        break;
+                    }
+                }
+            }
+            stmts.push(stmt);
+            stmts.append(&mut self.pending_stmts);
+        }
+        self.consume(&TokenType::RightBrace, "Expected '}'")?;
+        Ok(Expr::SpawnOn(SpawnOnExpr {
+            top,
+            stmts,
+            ret: ret_expr,
+            span: Span {
+                line: token.line,
+                column: token.column,
+                length: token.length,
+            },
+        }))
+    }
+
+    /// Parses the postfix operators after `expr`: `.member`, `.method()`, `(args)`, `[index]`
+    /// and `as T`, any number of times.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when a postfix operator is not complete.
+    fn parse_postfix_ops(&mut self, mut expr: Expr) -> ParseResult<'a, Expr> {
         loop {
             if self.match_token(&TokenType::Dot) {
-                // The method name's own token, so a diagnostic about the call points at it.
-                let name_span = crate::syntax::Span {
-                    line: self.peek().line,
-                    column: self.peek().column,
-                    length: self.peek().length,
-                };
-                let ident = match self.advance().kind.clone() {
-                    TokenType::Identifier(s) => s.to_string(),
-                    // `t.0`, a tuple's element, is its field `_0`. `t.0.1` lexes its tail as the
-                    // number `0.1`, so each part is one step.
-                    TokenType::Number(n) if n.chars().all(|c| c.is_ascii_digit() || c == '.') => {
-                        for part in n.split('.') {
-                            expr = Expr::MemberAccess(MemberAccessExpr {
-                                base: Box::new(expr),
-                                member: format!("_{part}").into(),
-                                struct_name: None,
-                                span: name_span,
-                            });
-                        }
-                        continue;
-                    }
-                    _ => return Err(self.error("Expected identifier after '.'")),
-                };
-                if self.match_token(&TokenType::LeftParen) {
-                    let mut args = Vec::new();
-                    if !self.check(&TokenType::RightParen) {
-                        loop {
-                            args.push(self.parse_expr()?);
-                            if !self.match_token(&TokenType::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    self.consume(&TokenType::RightParen, "Expected ')'")?;
-                    expr = Expr::MethodCall(MethodCallExpr {
-                        base: Box::new(expr),
-                        method_name: ident.to_string().into(),
-                        type_args: None,
-                        args,
-                        span: name_span,
-                    });
-                } else {
-                    expr = Expr::MemberAccess(MemberAccessExpr {
-                        base: Box::new(expr),
-                        member: ident.into(),
-                        struct_name: None,
-                        span: name_span,
-                    });
-                }
+                expr = self.parse_dot_postfix(expr)?;
             } else if self.match_token(&TokenType::LeftParen) {
-                let mut args = Vec::new();
-                if !self.check(&TokenType::RightParen) {
-                    loop {
-                        args.push(self.parse_expr()?);
-                        if !self.match_token(&TokenType::Comma) {
-                            break;
-                        }
-                    }
-                }
-                self.consume(&TokenType::RightParen, "Expected ')'")?;
+                let args = self.parse_call_args("Expected ')'")?;
                 expr = Expr::IndirectCall(IndirectCallExpr {
                     callee: Box::new(expr),
                     args,
@@ -1400,7 +1511,61 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    /// Parses what follows a `.` after `expr`: a field, a tuple element such as `.0`, or a
+    /// method call. The `.` is already consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when no name follows the `.`, or the method's arguments are not
+    /// valid.
+    fn parse_dot_postfix(&mut self, mut expr: Expr) -> ParseResult<'a, Expr> {
+        // The method name's own token, so a diagnostic about the call points at it.
+        let name_span = crate::syntax::Span {
+            line: self.peek().line,
+            column: self.peek().column,
+            length: self.peek().length,
+        };
+        let ident = match self.advance().kind.clone() {
+            TokenType::Identifier(s) => s.to_string(),
+            // `t.0`, a tuple's element, is its field `_0`. `t.0.1` lexes its tail as the
+            // number `0.1`, so each part is one step.
+            TokenType::Number(n) if n.chars().all(|c| c.is_ascii_digit() || c == '.') => {
+                for part in n.split('.') {
+                    expr = Expr::MemberAccess(MemberAccessExpr {
+                        base: Box::new(expr),
+                        member: format!("_{part}").into(),
+                        struct_name: None,
+                        span: name_span,
+                    });
+                }
+                return Ok(expr);
+            }
+            _ => return Err(self.error("Expected identifier after '.'")),
+        };
+        if self.match_token(&TokenType::LeftParen) {
+            let args = self.parse_call_args("Expected ')'")?;
+            Ok(Expr::MethodCall(MethodCallExpr {
+                base: Box::new(expr),
+                method_name: ident.into(),
+                type_args: None,
+                args,
+                span: name_span,
+            }))
+        } else {
+            Ok(Expr::MemberAccess(MemberAccessExpr {
+                base: Box::new(expr),
+                member: ident.into(),
+                struct_name: None,
+                span: name_span,
+            }))
+        }
+    }
+
     /// `expr as T`, any number of times.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when what follows an `as` is not a type.
     fn parse_as_casts(&mut self, mut expr: Expr) -> ParseResult<'a, Expr> {
         while self.check(&TokenType::As) {
             // The `as` token, so a diagnostic about the cast points at it.
@@ -1423,6 +1588,11 @@ impl<'a> Parser<'a> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
@@ -1449,7 +1619,7 @@ mod tests {
             assert_eq!(variant_name.as_ref(), "None");
             assert!(payload.is_none());
         } else {
-            panic!("Expected EnumVariant, got {:?}", expr);
+            panic!("Expected EnumVariant, got {expr:?}");
         }
     }
 
@@ -1474,7 +1644,7 @@ mod tests {
                 panic!("Expected Identifier payload");
             }
         } else {
-            panic!("Expected FunctionCall, got {:?}", expr);
+            panic!("Expected FunctionCall, got {expr:?}");
         }
     }
 
@@ -1493,7 +1663,7 @@ mod tests {
             assert_eq!(name.as_ref(), "Option<i32>::Some");
             assert_eq!(args.len(), 1);
         } else {
-            panic!("Expected FunctionCall, got {:?}", expr);
+            panic!("Expected FunctionCall, got {expr:?}");
         }
     }
 
@@ -1511,7 +1681,7 @@ mod tests {
             assert_eq!(name.as_ref(), "Vec<i32>::new");
             assert_eq!(args.len(), 0);
         } else {
-            panic!("Expected FunctionCall, got {:?}", expr);
+            panic!("Expected FunctionCall, got {expr:?}");
         }
     }
 
@@ -1540,7 +1710,7 @@ mod tests {
                 panic!("Expected Number payload");
             }
         } else {
-            panic!("Expected MethodCall, got {:?}", expr);
+            panic!("Expected MethodCall, got {expr:?}");
         }
     }
 
@@ -1577,7 +1747,7 @@ mod tests {
                 panic!("Expected inner MethodCall");
             }
         } else {
-            panic!("Expected MethodCall, got {:?}", expr);
+            panic!("Expected MethodCall, got {expr:?}");
         }
     }
 
@@ -1652,10 +1822,10 @@ mod tests {
             if let Expr::BinaryOp(BinaryOpExpr { op: inner_op, .. }) = &*rhs {
                 assert_eq!(*inner_op, BinaryOp::Mul);
             } else {
-                panic!("Expected Mul on RHS, got {:?}", rhs);
+                panic!("Expected Mul on RHS, got {rhs:?}");
             }
         } else {
-            panic!("Expected BinaryOp, got {:?}", expr);
+            panic!("Expected BinaryOp, got {expr:?}");
         }
     }
 
@@ -1668,10 +1838,10 @@ mod tests {
             if let Expr::LogicalOp(LogicalOpExpr { op: inner_op, .. }) = &*lhs {
                 assert_eq!(*inner_op, LogicalOp::And);
             } else {
-                panic!("Expected And on LHS, got {:?}", lhs);
+                panic!("Expected And on LHS, got {lhs:?}");
             }
         } else {
-            panic!("Expected LogicalOp, got {:?}", expr);
+            panic!("Expected LogicalOp, got {expr:?}");
         }
     }
 
@@ -1681,7 +1851,7 @@ mod tests {
         if let Expr::RelationalOp(RelationalOpExpr { op, .. }) = expr {
             assert_eq!(op, RelationalOp::Le);
         } else {
-            panic!("Expected RelationalOp, got {:?}", expr);
+            panic!("Expected RelationalOp, got {expr:?}");
         }
     }
 
@@ -1697,7 +1867,7 @@ mod tests {
             assert_eq!(op, UnaryOp::Neg);
             assert!(matches!(&*inner, Expr::Identifier(_)));
         } else {
-            panic!("Expected UnaryOp(Neg), got {:?}", expr);
+            panic!("Expected UnaryOp(Neg), got {expr:?}");
         }
     }
 
@@ -1712,10 +1882,10 @@ mod tests {
             if let Expr::Identifier(IdentifierExpr { name, .. }) = &*inner {
                 assert_eq!(name.as_ref(), "flag");
             } else {
-                panic!("Expected Identifier, got {:?}", inner);
+                panic!("Expected Identifier, got {inner:?}");
             }
         } else {
-            panic!("Expected UnaryOp(Not), got {:?}", expr);
+            panic!("Expected UnaryOp(Not), got {expr:?}");
         }
     }
 
@@ -1725,7 +1895,7 @@ mod tests {
         if let Expr::Borrow(BorrowExpr { is_mut, .. }) = expr {
             assert!(!is_mut);
         } else {
-            panic!("Expected Borrow, got {:?}", expr);
+            panic!("Expected Borrow, got {expr:?}");
         }
     }
 
@@ -1735,7 +1905,7 @@ mod tests {
         if let Expr::Borrow(BorrowExpr { is_mut, .. }) = expr {
             assert!(is_mut);
         } else {
-            panic!("Expected Borrow, got {:?}", expr);
+            panic!("Expected Borrow, got {expr:?}");
         }
     }
 
@@ -1746,10 +1916,10 @@ mod tests {
             if let Expr::Identifier(IdentifierExpr { name, .. }) = &*inner {
                 assert_eq!(name.as_ref(), "ptr");
             } else {
-                panic!("Expected Identifier, got {:?}", inner);
+                panic!("Expected Identifier, got {inner:?}");
             }
         } else {
-            panic!("Expected Dereference, got {:?}", expr);
+            panic!("Expected Dereference, got {expr:?}");
         }
     }
 
@@ -1762,7 +1932,7 @@ mod tests {
             assert_eq!(name.as_ref(), "foo");
             assert_eq!(args.len(), 3);
         } else {
-            panic!("Expected FunctionCall, got {:?}", expr);
+            panic!("Expected FunctionCall, got {expr:?}");
         }
     }
 
@@ -1773,7 +1943,7 @@ mod tests {
             assert_eq!(name.as_ref(), "bar");
             assert_eq!(args.len(), 0);
         } else {
-            panic!("Expected FunctionCall, got {:?}", expr);
+            panic!("Expected FunctionCall, got {expr:?}");
         }
     }
 
@@ -1787,7 +1957,7 @@ mod tests {
             assert_eq!(fields[0].0.as_ref(), "x");
             assert_eq!(fields[1].0.as_ref(), "y");
         } else {
-            panic!("Expected StructInit, got {:?}", expr);
+            panic!("Expected StructInit, got {expr:?}");
         }
     }
 
@@ -1797,7 +1967,7 @@ mod tests {
         if let Expr::Array(ArrayExpr { elements, .. }) = expr {
             assert_eq!(elements.len(), 3);
         } else {
-            panic!("Expected Array, got {:?}", expr);
+            panic!("Expected Array, got {expr:?}");
         }
     }
 
@@ -1816,7 +1986,7 @@ mod tests {
                 panic!("Expected Number end");
             }
         } else {
-            panic!("Expected Range, got {:?}", expr);
+            panic!("Expected Range, got {expr:?}");
         }
     }
 
@@ -1839,10 +2009,10 @@ mod tests {
                     panic!("Expected Identifier at root");
                 }
             } else {
-                panic!("Expected inner MemberAccess, got {:?}", base);
+                panic!("Expected inner MemberAccess, got {base:?}");
             }
         } else {
-            panic!("Expected MemberAccess, got {:?}", expr);
+            panic!("Expected MemberAccess, got {expr:?}");
         }
     }
 
@@ -1852,7 +2022,7 @@ mod tests {
         if let Expr::BinaryOp(BinaryOpExpr { op, .. }) = expr {
             assert_eq!(op, BinaryOp::MatMul);
         } else {
-            panic!("Expected BinaryOp(MatMul), got {:?}", expr);
+            panic!("Expected BinaryOp(MatMul), got {expr:?}");
         }
     }
 
@@ -1871,7 +2041,7 @@ mod tests {
                 panic!("Expected Number index");
             }
         } else {
-            panic!("Expected IndexAccess, got {:?}", expr);
+            panic!("Expected IndexAccess, got {expr:?}");
         }
     }
 
@@ -1893,7 +2063,7 @@ mod tests {
             assert_eq!(then_block.len(), 1);
             assert!(else_block.is_none());
         } else {
-            panic!("Expected If, got {:?}", expr);
+            panic!("Expected If, got {expr:?}");
         }
     }
 
@@ -1903,7 +2073,7 @@ mod tests {
         if let Expr::If(IfExpr { is_comptime, .. }) = expr {
             assert!(is_comptime);
         } else {
-            panic!("Expected If(comptime), got {:?}", expr);
+            panic!("Expected If(comptime), got {expr:?}");
         }
     }
 
@@ -1920,7 +2090,7 @@ mod tests {
             assert!(else_block.is_some());
             assert_eq!(else_block.unwrap().len(), 1);
         } else {
-            panic!("Expected If with else, got {:?}", expr);
+            panic!("Expected If with else, got {expr:?}");
         }
     }
 
@@ -1937,7 +2107,7 @@ mod tests {
                 panic!("Expected inner If in else-if chain");
             }
         } else {
-            panic!("Expected If, got {:?}", expr);
+            panic!("Expected If, got {expr:?}");
         }
     }
 
@@ -1956,7 +2126,7 @@ mod tests {
             assert_eq!(arms.len(), 1);
             assert_eq!(arms[0].pattern, Pattern::Wildcard);
         } else {
-            panic!("Expected Match, got {:?}", expr);
+            panic!("Expected Match, got {expr:?}");
         }
     }
 
@@ -1971,7 +2141,7 @@ mod tests {
             ));
             assert!(matches!(&arms[1].pattern, Pattern::Identifier(_)));
         } else {
-            panic!("Expected Match, got {:?}", expr);
+            panic!("Expected Match, got {expr:?}");
         }
     }
 
@@ -1995,7 +2165,7 @@ mod tests {
                 panic!("Expected EnumVariant pattern for second arm");
             }
         } else {
-            panic!("Expected Match, got {:?}", expr);
+            panic!("Expected Match, got {expr:?}");
         }
     }
 
@@ -2008,7 +2178,7 @@ mod tests {
             assert_eq!(stmts.len(), 1);
             assert!(ret.is_none());
         } else {
-            panic!("Expected UnsafeBlock, got {:?}", expr);
+            panic!("Expected UnsafeBlock, got {expr:?}");
         }
     }
 
@@ -2020,7 +2190,7 @@ mod tests {
             assert!(ret.is_some());
             assert!(matches!(&*ret.unwrap(), Expr::Identifier(_)));
         } else {
-            panic!("Expected UnsafeBlock with tail, got {:?}", expr);
+            panic!("Expected UnsafeBlock with tail, got {expr:?}");
         }
     }
 
@@ -2038,7 +2208,7 @@ mod tests {
                 panic!("Expected Number in comptime ret");
             }
         } else {
-            panic!("Expected ComptimeBlock, got {:?}", expr);
+            panic!("Expected ComptimeBlock, got {expr:?}");
         }
     }
 
@@ -2049,7 +2219,7 @@ mod tests {
             assert_eq!(stmts.len(), 1);
             assert!(ret.is_some());
         } else {
-            panic!("Expected ComptimeBlock, got {:?}", expr);
+            panic!("Expected ComptimeBlock, got {expr:?}");
         }
     }
 
@@ -2065,7 +2235,7 @@ mod tests {
             assert_eq!(target_fn.as_ref(), "f");
             assert_eq!(args.len(), 2);
         } else {
-            panic!("Expected Grad, got {:?}", expr);
+            panic!("Expected Grad, got {expr:?}");
         }
     }
 
@@ -2079,7 +2249,7 @@ mod tests {
             assert_eq!(target_fn.as_ref(), "f");
             assert!(args.is_empty());
         } else {
-            panic!("Expected Grad with no args, got {:?}", expr);
+            panic!("Expected Grad with no args, got {expr:?}");
         }
     }
 
@@ -2100,7 +2270,7 @@ mod tests {
             assert_eq!(args.len(), 2);
             assert!(matches!(&*cotangent, Expr::Identifier(_)));
         } else {
-            panic!("Expected Vjp, got {:?}", expr);
+            panic!("Expected Vjp, got {expr:?}");
         }
     }
 
@@ -2123,7 +2293,7 @@ mod tests {
                 panic!("Expected Identifier cotangent");
             }
         } else {
-            panic!("Expected Vjp, got {:?}", expr);
+            panic!("Expected Vjp, got {expr:?}");
         }
     }
 
@@ -2147,7 +2317,7 @@ mod tests {
                 panic!("Expected Identifier tangent");
             }
         } else {
-            panic!("Expected Jvp, got {:?}", expr);
+            panic!("Expected Jvp, got {expr:?}");
         }
     }
 
@@ -2162,7 +2332,7 @@ mod tests {
             assert_eq!(params[1].0.as_ref(), "y");
             assert!(matches!(&*body, Expr::Identifier(_)));
         } else {
-            panic!("Expected Closure, got {:?}", expr);
+            panic!("Expected Closure, got {expr:?}");
         }
     }
 
@@ -2173,7 +2343,7 @@ mod tests {
             assert!(params.is_empty());
             assert!(matches!(&*body, Expr::Number(_)));
         } else {
-            panic!("Expected Closure(zero-arg), got {:?}", expr);
+            panic!("Expected Closure(zero-arg), got {expr:?}");
         }
     }
 
@@ -2191,7 +2361,7 @@ mod tests {
             assert!(matches!(&*inner, Expr::Identifier(_)));
             assert_eq!(target_ty.to_string(), "f64");
         } else {
-            panic!("Expected AsCast, got {:?}", expr);
+            panic!("Expected AsCast, got {expr:?}");
         }
     }
 
@@ -2208,7 +2378,7 @@ mod tests {
             assert_eq!(target_ty.to_string(), "f64");
             assert!(matches!(&*inner, Expr::AsCast(_)));
         } else {
-            panic!("Expected chained AsCast, got {:?}", expr);
+            panic!("Expected chained AsCast, got {expr:?}");
         }
     }
 
@@ -2222,7 +2392,7 @@ mod tests {
             assert_eq!(args.len(), 2);
             assert!(matches!(&*callee, Expr::FunctionCall(_)));
         } else {
-            panic!("Expected IndirectCall, got {:?}", expr);
+            panic!("Expected IndirectCall, got {expr:?}");
         }
     }
 
@@ -2234,7 +2404,7 @@ mod tests {
         if let Expr::SizeOf(SizeOfExpr { target_ty, .. }) = expr {
             assert_eq!(target_ty.to_string(), "i32");
         } else {
-            panic!("Expected SizeOf, got {:?}", expr);
+            panic!("Expected SizeOf, got {expr:?}");
         }
     }
 
@@ -2246,7 +2416,7 @@ mod tests {
         if let Expr::StringLiteral(StringLiteralExpr { value, .. }) = expr {
             assert_eq!(value.as_ref(), "hello world");
         } else {
-            panic!("Expected StringLiteral, got {:?}", expr);
+            panic!("Expected StringLiteral, got {expr:?}");
         }
     }
 
@@ -2263,10 +2433,10 @@ mod tests {
             {
                 assert!(matches!(&**innermost, Expr::Identifier(_)));
             } else {
-                panic!("Expected inner Dereference, got {:?}", inner);
+                panic!("Expected inner Dereference, got {inner:?}");
             }
         } else {
-            panic!("Expected Dereference, got {:?}", expr);
+            panic!("Expected Dereference, got {expr:?}");
         }
     }
 
@@ -2279,7 +2449,7 @@ mod tests {
         if let Expr::Dereference(DereferenceExpr { expr: inner, .. }) = expr {
             assert!(matches!(&*inner, Expr::Borrow(_)));
         } else {
-            panic!("Expected Dereference(Borrow), got {:?}", expr);
+            panic!("Expected Dereference(Borrow), got {expr:?}");
         }
     }
 
@@ -2294,7 +2464,7 @@ mod tests {
             assert_eq!(op, UnaryOp::Neg);
             assert!(matches!(&*inner, Expr::FunctionCall(_)));
         } else {
-            panic!("Expected UnaryOp(Neg, FunctionCall), got {:?}", expr);
+            panic!("Expected UnaryOp(Neg, FunctionCall), got {expr:?}");
         }
     }
 }

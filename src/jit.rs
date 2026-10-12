@@ -16,10 +16,6 @@ use std::fs::File;
 use std::io::Write;
 use std::process::Command;
 
-/// Where `libvx_std_core` sits for the profile this compiler was built with.
-///
-/// Its absence is worth its own message: `cargo test` never emits the shared library, because a
-/// dependency edge only asks for an rlib, so a checkout that has only been tested reaches the
 /// An MLIR execution engine that emits an object file, holding its own handle.
 ///
 /// Not `melior::ExecutionEngine`, because of how MLIR's C API reads the library list.
@@ -33,12 +29,23 @@ use std::process::Command;
 /// `CString` is correct whichever the C++ side reads, which matters because it reads the pointer
 /// today and the fix upstream would make it read the length.
 pub struct ObjectEmitter {
+    /// The MLIR engine handle. This struct owns it and destroys it when dropped.
     raw: mlir_sys::MlirExecutionEngine,
 }
 
 impl ObjectEmitter {
     /// Build an engine over `module`, loading the runtime libraries `shared_library_paths` resolves.
-    pub fn new(module: &melior::ir::Module, opt_level: usize) -> Result<Self, String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a runtime library cannot be found, when a library path contains a
+    /// NUL byte, when `opt_level` does not fit in an `i32`, or when MLIR cannot build an engine
+    /// for the module.
+    #[allow(
+        unsafe_code,
+        reason = "creating an MLIR execution engine is a call into MLIR's C API"
+    )]
+    pub fn new(module: &melior::ir::Module<'_>, opt_level: usize) -> Result<Self, String> {
         let paths = shared_library_paths()?;
         let owned: Vec<std::ffi::CString> = paths
             .iter()
@@ -52,13 +59,17 @@ impl ObjectEmitter {
                 length: c.as_bytes().len(),
             })
             .collect();
+        let opt_level = i32::try_from(opt_level)
+            .map_err(|e| format!("optimization level {opt_level} is out of range: {e}"))?;
+        let library_count = i32::try_from(refs.len())
+            .map_err(|e| format!("too many shared libraries to load: {e}"))?;
 
         // SAFETY: `owned` backs every pointer in `refs`, and both outlive the call below.
         let raw = unsafe {
             mlir_sys::mlirExecutionEngineCreate(
                 module.to_raw(),
-                opt_level as i32,
-                refs.len() as i32,
+                opt_level,
+                library_count,
                 refs.as_ptr(),
                 true,
                 true,
@@ -79,6 +90,14 @@ impl ObjectEmitter {
     }
 
     /// Write the compiled module to `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `path` contains a NUL byte.
+    #[allow(
+        unsafe_code,
+        reason = "writing the object file is a call into MLIR's C API"
+    )]
     pub fn dump_to_object_file(&self, path: &str) -> Result<(), String> {
         let name = std::ffi::CString::new(path)
             .map_err(|e| format!("output path contains an interior NUL byte: {e}"))?;
@@ -90,13 +109,17 @@ impl ObjectEmitter {
                     data: name.as_ptr(),
                     length: name.as_bytes().len(),
                 },
-            )
+            );
         }
         Ok(())
     }
 }
 
 impl Drop for ObjectEmitter {
+    #[allow(
+        unsafe_code,
+        reason = "destroying the engine is a call into MLIR's C API"
+    )]
     fn drop(&mut self) {
         // SAFETY: `self.raw` was returned non-null by `mlirExecutionEngineCreate` and is destroyed
         // exactly once.
@@ -105,6 +128,10 @@ impl Drop for ObjectEmitter {
 }
 
 /// The target triple of the machine running the compiler, from `llvm-config --host-target`.
+///
+/// # Errors
+///
+/// Returns an error when `llvm-config` cannot be run, fails, or prints no triple.
 fn host_target_triple() -> Result<String, String> {
     let llvm_config_path =
         std::env::var("LLVM_CONFIG_PATH").unwrap_or_else(|_| "llvm-config".to_string());
@@ -121,6 +148,10 @@ fn host_target_triple() -> Result<String, String> {
 
 /// The Enzyme plugin `opt` should load for this LLVM IR, given `ENZYME_LIB`. Only a program that
 /// uses `grad`, `vjp` or `jvp` calls an `__enzyme_` function, so no other program loads the plugin.
+///
+/// # Errors
+///
+/// Returns an error when the program needs Enzyme and `enzyme_lib` is `None` or empty.
 fn enzyme_plugin_for(llvm_ir: &[u8], enzyme_lib: Option<String>) -> Result<Option<String>, String> {
     let needle = b"__enzyme_";
     if !llvm_ir.windows(needle.len()).any(|w| w == needle) {
@@ -141,6 +172,10 @@ fn enzyme_plugin_for(llvm_ir: &[u8], enzyme_lib: Option<String>) -> Result<Optio
 ///
 /// Resolved through PATH by default (config.local puts the intended LLVM first), matching how
 /// build.rs locates the toolchain. Hardcoding a Homebrew prefix made this unusable on Linux.
+///
+/// # Errors
+///
+/// Returns an error when `llvm-config` cannot be run.
 pub fn llvm_libdir() -> Result<String, String> {
     let llvm_config_path =
         std::env::var("LLVM_CONFIG_PATH").unwrap_or_else(|_| "llvm-config".to_string());
@@ -166,6 +201,10 @@ pub fn llvm_libdir() -> Result<String, String> {
 /// own list from BARE FILENAMES, which MLIR resolves against the process CWD, so it looked for
 /// `libmlir_runner_utils` in the repo root and silently produced no object; and it looked for the
 /// dispatch plugin under `target/jit/`, a directory the build never writes.
+///
+/// # Errors
+///
+/// Returns an error when `llvm-config` cannot be run or the Vx runtime library is missing.
 pub fn shared_library_paths() -> Result<Vec<String>, String> {
     let libdir = llvm_libdir()?;
     let mut libs = vec![
@@ -193,7 +232,7 @@ pub fn shared_library_paths() -> Result<Vec<String>, String> {
 }
 
 /// Where `libvx_mlir_shims` sits, most specific first: named outright, then an installed
-/// toolchain's own copy next to the compiler, then the OUT_DIR of the build that produced this
+/// toolchain's own copy next to the compiler, then the `OUT_DIR` of the build that produced this
 /// binary.
 ///
 /// That last one is an absolute path on the build machine. It is right in a source checkout and
@@ -202,6 +241,7 @@ pub fn shared_library_paths() -> Result<Vec<String>, String> {
 /// saying why.
 ///
 /// An empty string means there are none. Not fatal -- only half-precision printing needs them.
+#[must_use]
 pub fn mlir_shims_path() -> String {
     let file_name = format!(
         "{}vx_mlir_shims{}",
@@ -233,7 +273,16 @@ pub fn mlir_shims_path() -> String {
     String::new()
 }
 
+/// Where `libvx_std_core` sits for the profile this compiler was built with.
+///
+/// Its absence is worth its own message: `cargo test` never emits the shared library, because a
+/// dependency edge only asks for an rlib, so a checkout that has only been tested reaches the
 /// linker without it and clang reports a missing file with no hint of which build produces it.
+///
+/// # Errors
+///
+/// Returns an error that lists every place searched when the library is in none of them, or when
+/// the working directory cannot be read.
 pub fn runtime_library_path() -> Result<String, String> {
     let file_name = format!(
         "{}vx_std_core{}",
@@ -299,13 +348,18 @@ pub fn runtime_library_path() -> Result<String, String> {
     ))
 }
 
+/// Run `cmd` and return what it printed. `desc` names the command in an error message.
+///
+/// # Errors
+///
+/// Returns an error when the command cannot be started or exits with a failure status.
 fn run_cmd(mut cmd: Command, desc: &str) -> Result<std::process::Output, String> {
     let output = cmd
         .output()
-        .map_err(|e| format!("Failed to run {}: {}", desc, e))?;
+        .map_err(|e| format!("Failed to run {desc}: {e}"))?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("{} failed:\n{}", desc, err));
+        return Err(format!("{desc} failed:\n{err}"));
     }
     Ok(output)
 }
@@ -324,7 +378,9 @@ fn run_cmd(mut cmd: Command, desc: &str) -> Result<std::process::Output, String>
 /// the old concatenated form for those callers; the driver uses this and routes each stream to the
 /// matching one of its own.
 pub struct ProgramOutput {
+    /// What the program wrote to its standard output.
     pub stdout: String,
+    /// What the program wrote to its standard error.
     pub stderr: String,
 }
 
@@ -332,6 +388,14 @@ pub struct ProgramOutput {
 ///
 /// Kept for callers that only want "what did it print" and do not care which stream it came from,
 /// notably the fixture harnesses whose EXPECT lines match against either.
+///
+/// # Errors
+///
+/// Returns an error in the same cases as `execute_mlir_streams`.
+///
+/// # Panics
+///
+/// Panics when the working directory cannot be read.
 pub fn execute_mlir(
     mlir_src: &str,
     program_args: Vec<String>,
@@ -347,6 +411,20 @@ pub fn execute_mlir(
     Ok(format!("{}{}", out.stdout, out.stderr))
 }
 
+/// Compile MLIR text to a native program, run it, and return its two output streams apart.
+///
+/// The steps are: `mlir-translate` to LLVM IR, `opt`, `llc`, a link with `clang`, then the run.
+///
+/// # Errors
+///
+/// Returns an error when a temporary file cannot be written, when one of the tools cannot be run
+/// or fails, when the Vx runtime library is missing, when the program needs Enzyme and
+/// `ENZYME_LIB` is not set, or when the program exits with a non-zero code or is killed by a
+/// signal.
+///
+/// # Panics
+///
+/// Panics when the working directory cannot be read.
 pub fn execute_mlir_streams(
     mlir_src: &str,
     program_args: Vec<String>,
@@ -355,22 +433,7 @@ pub fn execute_mlir_streams(
 ) -> Result<ProgramOutput, String> {
     let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
 
-    let temp_mlir = temp_dir
-        .path()
-        .join("input.mlir")
-        .to_string_lossy()
-        .into_owned();
-    let temp_ll = temp_dir
-        .path()
-        .join("input.ll")
-        .to_string_lossy()
-        .into_owned();
-
-    // 1. Write MLIR to temp file
-    let mut mlir_file = File::create(&temp_mlir).map_err(|e| e.to_string())?;
-    mlir_file
-        .write_all(mlir_src.as_bytes())
-        .map_err(|e| e.to_string())?;
+    let temp_mlir = write_mlir_file(temp_dir.path(), mlir_src)?;
 
     // Runtime functions are now loaded via libvx_std_core.dylib
 
@@ -382,24 +445,8 @@ pub fn execute_mlir_streams(
     let lib_npu = std::env::var("VX_DISPATCH_LIB")
         .unwrap_or_else(|_| std::env!("NPU_SHARED_LIB_PATH").to_string());
 
-    let mlir_translate_path =
-        std::env::var("MLIR_TRANSLATE_PATH").unwrap_or_else(|_| "mlir-translate".to_string());
-    println!("[JIT] Translating to LLVM IR...");
-    let mut mlir_translate_cmd = Command::new(&mlir_translate_path);
-    mlir_translate_cmd.args(["--mlir-to-llvmir", &temp_mlir]);
-    let mlir_translate_out = run_cmd(mlir_translate_cmd, "mlir-translate")?;
+    let (temp_ll, llvm_ir) = translate_to_llvm_ir(temp_dir.path(), &temp_mlir)?;
 
-    let mut llvmir_file = File::create(&temp_ll).map_err(|e| e.to_string())?;
-    llvmir_file
-        .write_all(&mlir_translate_out.stdout)
-        .map_err(|e| e.to_string())?;
-
-    let temp_opt_ll = temp_dir
-        .path()
-        .join("opt.ll")
-        .to_string_lossy()
-        .into_owned();
-    let mut opt_args = vec![];
     let actual_opt_level = if disable_llvm_optimizations {
         0
     } else {
@@ -409,55 +456,162 @@ pub fn execute_mlir_streams(
     // The translated module names no target. Without one, `opt` has no target machine, so its
     // vectorizer sees no vector registers and leaves every loop scalar.
     let triple = host_target_triple()?;
-    opt_args.push(format!("-mtriple={triple}"));
-    opt_args.push("-mcpu=native".to_string());
 
-    let mut passes = format!("default<O{}>", actual_opt_level);
+    let temp_opt_ll = optimize_llvm_ir(
+        temp_dir.path(),
+        &temp_ll,
+        &llvm_ir,
+        &triple,
+        actual_opt_level,
+    )?;
+    let temp_obj = compile_to_object(temp_dir.path(), &temp_opt_ll, &triple, actual_opt_level)?;
+    let temp_exe = link_executable(temp_dir.path(), &temp_obj, &lib_npu)?;
+    run_program(&temp_exe, program_args)
+}
 
-    if let Some(enzyme_lib) =
-        enzyme_plugin_for(&mlir_translate_out.stdout, std::env::var("ENZYME_LIB").ok())?
-    {
-        opt_args.push(format!("-load-pass-plugin={}", enzyme_lib));
+/// The path of the file called `name` inside `temp_dir`, as a string.
+fn temp_file_path(temp_dir: &std::path::Path, name: &str) -> String {
+    temp_dir.join(name).to_string_lossy().into_owned()
+}
+
+/// Write the MLIR text to a file inside `temp_dir` and return the path of that file.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be created or written.
+fn write_mlir_file(temp_dir: &std::path::Path, mlir_src: &str) -> Result<String, String> {
+    let temp_mlir = temp_file_path(temp_dir, "input.mlir");
+
+    // 1. Write MLIR to temp file
+    let mut mlir_file = File::create(&temp_mlir).map_err(|e| e.to_string())?;
+    mlir_file
+        .write_all(mlir_src.as_bytes())
+        .map_err(|e| e.to_string())?;
+    Ok(temp_mlir)
+}
+
+/// Translate the MLIR file to LLVM IR with `mlir-translate`. Returns the path of the LLVM IR file
+/// it wrote inside `temp_dir`, and the LLVM IR itself.
+///
+/// # Errors
+///
+/// Returns an error when `mlir-translate` cannot be run or fails, or when the LLVM IR file cannot
+/// be written.
+fn translate_to_llvm_ir(
+    temp_dir: &std::path::Path,
+    temp_mlir: &str,
+) -> Result<(String, Vec<u8>), String> {
+    let temp_ll = temp_file_path(temp_dir, "input.ll");
+
+    let mlir_translate_path =
+        std::env::var("MLIR_TRANSLATE_PATH").unwrap_or_else(|_| "mlir-translate".to_string());
+    println!("[JIT] Translating to LLVM IR...");
+    let mut mlir_translate_cmd = Command::new(&mlir_translate_path);
+    mlir_translate_cmd.args(["--mlir-to-llvmir", temp_mlir]);
+    let mlir_translate_out = run_cmd(mlir_translate_cmd, "mlir-translate")?;
+
+    let mut llvmir_file = File::create(&temp_ll).map_err(|e| e.to_string())?;
+    llvmir_file
+        .write_all(&mlir_translate_out.stdout)
+        .map_err(|e| e.to_string())?;
+    Ok((temp_ll, mlir_translate_out.stdout))
+}
+
+/// Optimize the LLVM IR file `temp_ll` with `opt` and return the path of the optimized file it
+/// wrote inside `temp_dir`. `llvm_ir` is the content of `temp_ll`, read to decide whether the
+/// Enzyme plugin is needed.
+///
+/// # Errors
+///
+/// Returns an error when the program needs Enzyme and `ENZYME_LIB` is not set, or when `opt`
+/// cannot be run or fails.
+fn optimize_llvm_ir(
+    temp_dir: &std::path::Path,
+    temp_ll: &str,
+    llvm_ir: &[u8],
+    triple: &str,
+    actual_opt_level: u8,
+) -> Result<String, String> {
+    let temp_opt_ll = temp_file_path(temp_dir, "opt.ll");
+    let mut opt_args = vec![format!("-mtriple={triple}"), "-mcpu=native".to_string()];
+
+    let mut passes = format!("default<O{actual_opt_level}>");
+
+    if let Some(enzyme_lib) = enzyme_plugin_for(llvm_ir, std::env::var("ENZYME_LIB").ok())? {
+        opt_args.push(format!("-load-pass-plugin={enzyme_lib}"));
         passes.push_str(",enzyme");
     }
 
-    opt_args.push(format!("-passes={}", passes));
+    opt_args.push(format!("-passes={passes}"));
     opt_args.push("-S".to_string());
-    opt_args.push(temp_ll.clone());
+    opt_args.push(temp_ll.to_string());
     opt_args.push("-o".to_string());
     opt_args.push(temp_opt_ll.clone());
 
     let opt_path = std::env::var("OPT_PATH").unwrap_or_else(|_| "opt".to_string());
-    println!("[JIT] Optimizing LLVM IR (-O{})...", actual_opt_level);
+    println!("[JIT] Optimizing LLVM IR (-O{actual_opt_level})...");
     let mut opt_cmd = Command::new(&opt_path);
     opt_cmd.args(&opt_args);
     run_cmd(opt_cmd, "opt")?;
+    Ok(temp_opt_ll)
+}
 
+/// Compile the optimized LLVM IR file to a native object file with `llc` and return the path of
+/// the object file it wrote inside `temp_dir`.
+///
+/// # Errors
+///
+/// Returns an error when `llc` cannot be run or fails.
+fn compile_to_object(
+    temp_dir: &std::path::Path,
+    temp_opt_ll: &str,
+    triple: &str,
+    actual_opt_level: u8,
+) -> Result<String, String> {
     let llc_path = std::env::var("LLC_PATH").unwrap_or_else(|_| "llc".to_string());
-    println!(
-        "[JIT] Compiling to native object (-O{})...",
-        actual_opt_level
-    );
-    let temp_obj = temp_dir.path().join("opt.o").to_string_lossy().into_owned();
+    println!("[JIT] Compiling to native object (-O{actual_opt_level})...");
+    let temp_obj = temp_file_path(temp_dir, "opt.o");
     let mut llc_cmd = Command::new(&llc_path);
     llc_cmd.args([
-        &format!("-O={}", actual_opt_level),
+        &format!("-O={actual_opt_level}"),
         &format!("-mtriple={triple}"),
         "-mcpu=native",
         "-filetype=obj",
         "-relocation-model=pic",
-        &temp_opt_ll,
+        temp_opt_ll,
         "-o",
         &temp_obj,
     ]);
     run_cmd(llc_cmd, "llc")?;
+    Ok(temp_obj)
+}
 
+/// The directory that holds the file `p`, or `.` when the path has no parent.
+fn parent_dir_of(p: &str) -> String {
+    std::path::Path::new(p)
+        .parent()
+        .map_or_else(|| ".".to_string(), |d| d.display().to_string())
+}
+
+/// Link the object file into a native executable with `clang` and return the path of the
+/// executable it wrote inside `temp_dir`. `lib_npu` is the dispatch backend library, which is
+/// linked only when the file exists.
+///
+/// # Errors
+///
+/// Returns an error when `llvm-config` cannot be run, when the Vx runtime library is missing, or
+/// when `clang` cannot be run or fails.
+///
+/// # Panics
+///
+/// Panics when the working directory cannot be read.
+fn link_executable(
+    temp_dir: &std::path::Path,
+    temp_obj: &str,
+    lib_npu: &str,
+) -> Result<String, String> {
     println!("[JIT] Linking native executable...");
-    let temp_exe = temp_dir
-        .path()
-        .join("temp.out")
-        .to_string_lossy()
-        .into_owned();
+    let temp_exe = temp_file_path(temp_dir, "temp.out");
     let current_dir = std::env::current_dir().unwrap();
     let profile_dir = if cfg!(debug_assertions) {
         "debug"
@@ -465,27 +619,7 @@ pub fn execute_mlir_streams(
         "release"
     };
 
-    // Resolve through PATH by default (config.local puts the intended LLVM
-    // first), matching how build.rs locates the toolchain. Hardcoding a
-    // Homebrew prefix here made the JIT unusable on Linux.
-    let llvm_config_path =
-        std::env::var("LLVM_CONFIG_PATH").unwrap_or_else(|_| "llvm-config".to_string());
-
-    let mut llvm_config_cmd = Command::new(&llvm_config_path);
-    llvm_config_cmd.arg("--libdir");
-    let llvm_libdir_out = llvm_config_cmd.output().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!(
-                "Compiler toolchain error: '{}' was not found. Please ensure LLVM is installed and in your PATH, or set LLVM_CONFIG_PATH.",
-                llvm_config_path
-            )
-        } else {
-            format!("Failed to run {}: {}", llvm_config_path, e)
-        }
-    })?;
-    let llvm_libdir = String::from_utf8_lossy(&llvm_libdir_out.stdout)
-        .trim()
-        .to_string();
+    let llvm_libdir = llvm_libdir()?;
 
     let clang_path = std::env::var("CLANG_PATH").unwrap_or_else(|_| "clang".to_string());
     let mut clang_cmd = Command::new(&clang_path);
@@ -497,17 +631,11 @@ pub fn execute_mlir_streams(
     // `target/<profile>` and the shims in the build script's OUT_DIR.
     let runtime_lib = runtime_library_path()?;
     let shims = mlir_shims_path();
-    let parent_of = |p: &str| {
-        std::path::Path::new(p)
-            .parent()
-            .map(|d| d.display().to_string())
-            .unwrap_or_else(|| ".".to_string())
-    };
 
     // Rpaths
     clang_cmd.args([
-        &format!("-Wl,-rpath,{}", llvm_libdir),
-        &format!("-Wl,-rpath,{}", parent_of(&runtime_lib)),
+        &format!("-Wl,-rpath,{llvm_libdir}"),
+        &format!("-Wl,-rpath,{}", parent_dir_of(&runtime_lib)),
         &format!(
             "-Wl,-rpath,{}/target/{}",
             current_dir.display(),
@@ -516,11 +644,11 @@ pub fn execute_mlir_streams(
         // No longer need target/jit in rpath
     ]);
     if !shims.is_empty() {
-        clang_cmd.arg(format!("-Wl,-rpath,{}", parent_of(&shims)));
+        clang_cmd.arg(format!("-Wl,-rpath,{}", parent_dir_of(&shims)));
     }
 
     // Input obj and output exe
-    clang_cmd.args([&temp_obj, "-o", &temp_exe]);
+    clang_cmd.args([temp_obj, "-o", &temp_exe]);
 
     // Libraries
     clang_cmd.args([
@@ -544,6 +672,17 @@ pub fn execute_mlir_streams(
         clang_cmd.arg(&shims);
     }
 
+    add_dispatch_library_args(&mut clang_cmd, lib_npu);
+
+    clang_cmd.arg("-lm");
+
+    run_cmd(clang_cmd, "clang")?;
+    Ok(temp_exe)
+}
+
+/// Add the `clang` arguments that link the dispatch backend library `lib_npu`. Adds nothing when
+/// the path is empty or the file does not exist.
+fn add_dispatch_library_args(clang_cmd: &mut Command, lib_npu: &str) {
     // The dispatch runtime provides vx_plugin_dispatch_async, which any program
     // containing a non-CPU `spawn on` calls. macOS gets the ANE/AMX backend
     // (runtime/npu_dispatch.mm); other platforms get the portable host shim
@@ -553,9 +692,9 @@ pub fn execute_mlir_streams(
     // never shipped -- and handing clang a path that is not there fails the link outright with
     // "no such file or directory", rather than falling back to host execution. The sibling
     // resolution in `shared_library_paths` has always checked this; the link path had not.
-    if !lib_npu.is_empty() && std::path::Path::new(&lib_npu).exists() {
-        clang_cmd.arg(format!("-Wl,-rpath,{}", parent_of(&lib_npu)));
-        clang_cmd.args([&lib_npu]);
+    if !lib_npu.is_empty() && std::path::Path::new(lib_npu).exists() {
+        clang_cmd.arg(format!("-Wl,-rpath,{}", parent_dir_of(lib_npu)));
+        clang_cmd.args([lib_npu]);
         clang_cmd.arg("-lffi");
 
         // The dispatcher resolves the outlined kernel with
@@ -579,13 +718,17 @@ pub fn execute_mlir_streams(
             }
         }
     }
+}
 
-    clang_cmd.arg("-lm");
-
-    run_cmd(clang_cmd, "clang")?;
-
+/// Run the linked program `temp_exe` with `program_args` and return what it wrote.
+///
+/// # Errors
+///
+/// Returns an error when the program cannot be started, exits with a non-zero code, or is killed
+/// by a signal.
+fn run_program(temp_exe: &str, program_args: Vec<String>) -> Result<ProgramOutput, String> {
     println!("[JIT] Executing native binary...");
-    let mut exe_cmd = Command::new(&temp_exe);
+    let mut exe_cmd = Command::new(temp_exe);
     exe_cmd.args(program_args);
     if std::env::var("RUST_BACKTRACE").is_err() {
         exe_cmd.env("RUST_BACKTRACE", "1");
@@ -605,22 +748,21 @@ pub fn execute_mlir_streams(
         // byte-identical to what they were, because callers match on them: the
         // differential harness parses the number off the end of the error, and
         // a monomorphization test looks for "exited with code: 8".
-        let killed = killed_by_signal(&exe_out.status);
+        let killed = killed_by_signal(exe_out.status);
         match &killed {
-            Some(how) => println!("[JIT] Program {}", how),
+            Some(how) => println!("[JIT] Program {how}"),
             None => println!(
                 "[JIT] Program exited with code: {}",
                 exe_out.status.code().unwrap_or(-1)
             ),
         }
         if !out_str.is_empty() {
-            println!("{}", out_str);
+            println!("{out_str}");
         }
         if !err_str.is_empty() {
             println!(
                 "[JIT] Error output:
-{}",
-                err_str
+{err_str}"
             );
         }
         return Err(match killed {
@@ -644,7 +786,7 @@ pub fn execute_mlir_streams(
 /// the usual `unwrap_or(-1)` turns every crash into "exited with code -1" --
 /// which reads as though the program returned -1 and hides the difference
 /// between a wrong answer and a segfault.
-fn killed_by_signal(status: &std::process::ExitStatus) -> Option<String> {
+fn killed_by_signal(status: std::process::ExitStatus) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -666,6 +808,11 @@ fn killed_by_signal(status: &std::process::ExitStatus) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 

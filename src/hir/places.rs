@@ -21,6 +21,7 @@ use crate::syntax::Expr;
 /// The path element for an index: `[3]` for an integer literal, and [`ANY_INDEX`] for anything
 /// else, which may be any element. So `q[0]` and `q[1]` are different places, and `q[i]` may be
 /// either of them.
+#[must_use]
 pub fn index_element(index: &Expr) -> String {
     match index {
         Expr::Number(n) => match n.value.parse::<u64>() {
@@ -37,6 +38,7 @@ pub const ANY_INDEX: &str = "[?]";
 /// The root local and projection path of an lvalue: `o.x.y` -> `(o, [x, y])`, `q[0].x` ->
 /// `(q, [[0], x])`, a bare local -> `(o, [])`. An index is a path element, written by
 /// [`index_element`]. `None` for a base with no nameable root (`&5`, a call result).
+#[must_use]
 pub fn base_and_path(e: &Expr) -> Option<(Symbol, Vec<Symbol>)> {
     match e {
         Expr::Identifier(id) => Some((id.name.clone(), Vec::new())),

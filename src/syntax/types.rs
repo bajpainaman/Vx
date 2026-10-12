@@ -1,4 +1,4 @@
-use super::*;
+use super::Expr;
 
 //===- ast.rs - Vx Compiler ------------------------------------*- Rust -*-===//
 //
@@ -60,6 +60,7 @@ pub const REGION_MAX_0: u64 = REGION_MASK_0 - 1;
 ///
 /// Here rather than in either backend because it asks a question about the AST, and both the
 /// flattener and the flat emitter carried an identical copy of it.
+#[must_use]
 pub fn scalar_of(ty: &Type) -> Option<ElementType> {
     match ty {
         Type::Scalar(ElementType::Generic(_)) => None,
@@ -71,17 +72,20 @@ pub fn scalar_of(ty: &Type) -> Option<ElementType> {
 /// Whether a return type is `void` — spelled `Type::Struct("void", _)`. A void-returning call
 /// produces no result value; the flat emitter prints `-> ()`. `!` counts too: a function that
 /// never returns has no result value either.
+#[must_use]
 pub fn is_void_ty(ty: &Type) -> bool {
     matches!(ty, Type::Struct(n, _) if n.as_ref() == "void" || n.as_ref() == "none")
         || is_never_ty(ty)
 }
 
 /// The return type `!`: the function never returns. Spelled `Type::Struct("!", _)`, like `void`.
+#[must_use]
 pub fn never_ty() -> Type {
     Type::Struct("!".into(), None)
 }
 
 /// Whether a return type is `!`.
+#[must_use]
 pub fn is_never_ty(ty: &Type) -> bool {
     matches!(ty, Type::Struct(n, _) if n.as_ref() == "!")
 }
@@ -91,12 +95,17 @@ pub fn is_never_ty(ty: &Type) -> bool {
 /// Here rather than in `crate::resolver` because the AST's own `resolve_names` walk threads them,
 /// and the AST cannot depend on the resolver that consumes it.
 pub type SymbolTable = std::collections::HashMap<Symbol, crate::gid::TypeId>;
+/// Every module's [`SymbolTable`], by module path.
 pub type SymbolMap = std::collections::HashMap<Symbol, SymbolTable>;
 
+/// A place in the source text.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Default, Hash)]
 pub struct Span {
+    /// The line number.
     pub line: usize,
+    /// The column number on that line.
     pub column: usize,
+    /// How many characters the place covers.
     pub length: usize,
 }
 
@@ -216,7 +225,9 @@ impl PartialEq for Topology {
 /// a device and one written as its space name the same location and have to compare equal.
 #[derive(Debug, Clone)]
 pub struct Placement {
+    /// The device that holds the value.
     pub topology: Topology,
+    /// The memory space on that device.
     pub space: MemorySpace,
     /// Which projection the source stated. The other is derived, and is provisional until
     /// [`Placement::complete`] has this compilation's topology declarations: the parser can
@@ -233,14 +244,18 @@ pub struct Placement {
 /// Which half of a [`Placement`] the source wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stated {
+    /// The source wrote the device, `Topology::X`.
     Device,
+    /// The source wrote the memory space, `Memory::X`.
     Space,
 }
 
 /// The public reading of [`Stated`], for callers that must derive the other half themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Written {
+    /// The source wrote the device, `Topology::X`.
     Device,
+    /// The source wrote the memory space, `Memory::X`.
     Space,
 }
 
@@ -254,6 +269,7 @@ impl PartialEq for Placement {
 
 impl Placement {
     /// A placement written as a device. The space is the one that device holds.
+    #[must_use]
     pub fn on(topology: Topology) -> Self {
         let space = crate::arch::builtin_default_space(&topology.kind());
         Self {
@@ -269,9 +285,11 @@ impl Placement {
     /// `memory:` names it, which only the program's declarations can say, so the device starts as
     /// the like-named topology -- the convention `default_memory_for` already applies in the
     /// other direction -- and `complete` replaces it.
+    #[must_use]
     pub fn at(space: MemorySpace) -> Self {
-        let topology = crate::arch::owning_topology_in(&space, &Default::default())
-            .unwrap_or_else(|_| Topology::Custom(Symbol::from(space.name().as_str())));
+        let topology =
+            crate::arch::owning_topology_in(&space, &std::collections::HashMap::default())
+                .unwrap_or_else(|_| Topology::Custom(Symbol::from(space.name().as_str())));
         Self {
             topology,
             space,
@@ -285,6 +303,7 @@ impl Placement {
     /// replaces it. Also the constructor for a placement read back from a `.vxlib`, where both
     /// projections were serialized and neither needs deriving -- those are never re-completed,
     /// since a metadata type does not pass through name resolution.
+    #[must_use]
     pub fn in_space(space: MemorySpace, topology: Topology) -> Self {
         Self {
             topology,
@@ -304,7 +323,7 @@ impl Placement {
     ) {
         match self.stated {
             Stated::Device => {
-                self.space = crate::arch::default_space_in(&self.topology, descriptors)
+                self.space = crate::arch::default_space_in(&self.topology, descriptors);
             }
             Stated::Space => {
                 if let Ok(t) = crate::arch::owning_topology_in(&self.space, descriptors) {
@@ -320,6 +339,7 @@ impl Placement {
     /// derivation runs in name resolution, and a program that fails the type checker never gets
     /// there, so the checker sees the provisional value the parser left. Knowing which half was
     /// written lets such a caller derive the other from its own tables.
+    #[must_use]
     pub fn written(&self) -> Written {
         match self.stated {
             Stated::Device => Written::Device,
@@ -330,6 +350,7 @@ impl Placement {
     /// The placement as the source wrote it, for a diagnostic that quotes the program rather than
     /// the projection derived from it. A reader who wrote `Topology::X` is not helped by being
     /// told about `Memory::X`.
+    #[must_use]
     pub fn as_written(&self) -> String {
         match self.stated {
             Stated::Device => match self.topology.kind() {
@@ -341,13 +362,18 @@ impl Placement {
     }
 }
 
-#[allow(non_camel_case_types)]
+/// A device, or a group of devices, that code can run on and that data can be placed on.
 #[derive(Debug, Clone)]
 pub enum Topology {
+    /// The host CPU.
     CPU,
+    /// A neural processing unit, by device index.
     NPU(Box<Expr>),
+    /// One core of an accelerator, by index.
     AccCore(Box<Expr>),
+    /// The AMX matrix unit of the CPU.
     AMX,
+    /// The Apple Neural Engine.
     ANE,
     /// A discrete GPU, by device index. Bare `Topology::gpu(0)` in source means
     /// device 0; `Topology::gpu(0)[1]` names the second.
@@ -357,23 +383,34 @@ pub enum Topology {
     /// `spawn on(Topology::gpu(0))` denoted the same anonymous device, and
     /// `Topology::gpu(0)[1]` was a parse error.
     GPU(Box<Expr>),
+    /// A CPU that has the AVX-512 vector instructions.
     CpuAvx512,
+    /// A CPU that has the NEON vector instructions.
     CpuNeon,
+    /// A range of devices of one kind, `NPU[0..4]`: the devices, then the two ends of the range.
     Slice(Box<Topology>, Box<Expr>, Box<Expr>), // For NPU[0..4] etc.
     /// A user-defined topology, identified by name and described in the topology
     /// registry (`crate::arch::topology_descriptor`). This is the open identity that
     /// lets users add their own topologies without editing the language.
     Custom(Symbol),
+    /// `Topology::Current`: the device the surrounding code runs on.
     Current,
 }
 
+/// A kind of memory that data can live in, as written after `Memory::`.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum MemorySpace {
+    /// `CPU_DRAM`: the host's main memory.
     CPUDRAM,
+    /// `NPU_HBM`: the high-bandwidth memory of a neural processing unit.
     NPUHBM,
+    /// `GPU_HBM`: the high-bandwidth memory of a GPU.
     GpuHbm,
+    /// `Local_SRAM`: static RAM next to an accelerator core.
     LocalSRAM,
+    /// `NIC_RAM`: the memory of a network card.
     NicRam,
+    /// `Remote_HBM`: high-bandwidth memory on another machine.
     RemoteHbm,
     /// A user-defined memory space, identified by name. Lets a custom topology declare a
     /// novel memory (not one of the built-ins). See `Topology::Custom`.
@@ -384,6 +421,7 @@ impl MemorySpace {
     /// Map a surface name (as written after `Memory::`) to a space: the built-in names map to
     /// their variants; any other identifier is a user-defined `Custom` space. Single source of
     /// truth shared by the parser and the memory hierarchy.
+    #[must_use]
     pub fn from_name(name: &str) -> MemorySpace {
         match name {
             "CPU_DRAM" => MemorySpace::CPUDRAM,
@@ -397,6 +435,7 @@ impl MemorySpace {
     }
 
     /// The surface name of a space (the inverse of `from_name`), for diagnostics.
+    #[must_use]
     pub fn name(&self) -> String {
         match self {
             MemorySpace::CPUDRAM => "CPU_DRAM".to_string(),
@@ -410,18 +449,31 @@ impl MemorySpace {
     }
 }
 
+/// Which kind of device a [`Topology`] is, without its device index. Unlike `Topology`, this
+/// can be a map key.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum TopologyKind {
+    /// The kind of [`Topology::CPU`].
     CPU,
+    /// The kind of every [`Topology::NPU`], whatever its index.
     NPU,
+    /// The kind of every [`Topology::AccCore`], whatever its index.
     AccCore,
+    /// The kind of [`Topology::AMX`].
     AMX,
+    /// The kind of [`Topology::ANE`].
     ANE,
+    /// The kind of every [`Topology::GPU`], whatever its index.
     GPU,
+    /// The kind of [`Topology::CpuAvx512`].
     CpuAvx512,
+    /// The kind of [`Topology::CpuNeon`].
     CpuNeon,
+    /// The kind of every [`Topology::Slice`], whatever it is a range of.
     Slice,
+    /// The kind of a user-defined topology, by its name.
     Custom(Symbol),
+    /// The kind of [`Topology::Current`].
     Current,
 }
 
@@ -447,6 +499,9 @@ impl std::fmt::Display for TopologyKind {
 }
 
 /// A device index as the program wrote it: a number or a name. Anything longer prints as `..`.
+///
+/// # Errors
+/// When the formatter cannot be written to.
 fn write_index(f: &mut std::fmt::Formatter<'_>, e: &Expr) -> std::fmt::Result {
     match e {
         Expr::Number(n) => f.write_str(&n.value),
@@ -484,6 +539,7 @@ impl Topology {
     /// test that does not care which one. Spelling it out keeps those honest:
     /// picking 0 is a choice, and one that is wrong on a machine where the
     /// program meant a particular device.
+    #[must_use]
     pub fn gpu(index: i64) -> Topology {
         Topology::GPU(Box::new(Expr::Number(crate::syntax::NumberExpr::new(
             index.to_string(),
@@ -492,6 +548,8 @@ impl Topology {
         ))))
     }
 
+    /// Which kind of device this is, without its index.
+    #[must_use]
     pub fn kind(&self) -> TopologyKind {
         match self {
             Topology::CPU => TopologyKind::CPU,
@@ -508,11 +566,14 @@ impl Topology {
         }
     }
 
+    /// Whether both are the same kind of device. The device index is not compared.
+    #[must_use]
     pub fn is_same_kind(&self, other: &Self) -> bool {
         self.kind() == other.kind()
     }
 
     /// The literal device index, when the topology has one and it is a literal.
+    #[must_use]
     pub fn device_index(&self) -> Option<i64> {
         let literal = |e: &Expr| match e {
             Expr::Number(n) => n.value.parse::<i64>().ok(),
@@ -535,6 +596,7 @@ impl Topology {
     /// Kind first, then index by value when both are literals. A non-literal
     /// index is not resolvable here, so those fall back to structural equality
     /// rather than being assumed equal.
+    #[must_use]
     pub fn same_device(&self, other: &Self) -> bool {
         if self.kind() != other.kind() {
             return false;
@@ -552,6 +614,7 @@ impl Topology {
     ///
     /// Substitutes only the indices; a topology *variable* (`<D: Topology>`) is bound separately
     /// during monomorphization, since it maps to a `Topology` rather than a `Type`.
+    #[must_use]
     pub fn substitute(&self, mapping: &std::collections::HashMap<Symbol, Type>) -> Topology {
         match self {
             Topology::NPU(e) => Topology::NPU(Box::new(e.substitute(mapping))),
@@ -570,6 +633,7 @@ impl Topology {
     /// Diagnostics previously interpolated the `Debug` form, which rendered an indexed topology as
     /// `NPU(Number(NumberExpr { value: "0", ty: Some(I32), span: .. }))` — unreadable in a headline
     /// error. An index that is not a literal falls back to its own display (`NPU[i]`). (#253)
+    #[must_use]
     pub fn display_name(&self) -> String {
         let idx = |e: &Expr| -> String {
             match e {
@@ -596,33 +660,54 @@ impl Topology {
     }
 }
 
+/// The type of one number: of a scalar, or of each element of a tensor.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ElementType {
+    /// `f16`, a 16-bit float.
     F16,
+    /// `f32`, a 32-bit float.
     F32,
+    /// `f64`, a 64-bit float.
     F64,
+    /// `bf16`, a 16-bit float with the exponent range of `f32` and a shorter fraction.
     BF16,
+    /// `f8e4m3`, an 8-bit float with 4 exponent bits and 3 fraction bits.
     F8E4M3,
+    /// `f8e5m2`, an 8-bit float with 5 exponent bits and 2 fraction bits.
     F8E5M2,
     /// OCP fp4 (E2M1). Blackwell-class tensor cores have it; Hopper does not,
     /// which is the boundary a machine file needs to be able to state.
     F4E2M1,
+    /// `i4`, a signed 4-bit integer.
     I4,
+    /// `u4`, an unsigned 4-bit integer.
     U4,
+    /// `i8`, a signed 8-bit integer.
     I8,
+    /// `u8`, an unsigned 8-bit integer.
     U8,
+    /// `i16`, a signed 16-bit integer.
     I16,
+    /// `u16`, an unsigned 16-bit integer.
     U16,
+    /// `i32`, a signed 32-bit integer.
     I32,
+    /// `u32`, an unsigned 32-bit integer.
     U32,
+    /// `i64`, a signed 64-bit integer.
     I64,
+    /// `u64`, an unsigned 64-bit integer.
     U64,
+    /// `i128`, a signed 128-bit integer.
     I128,
+    /// `u128`, an unsigned 128-bit integer.
     U128,
     /// The size type: 64 bits, from 0 to `i64::MAX`, so its top bit is always clear. See
     /// `docs/discussions/size_type.md`.
     USize,
+    /// `bool`, true or false.
     Bool,
+    /// A type parameter used as an element type, such as the `T` in `Tensor<T, [4]>`.
     Generic(Symbol),
 }
 
@@ -632,7 +717,10 @@ pub enum ElementType {
 ///
 /// `Static` is the common case and `Dyn` the exception, so boxing the expression would cost
 /// an allocation per dimension of every tensor type to shrink the rare `?`.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing the expression would cost an allocation per dimension of every tensor type"
+)]
 #[derive(Debug, PartialEq, Clone)]
 pub enum Dim {
     /// `[2, 3]`, `[N, M]`, `[BATCH * CTX]`: a literal, a const-generic name, or an expression
@@ -644,6 +732,7 @@ pub enum Dim {
 
 impl Dim {
     /// The expression of a static dimension; `None` for `?`.
+    #[must_use]
     pub fn as_static(&self) -> Option<&Expr> {
         match self {
             Dim::Static(e) => Some(e),
@@ -652,6 +741,7 @@ impl Dim {
     }
 
     /// The value of a dimension spelled as a number literal.
+    #[must_use]
     pub fn literal(&self) -> Option<&str> {
         match self {
             Dim::Static(Expr::Number(n)) => Some(n.value.as_ref()),
@@ -659,6 +749,8 @@ impl Dim {
         }
     }
 
+    /// The dimension with const generic names replaced by the values `mapping` gives them.
+    #[must_use]
     pub fn substitute(&self, mapping: &std::collections::HashMap<Symbol, Type>) -> Dim {
         match self {
             Dim::Static(e) => Dim::Static(e.substitute(mapping)),
@@ -670,6 +762,7 @@ impl Dim {
 /// Split a type-argument list on the commas that separate ARGUMENTS, ignoring those inside a
 /// nested instance. A plain `split(',')` cuts `Pair<i32, f32>` in half when it is one argument
 /// of `Holder<Pair<i32, f32>>`, and both halves then parse as nonsense struct names.
+#[must_use]
 pub fn split_type_args(inner: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0usize;
@@ -696,9 +789,10 @@ pub fn split_type_args(inner: &str) -> Vec<&str> {
 ///
 /// Substituting argument by argument after a flat split both cut a nested argument at its comma
 /// and left the parameters inside it untouched.
-pub fn substitute_type_name(
+#[must_use]
+pub fn substitute_type_name<S: std::hash::BuildHasher>(
     name: &str,
-    mapping: &std::collections::HashMap<Symbol, Type>,
+    mapping: &std::collections::HashMap<Symbol, Type, S>,
 ) -> String {
     // `&T` and `&mut T`: the reference stays, what it refers to is substituted.
     let trimmed = name.trim();
@@ -744,44 +838,73 @@ pub fn substitute_type_name(
     )
 }
 
+/// A type in a Vx program.
 #[derive(Debug, PartialEq, Clone)]
 pub enum Type {
     /// A shaped tensor. Its extents are part of the type, so `[2, 3]` and `[4, 5]` are
     /// different types and get different monomorphs (Vx#401); each is a [`Dim`], so a
     /// run-time extent is spelled per position rather than by a different type.
     Tensor(ElementType, Vec<Dim>, Option<Placement>),
+    /// `Matrix`, written with no element type and no shape.
     Matrix,
+    /// `Ref<T, Memory::X>`: a value of type `T` that lives in the memory space `X`.
     Ref(Box<Type>, MemorySpace),
+    /// A reference, `&T` or `&mut T`.
     Borrow {
+        /// The type that is borrowed.
         inner: Box<Type>,
+        /// The memory space the reference points into, when one is known.
         mem_space: Option<MemorySpace>,
+        /// Whether the reference is `&mut`.
         is_mut: bool,
+        /// How long the reference is valid, packed as the `REGION_*` constants describe.
         region_id: usize,
     }, // (type, mem_space, is_mut, region_id)
     /// A raw pointer, and where the memory it points into lives. `None` is host memory, which is
     /// what a bare `*mut T` means; `*mut T in Memory::GPU_HBM` fills the slot. The placement
     /// belongs to the pointee: it says where a load through the pointer would read.
     Pointer(Box<Type>, Option<Placement>, bool), // (type, placement, is_mut)
+    /// A single number or `bool`.
     Scalar(ElementType),
+    /// A struct, by name, with its global id once names are resolved. `void` and `!` are spelled
+    /// as structs too.
     Struct(Symbol, Option<crate::gid::TypeId>),
+    /// An enum, by name, with its global id once names are resolved.
     Enum(Symbol, Option<crate::gid::TypeId>),
+    /// `Verified<T>`: a value of type `T` that the compiler may compute on any device, unlike
+    /// [`Type::Pinned`].
     Verified(Box<Type>),
+    /// `Pinned<T, Topology::X>`: a value of type `T` placed on the device `X`.
     Pinned(Box<Type>, Topology),
+    /// A type parameter, such as `T`, with its global id once names are resolved.
     Generic(Symbol, Option<crate::gid::TypeId>), // e.g. T
-    GenericInstance(Box<Type>, Vec<Type>),       // e.g. Config<f32>
+    /// A generic type with its arguments, such as `Config<f32>`: the generic type, then the
+    /// arguments.
+    GenericInstance(Box<Type>, Vec<Type>), // e.g. Config<f32>
+    /// An imported module: its path, and the type of each name it exports.
     Module(Symbol, std::collections::HashMap<Symbol, Type>), // (path, exported_symbols)
-    Simd(ElementType, usize),                    // e.g. <4 x f32>
+    /// A SIMD vector, `<4 x f32>`: the element type and how many elements.
+    Simd(ElementType, usize), // e.g. <4 x f32>
     /// `fn(i32, f32) -> f32`. The `bool` is unsafe-ness: a function's contract travels with its
     /// type, so binding it to a name does not discard it. A safe function is usable where an
     /// unsafe one is expected; the reverse is refused.
     Function(Vec<Type>, Box<Type>, bool),
-    Closure(Vec<Type>, Box<Type>),  // Fat pointer closure type
+    /// A closure: its parameter types and its return type.
+    Closure(Vec<Type>, Box<Type>), // Fat pointer closure type
+    /// A constant used as a generic argument, such as the `10` in `Buf<10>`.
     Const(Box<syntax::expr::Expr>), // E.g., generic const argument like `10`
+    /// A type that is not known, for example the type of an expression that has an error.
     Unknown,
 }
 
+/// Turns a type into the text that stands for it inside a linker symbol name.
 pub trait Mangle {
+    /// Writes the mangled form of `self` to `w`.
+    ///
+    /// # Errors
+    /// When `w` cannot be written to.
     fn mangle_to(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result;
+    /// The mangled form of `self` as a new string.
     fn mangle(&self) -> String {
         let mut s = String::new();
         let _ = self.mangle_to(&mut s);
@@ -809,6 +932,7 @@ pub trait Mangle {
 ///
 /// Trailing separator rather than leading, so a caller joins it to the method name and gets the
 /// inherent spelling back for free when there is no trait.
+#[must_use]
 pub fn trait_segment(trait_name: Option<&crate::symbol::Symbol>, trait_args: &[Type]) -> String {
     let Some(t) = trait_name else {
         return String::new();
@@ -830,6 +954,7 @@ pub fn trait_segment(trait_name: Option<&crate::symbol::Symbol>, trait_args: &[T
 ///
 /// Every site that builds one calls this, because a call has to arrive at the same string the
 /// definition did or it resolves to nothing.
+#[must_use]
 pub fn mangle_method(
     target: &Type,
     trait_name: Option<&crate::symbol::Symbol>,
@@ -845,6 +970,9 @@ pub fn mangle_method(
 }
 
 impl Type {
+    /// Whether a value of this type is moved when it is used, not copied: a tensor, a struct other
+    /// than `void`, an enum, and the wrappers around those.
+    #[must_use]
     pub fn is_linear(&self) -> bool {
         match self {
             Type::Ref(_, _)
@@ -861,6 +989,9 @@ impl Type {
         }
     }
 
+    /// The type with each type parameter and const generic name replaced by what `mapping` gives
+    /// it. Names that `mapping` does not have are left as they are.
+    #[must_use]
     pub fn substitute(&self, mapping: &std::collections::HashMap<Symbol, Type>) -> Type {
         match self {
             Type::Generic(name, _) => {
@@ -891,15 +1022,7 @@ impl Type {
                 Type::Pointer(Box::new(inner.substitute(mapping)), mem.clone(), *is_mut)
             }
             Type::Tensor(el_ty, dims, top) => {
-                let new_el_ty = if let ElementType::Generic(ref name) = el_ty {
-                    if let Some(Type::Scalar(concrete_el)) = mapping.get(name) {
-                        concrete_el.clone()
-                    } else {
-                        el_ty.clone()
-                    }
-                } else {
-                    el_ty.clone()
-                };
+                let new_el_ty = substitute_elem(el_ty, mapping);
                 let new_dims = dims.iter().map(|d| d.substitute(mapping)).collect();
                 Type::Tensor(new_el_ty, new_dims, top.clone())
             }
@@ -909,15 +1032,7 @@ impl Type {
                 Type::Pinned(Box::new(inner.substitute(mapping)), top.clone())
             }
             Type::Simd(el_ty, n) => {
-                let new_el_ty = if let ElementType::Generic(ref name) = el_ty {
-                    if let Some(Type::Scalar(concrete_el)) = mapping.get(name) {
-                        concrete_el.clone()
-                    } else {
-                        el_ty.clone()
-                    }
-                } else {
-                    el_ty.clone()
-                };
+                let new_el_ty = substitute_elem(el_ty, mapping);
                 Type::Simd(new_el_ty, *n)
             }
             Type::Function(params, ret, unsafe_fn) => {
@@ -937,11 +1052,14 @@ impl Type {
 
     // Mangle trait is implemented below
 
+    /// The device this value is placed on, when its type says.
+    #[must_use]
     pub fn topology(&self) -> Option<Topology> {
         self.placement().map(|p| p.topology.clone())
     }
 
     /// Where this value lives, when its type says.
+    #[must_use]
     pub fn placement(&self) -> Option<&Placement> {
         match self {
             Type::Tensor(_, _, p) => p.as_ref(),
@@ -949,11 +1067,6 @@ impl Type {
         }
     }
 
-    /// Whether a tensor occurs anywhere inside this type. Only a tensor can carry a placement,
-    /// and only a tensor can be given a location by a wrapper (`Ref<Tensor<..>, Memory::X>`,
-    /// `Pinned<Tensor<..>, Topology::X>`), so a type with no tensor in it has nothing for a
-    /// placement check to look at. Exhaustive over the variants, so a new one that holds a
-    /// type is walked rather than skipped.
     /// Whether a type parameter, `T`, is still in the type: `Vec<T>` or `&T`.
     pub fn has_generic_params(&self) -> bool {
         match self {
@@ -974,6 +1087,11 @@ impl Type {
         }
     }
 
+    /// Whether a tensor occurs anywhere inside this type. Only a tensor can carry a placement,
+    /// and only a tensor can be given a location by a wrapper (`Ref<Tensor<..>, Memory::X>`,
+    /// `Pinned<Tensor<..>, Topology::X>`), so a type with no tensor in it has nothing for a
+    /// placement check to look at. Exhaustive over the variants, so a new one that holds a
+    /// type is walked rather than skipped.
     pub fn mentions_tensor(&self) -> bool {
         match self {
             Type::Tensor(..) => true,
@@ -1066,6 +1184,23 @@ impl Type {
     }
 }
 
+/// The element type with a type parameter replaced by the scalar that `mapping` gives it. Any
+/// other element type, and a parameter that `mapping` does not give a scalar, stays as it is.
+fn substitute_elem(
+    el_ty: &ElementType,
+    mapping: &std::collections::HashMap<Symbol, Type>,
+) -> ElementType {
+    if let ElementType::Generic(ref name) = el_ty {
+        if let Some(Type::Scalar(concrete_el)) = mapping.get(name) {
+            concrete_el.clone()
+        } else {
+            el_ty.clone()
+        }
+    } else {
+        el_ty.clone()
+    }
+}
+
 /// The value of a const generic argument written with numbers and `+ - * /`, as text: `3.14`,
 /// `-2`, or `3` for `1 + 2`. `None` for anything else.
 fn const_value_text(e: &crate::syntax::Expr) -> Option<String> {
@@ -1078,20 +1213,20 @@ fn const_value_text(e: &crate::syntax::Expr) -> Option<String> {
     }
     fn eval(e: &Expr) -> Option<Num> {
         match e {
-            Expr::Number(n) => {
-                let t = n.value.as_ref();
-                if t.contains(['.', 'e', 'E']) {
-                    t.parse::<f64>().ok().map(Num::Float)
+            Expr::Number(number) => {
+                let text = number.value.as_ref();
+                if text.contains(['.', 'e', 'E']) {
+                    text.parse::<f64>().ok().map(Num::Float)
                 } else {
-                    t.parse::<i128>().ok().map(Num::Int)
+                    text.parse::<i128>().ok().map(Num::Int)
                 }
             }
-            Expr::UnaryOp(u) if u.op == UnaryOp::Neg => match eval(&u.expr)? {
-                Num::Int(i) => i.checked_neg().map(Num::Int),
-                Num::Float(f) => Some(Num::Float(-f)),
+            Expr::UnaryOp(unary) if unary.op == UnaryOp::Neg => match eval(&unary.expr)? {
+                Num::Int(int) => int.checked_neg().map(Num::Int),
+                Num::Float(float) => Some(Num::Float(-float)),
             },
-            Expr::BinaryOp(b) => match (eval(&b.lhs)?, eval(&b.rhs)?) {
-                (Num::Int(l), Num::Int(r)) => match b.op {
+            Expr::BinaryOp(binary) => match (eval(&binary.lhs)?, eval(&binary.rhs)?) {
+                (Num::Int(l), Num::Int(r)) => match binary.op {
                     BinaryOp::Add => l.checked_add(r),
                     BinaryOp::Sub => l.checked_sub(r),
                     BinaryOp::Mul => l.checked_mul(r),
@@ -1100,12 +1235,17 @@ fn const_value_text(e: &crate::syntax::Expr) -> Option<String> {
                 }
                 .map(Num::Int),
                 (l, r) => {
-                    let float = |n| match n {
-                        Num::Int(i) => i as f64,
-                        Num::Float(f) => f,
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "an integer next to a float is folded as a float, and a float \
+                                  cannot hold every large integer exactly"
+                    )]
+                    let as_float = |num| match num {
+                        Num::Int(int) => int as f64,
+                        Num::Float(float) => float,
                     };
-                    let (l, r) = (float(l), float(r));
-                    match b.op {
+                    let (l, r) = (as_float(l), as_float(r));
+                    match binary.op {
                         BinaryOp::Add => Some(l + r),
                         BinaryOp::Sub => Some(l - r),
                         BinaryOp::Mul => Some(l * r),
@@ -1127,8 +1267,9 @@ fn const_value_text(e: &crate::syntax::Expr) -> Option<String> {
 impl ElementType {
     /// The width in bits of an integer element type. `None` for a float or anything that
     /// is not an integer.
+    #[must_use]
     pub fn int_bits(&self) -> Option<u32> {
-        use ElementType::*;
+        use ElementType::{Bool, USize, I128, I16, I32, I4, I64, I8, U128, U16, U32, U4, U64, U8};
         Some(match self {
             Bool => 1,
             I4 | U4 => 4,
@@ -1143,12 +1284,14 @@ impl ElementType {
 
     /// Whether this is a signed integer. `bool` and the unsigned widths are not; ask
     /// `is_float` about the floating-point ones.
+    #[must_use]
     pub fn is_signed_int(&self) -> bool {
-        use ElementType::*;
+        use ElementType::{I128, I16, I32, I4, I64, I8};
         matches!(self, I4 | I8 | I16 | I32 | I64 | I128)
     }
 
     /// Whether this is a floating-point element type (`f16`/`f32`/`f64`/`bf16`/`f8e4m3`/`f8e5m2`).
+    #[must_use]
     pub fn is_float(&self) -> bool {
         matches!(
             self,
@@ -1168,6 +1311,7 @@ impl ElementType {
     /// 4 dense bits vs 1 padded byte, both from independent tables). `None` for an un-instantiated
     /// generic. Adding a numeric format sets its width here, in one place. (See the
     /// heterogeneous gap analysis §9.8.1.)
+    #[must_use]
     pub fn bits(&self) -> Option<u32> {
         Some(match self {
             ElementType::Bool => 1,
@@ -1186,12 +1330,13 @@ impl ElementType {
     /// `None` when the question does not apply (a float or generic element type, or a literal
     /// with a fractional part -- those are type errors reported elsewhere, and answering
     /// "out of range" for them would name the wrong defect).
+    #[must_use]
     pub fn accepts_integer_literal(&self, text: &str) -> Option<bool> {
         if text.contains('.') {
             return None;
         }
         if *self == ElementType::USize {
-            return Some(text.parse::<u64>().is_ok_and(|v| v <= i64::MAX as u64));
+            return Some(text.parse::<u64>().is_ok_and(|v| i64::try_from(v).is_ok()));
         }
         let bits = self.bits()?;
         let signed = match self {
@@ -1252,7 +1397,7 @@ impl std::fmt::Display for ElementType {
             // The surface spelling, which is what `from_str` reads and what a machine
             // file or a type annotation writes. Debug still renders the variant.
             ElementType::Bool => write!(f, "bool"),
-            ElementType::Generic(g) => write!(f, "{}", g),
+            ElementType::Generic(g) => write!(f, "{g}"),
         }
     }
 }
@@ -1283,17 +1428,66 @@ impl std::str::FromStr for ElementType {
             "u128" => Ok(ElementType::U128),
             "usize" => Ok(ElementType::USize),
             "bool" | "Bool" => Ok(ElementType::Bool),
-            _ => Err(format!("Unknown element type '{}'", s)),
+            _ => Err(format!("Unknown element type '{s}'")),
         }
     }
+}
+
+/// Writes `types` with `, ` between them.
+///
+/// # Errors
+/// When the formatter cannot be written to.
+fn write_type_list(f: &mut std::fmt::Formatter<'_>, types: &[Type]) -> std::fmt::Result {
+    for (i, ty) in types.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "{ty}")?;
+    }
+    Ok(())
+}
+
+/// Writes a tensor type as the program writes it: `Tensor<f32, [2, ?], Memory::GPU_HBM>`.
+///
+/// # Errors
+/// When the formatter cannot be written to.
+fn write_tensor_type(
+    f: &mut std::fmt::Formatter<'_>,
+    el: &ElementType,
+    dims: &[Dim],
+    top: Option<&Placement>,
+) -> std::fmt::Result {
+    write!(f, "Tensor<{el}, [")?;
+    for (i, d) in dims.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        match d {
+            Dim::Static(syntax::expr::Expr::Number(n)) => write!(f, "{}", n.value)?,
+            // A named extent prints its name, so a message about a `const N`
+            // parameter says `N` instead of an anonymous placeholder.
+            Dim::Static(syntax::expr::Expr::Identifier(id)) => {
+                write!(f, "{}", id.name)?;
+            }
+            Dim::Static(_) => write!(f, "{{..}}")?,
+            Dim::Dyn => write!(f, "?")?,
+        }
+    }
+    write!(f, "]")?;
+    // The placement as the program writes it in a tensor type, `Memory::GPU_HBM`.
+    if let Some(p) = top {
+        write!(f, ", {}", p.as_written())?;
+    }
+    write!(f, ">")
 }
 
 impl std::fmt::Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Type::Scalar(el) => write!(f, "{}", el),
-            Type::Struct(name, _) => write!(f, "{}", name),
-            Type::Enum(name, _) => write!(f, "{}", name),
+            Type::Scalar(el) => write!(f, "{el}"),
+            Type::Struct(name, _) | Type::Enum(name, _) | Type::Generic(name, _) => {
+                write!(f, "{name}")
+            }
             Type::Pointer(inner, place, is_mut) => {
                 write!(f, "{} {}", if *is_mut { "*mut" } else { "*const" }, inner)?;
                 match place {
@@ -1303,58 +1497,29 @@ impl std::fmt::Display for Type {
             }
             Type::Borrow { inner, is_mut, .. } => {
                 if *is_mut {
-                    write!(f, "&mut {}", inner)
+                    write!(f, "&mut {inner}")
                 } else {
-                    write!(f, "&{}", inner)
+                    write!(f, "&{inner}")
                 }
             }
             Type::GenericInstance(base, args) => {
-                write!(f, "{}<", base)?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", arg)?;
-                }
+                write!(f, "{base}<")?;
+                write_type_list(f, args)?;
                 write!(f, ">")
             }
-            Type::Generic(name, _) => write!(f, "{}", name),
             Type::Const(expr) => {
                 if let syntax::expr::Expr::Number(n) = &**expr {
                     write!(f, "{}", n.value)
                 } else if let syntax::expr::Expr::StringLiteral(s) = &**expr {
                     write!(f, "\"{}\"", s.value)
                 } else {
-                    write!(f, "{{{:?}}}", expr)
+                    write!(f, "{{{expr:?}}}")
                 }
             }
             // Without this a tensor reached the `{:?}` fallback, so a type error naming one
             // printed the whole dims AST -- `NumberExpr { value: "4", span: .. }` per extent.
             // An empty shape is rank 0 and prints as `[]`: `Tensor<f32>` does not parse.
-            Type::Tensor(el, dims, top) => {
-                write!(f, "Tensor<{}, [", el)?;
-                for (i, d) in dims.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    match d {
-                        Dim::Static(syntax::expr::Expr::Number(n)) => write!(f, "{}", n.value)?,
-                        // A named extent prints its name, so a message about a `const N`
-                        // parameter says `N` instead of an anonymous placeholder.
-                        Dim::Static(syntax::expr::Expr::Identifier(id)) => {
-                            write!(f, "{}", id.name)?
-                        }
-                        Dim::Static(_) => write!(f, "{{..}}")?,
-                        Dim::Dyn => write!(f, "?")?,
-                    }
-                }
-                write!(f, "]")?;
-                // The placement as the program writes it in a tensor type, `Memory::GPU_HBM`.
-                if let Some(p) = top {
-                    write!(f, ", {}", p.as_written())?;
-                }
-                write!(f, ">")
-            }
+            Type::Tensor(el, dims, top) => write_tensor_type(f, el, dims, top.as_ref()),
             Type::Unknown => write!(f, "?"),
             Type::Simd(el, n) => write!(f, "<{n} x {el}>"),
             Type::Function(params, ret, unsafe_fn) => {
@@ -1362,23 +1527,13 @@ impl std::fmt::Display for Type {
                     write!(f, "unsafe ")?;
                 }
                 write!(f, "fn(")?;
-                for (i, p) in params.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", p)?;
-                }
-                write!(f, ") -> {}", ret)
+                write_type_list(f, params)?;
+                write!(f, ") -> {ret}")
             }
             Type::Closure(params, ret) => {
                 write!(f, "|")?;
-                for (i, p) in params.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", p)?;
-                }
-                write!(f, "| -> {}", ret)
+                write_type_list(f, params)?;
+                write!(f, "| -> {ret}")
             }
             Type::Verified(inner) => write!(f, "Verified<{inner}>"),
             Type::Ref(inner, space) => write!(f, "Ref<{inner}, Memory::{}>", space.name()),
@@ -1389,6 +1544,25 @@ impl std::fmt::Display for Type {
     }
 }
 
+/// Writes the mangled form of a tensor type: `Tensor$`, the element type, then each extent.
+///
+/// # Errors
+/// When `w` cannot be written to.
+fn mangle_tensor(w: &mut dyn std::fmt::Write, el: &ElementType, dims: &[Dim]) -> std::fmt::Result {
+    write!(w, "Tensor$")?;
+    el.mangle_to(w)?;
+    for (i, d) in dims.iter().enumerate() {
+        write!(w, "{}", if i == 0 { "$" } else { "x" })?;
+        match d {
+            Dim::Static(Expr::Number(n)) => write!(w, "{}", n.value)?,
+            Dim::Static(Expr::Identifier(id)) => write!(w, "{}", id.name)?,
+            Dim::Static(_) => write!(w, "d")?,
+            Dim::Dyn => write!(w, "_")?,
+        }
+    }
+    Ok(())
+}
+
 impl Mangle for Type {
     fn mangle_to(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
         match self {
@@ -1396,7 +1570,7 @@ impl Mangle for Type {
             Type::Simd(el, n) => {
                 write!(w, "Simd$")?;
                 el.mangle_to(w)?;
-                write!(w, "${}", n)
+                write!(w, "${n}")
             }
             // A pointer into device memory is a different type from a host pointer, so a
             // generic instantiated at each gets its own symbol. A host pointer mangles as it
@@ -1422,24 +1596,11 @@ impl Mangle for Type {
             // them. Topology stays excluded. A dimension the canonical forms below cannot spell
             // contributes `d`, which is why two such dimensions can still share a name. `?` is
             // `_`, a character a symbol may carry.
-            Type::Tensor(el, dims, _) => {
-                write!(w, "Tensor$")?;
-                el.mangle_to(w)?;
-                for (i, d) in dims.iter().enumerate() {
-                    write!(w, "{}", if i == 0 { "$" } else { "x" })?;
-                    match d {
-                        Dim::Static(Expr::Number(n)) => write!(w, "{}", n.value)?,
-                        Dim::Static(Expr::Identifier(id)) => write!(w, "{}", id.name)?,
-                        Dim::Static(_) => write!(w, "d")?,
-                        Dim::Dyn => write!(w, "_")?,
-                    }
-                }
-                Ok(())
-            }
+            Type::Tensor(el, dims, _) => mangle_tensor(w, el, dims),
             Type::Matrix => write!(w, "Matrix"),
-            Type::Struct(name, _) => write!(w, "{}", name),
-            Type::Enum(name, _) => write!(w, "{}", name),
-            Type::Generic(name, _) => write!(w, "{}", name),
+            Type::Struct(name, _) | Type::Enum(name, _) | Type::Generic(name, _) => {
+                write!(w, "{name}")
+            }
             Type::GenericInstance(base, args) => {
                 base.mangle_to(w)?;
                 for arg in args {
@@ -1461,14 +1622,14 @@ impl Mangle for Type {
             Type::Const(expr) => {
                 // Named by its value, so `3.14` and `3.140`, or `3` and `1 + 2`, are one
                 // function. An argument that does not fold keeps its syntax as the name.
-                let text = const_value_text(expr).unwrap_or_else(|| format!("{:?}", expr));
+                let text = const_value_text(expr).unwrap_or_else(|| format!("{expr:?}"));
                 let sanitized: String = text
                     .chars()
                     .map(|c| if c.is_alphanumeric() { c } else { '_' })
                     .collect();
-                write!(w, "const${}", sanitized)
+                write!(w, "const${sanitized}")
             }
-            Type::Module(name, _) => write!(w, "Module${}", name),
+            Type::Module(name, _) => write!(w, "Module${name}"),
             Type::Unknown => write!(w, "Unknown"),
         }
     }
@@ -1477,15 +1638,21 @@ impl Mangle for Type {
 impl Mangle for ElementType {
     fn mangle_to(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
         match self {
-            ElementType::Generic(g) => write!(w, "{}", g),
-            _ => write!(w, "{}", self),
+            ElementType::Generic(g) => write!(w, "{g}"),
+            _ => write!(w, "{self}"),
         }
     }
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
+    use crate::syntax::NumberExpr;
     use std::collections::HashMap;
 
     /// `usize` is 64 bits and unsigned, reads and prints as `usize`, and holds a literal up to

@@ -437,15 +437,15 @@ fn the_active_topology_picks_among_lowerings_for_one_edge() {
 /// A machine that declares an edge but supplies NO lowering for it gets the
 /// builtin copy -- never a peer machine's body.
 ///
-/// HasImpl and NoImpl declare the same edge; only HasImpl implements it, with
+/// `HasImpl` and `NoImpl` declare the same edge; only `HasImpl` implements it, with
 /// a body that reads the source twice. The transfer runs inside
-/// `spawn on(Topology::NoImpl)`. NoImpl chose not to supply a lowering, so the
+/// `spawn on(Topology::NoImpl)`. `NoImpl` chose not to supply a lowering, so the
 /// builtin must move its tile: one read, `builtin_copy`.
 ///
 /// The review found the opposite (Vx#353): the single-candidate fallback --
 /// which exists so a host-driven transfer can find the one machine that owns a
-/// device edge -- also fired when the site WAS on a machine, handing NoImpl
-/// the only lowering in scope. HasImpl's body may use instructions NoImpl
+/// device edge -- also fired when the site WAS on a machine, handing `NoImpl`
+/// the only lowering in scope. `HasImpl`'s body may use instructions `NoImpl`
 /// never declared (that is what `copy_engine` gates), so borrowing it is not a
 /// default, it is a miscompile. The fallback is now conditional on the active
 /// topology not declaring the edge itself.
@@ -631,7 +631,7 @@ fn a_kernel_that_re_reads_reports_more_than_the_tile_holds() {
 /// Scratch declared inside the kernel is not traffic against the device memory
 /// anyone staged. `ts` is an ordinary `Tensor`, never transferred; the placement
 /// rule keys on the TYPE carrying a placement, not on the ambient topology --
-/// which inside `spawn on(Topology::Dev)` would have reported GPU_HBM for it and
+/// which inside `spawn on(Topology::Dev)` would have reported `GPU_HBM` for it and
 /// inflated the figure with kernel-local storage.
 #[test]
 fn kernel_local_scratch_is_not_counted_as_device_traffic() {
@@ -746,11 +746,11 @@ fn a_region_count_that_overflows_is_reported_as_absent() {
 }
 
 /// One region, two spaces. `custom_topology_user_lowering.vx` stages a tile from
-/// GPU_HBM into SMEM inside the kernel and writes its result back out, so the
+/// `GPU_HBM` into SMEM inside the kernel and writes its result back out, so the
 /// same `spawn` touches both spaces and they must not be pooled.
 ///
 /// This is what makes the record answer a locality question. The SMEM reads are
-/// reads of a tile that was staged precisely so they would be cheap; the GPU_HBM
+/// reads of a tile that was staged precisely so they would be cheap; the `GPU_HBM`
 /// writes are not. Summed into one figure the distinction disappears, and the
 /// distinction is the reason anyone stages a tile at all.
 ///

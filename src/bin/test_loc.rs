@@ -10,24 +10,21 @@ fn main() -> Result<()> {
 
     let di_file = r#"#llvm.di_file<"test.vx" in "">"#;
     let di_cu = format!(
-        r#"#llvm.di_compile_unit<id = distinct[0]<>, sourceLanguage = DW_LANG_C, file = {}, producer = "vx", isOptimized = false, emissionKind = Full>"#,
-        di_file
+        r#"#llvm.di_compile_unit<id = distinct[0]<>, sourceLanguage = DW_LANG_C, file = {di_file}, producer = "vx", isOptimized = false, emissionKind = Full>"#
     );
     let di_subp = format!(
-        r#"#llvm.di_subprogram<id = distinct[1]<>, compileUnit = {}, scope = {}, name = "test_fn", file = {}, subprogramFlags = Definition, type = #llvm.di_subroutine_type<>>"#,
-        di_cu, di_file, di_file
+        r#"#llvm.di_subprogram<id = distinct[1]<>, compileUnit = {di_cu}, scope = {di_file}, name = "test_fn", file = {di_file}, subprogramFlags = Definition, type = #llvm.di_subroutine_type<>>"#
     );
 
     let mlir_str = format!(
         r#"
-    #di_file = {}
-    #di_cu = {}
-    #di_subp = {}
+    #di_file = {di_file}
+    #di_cu = {di_cu}
+    #di_subp = {di_subp}
     module {{
         "dummy.op"() : () -> () loc(fused<#di_subp>["test.vx":1:1])
     }}
-    "#,
-        di_file, di_cu, di_subp
+    "#
     );
 
     let module = melior::ir::Module::parse(&context, &mlir_str)
@@ -37,6 +34,6 @@ fn main() -> Result<()> {
         .first_operation()
         .context("Module has no operations")?;
     let loc = op.location();
-    println!("Got loc: {}", loc);
+    println!("Got loc: {loc}");
     Ok(())
 }

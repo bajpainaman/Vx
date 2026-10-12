@@ -16,7 +16,7 @@
 
 use std::fs;
 
-const HEADER: &str = r#"
+const HEADER: &str = r"
 Memory CPU_DRAM {}
 Memory W {
   within: Memory::CPU_DRAM, capacity: 4 MiB, managed: explicit
@@ -28,7 +28,7 @@ Topology Dev {
   transfer Memory::CPU_DRAM -> Memory::W : 10
   transfer Memory::W -> Memory::CPU_DRAM : 10
 }
-"#;
+";
 
 fn compile(name: &str, body: &str) -> Result<(), String> {
     let dir = std::env::temp_dir().join("vx_cross_call_capacity");
@@ -46,7 +46,7 @@ fn compile(name: &str, body: &str) -> Result<(), String> {
 fn the_parallel_frontend_refuses_a_tile_held_across_a_call() {
     let r = compile(
         "nested.vx",
-        r#"
+        r"
 fn g() -> i32 {
   let y = Tensor<f32, [1024, 768]>::uninit();
   let _sy = transfer(y, Memory::W);
@@ -60,7 +60,7 @@ fn f() -> i32 {
   return r;
 }
 fn main() -> i32 { return f(); }
-"#,
+",
     );
     assert!(
         r.is_err(),
@@ -75,7 +75,7 @@ fn main() -> i32 { return f(); }
 fn the_parallel_frontend_still_admits_sequential_calls() {
     let r = compile(
         "sequential.vx",
-        r#"
+        r"
 fn g() -> i32 {
   let y = Tensor<f32, [1024, 768]>::uninit();
   let _sy = transfer(y, Memory::W);
@@ -91,7 +91,7 @@ fn main() -> i32 {
   let b = g();
   return a + b;
 }
-"#,
+",
     );
     assert!(
         r.is_ok(),

@@ -18,7 +18,8 @@ use crate::syntax::{SymbolMap, VxModule};
 use std::collections::HashMap;
 
 /// Iterates through all parsed modules sequentially and computes their deterministic
-/// 256-bit TypeId for every top-level struct, enum, and trait.
+/// 256-bit `TypeId` for every top-level struct, enum, and trait.
+#[must_use]
 pub fn build_symbol_map(modules: &[VxModule]) -> SymbolMap {
     use rayon::prelude::*;
 
@@ -49,6 +50,7 @@ pub fn build_symbol_map(modules: &[VxModule]) -> SymbolMap {
 /// handed to each module's `resolve_names` during the mutable walk. Owned because that walk takes
 /// the array by `&mut`, and because a topology declared in a `--machine` file has to reach the
 /// module that names it, which a per-module view cannot do.
+#[must_use]
 pub fn collect_topologies(modules: &[VxModule]) -> Vec<crate::arch::TopologyDecl> {
     modules
         .iter()
@@ -98,17 +100,14 @@ fn substitute_self(ty: &crate::syntax::Type, target: &crate::syntax::Type) -> cr
     }
 }
 
-/// Give every impl of a trait the trait's default method bodies, for the methods it does
-/// not write itself.
-///
-/// This runs over the parsed modules before anything reads them, so from here on an impl
-/// block holds every method it is supposed to have and nothing downstream -- name
-/// resolution, the checker, either code generator -- needs to know that defaults exist.
-/// That is also why it is a rewrite rather than a fallback at method-lookup time: the
-/// lookup is not the only reader, and codegen walks the impl's methods directly.
-///
-/// A trait's defaults are collected across every module first, because the trait and the
-/// impl need not be in the same one.
+/// The type an impl is for, with the associated types that impl binds.
+pub type ImplBindings = (
+    crate::syntax::Type,
+    Vec<(crate::symbol::Symbol, crate::syntax::Type)>,
+);
+
+/// What every module says about trait defaults: the default method bodies of each trait, and
+/// the associated types each impl binds.
 #[derive(Default)]
 pub struct TraitDefaults {
     /// Each trait's parameters and the methods it gives a default body.
@@ -122,10 +121,7 @@ pub struct TraitDefaults {
     /// Every impl's associated-type bindings, by the type it is for. `Self::Item` in an impl
     /// that binds no `Item` of its own -- `impl DoubleEndedIterator for Range` -- means the one
     /// another impl for the same type binds, as a supertrait's does in Rust.
-    pub bindings: Vec<(
-        crate::syntax::Type,
-        Vec<(crate::symbol::Symbol, crate::syntax::Type)>,
-    )>,
+    pub bindings: Vec<ImplBindings>,
 }
 
 /// The trait methods that carry a default body, across every module.
@@ -208,6 +204,89 @@ pub fn bind_associated_types_in(program: &mut crate::syntax::Program, defaults: 
     }
 }
 
+/// The method an impl gets from a trait's default: the default body and the signature, with
+/// `Self` and the trait's own parameters replaced by what the impl says they are.
+///
+/// # Panics
+///
+/// Panics if `signature` has no default body. `collect_trait_defaults` keeps only the methods
+/// that have one.
+fn default_method_for(
+    block: &crate::syntax::ImplBlock,
+    signature: &crate::syntax::MethodSignature,
+    trait_subst: &std::collections::HashMap<crate::symbol::Symbol, crate::syntax::Type>,
+) -> crate::syntax::Function {
+    // `Self` in the body too, where an adaptor names its own type: `Map<Self, ..> {..}`,
+    // and the trait's own parameters, as the signature gets them: `Option<Item>::None()`.
+    let mut self_subst = trait_subst.clone();
+    self_subst.insert("Self".into(), block.target_type.clone());
+    let body = signature
+        .default_body
+        .clone()
+        .expect("only methods with a default body are collected")
+        .iter()
+        .map(|s| s.substitute(&self_subst))
+        .collect();
+    // A method of a generic impl has the block's parameters in scope, which the
+    // parser arranges for a hand-written one. A default arrives here after that,
+    // so it is done again: without it the copied body is checked with `I`
+    // unbound and reports "Method 'next' not found on type I".
+    let own: Vec<&str> = signature
+        .generics
+        .iter()
+        .map(super::syntax::decl::GenericParam::name)
+        .collect();
+    let mut generics: Vec<crate::syntax::GenericParam> = block
+        .generics
+        .iter()
+        .filter(|g| !own.contains(&g.name()))
+        .cloned()
+        .collect();
+    generics.extend(signature.generics.iter().cloned());
+    crate::syntax::Function {
+        name: signature.name.clone(),
+        generics,
+        params: signature
+            .params
+            .iter()
+            .map(|(n, t)| {
+                (
+                    n.clone(),
+                    substitute_self(&t.substitute(trait_subst), &block.target_type),
+                )
+            })
+            .collect(),
+        mut_params: signature.mut_params.clone(),
+        topology: crate::syntax::Topology::CPU,
+        return_type: substitute_self(
+            &signature.return_type.substitute(trait_subst),
+            &block.target_type,
+        ),
+        requires: Vec::new(),
+        ensures: Vec::new(),
+        where_transfers: Vec::new(),
+        is_unsafe: false,
+        body,
+        doc_comment: None,
+    }
+}
+
+/// Give every impl of a trait the trait's default method bodies, for the methods it does
+/// not write itself.
+///
+/// This runs over the parsed modules before anything reads them, so from here on an impl
+/// block holds every method it is supposed to have and nothing downstream -- name
+/// resolution, the checker, either code generator -- needs to know that defaults exist.
+/// That is also why it is a rewrite rather than a fallback at method-lookup time: the
+/// lookup is not the only reader, and codegen walks the impl's methods directly.
+///
+/// A trait's defaults are collected across every module first, because the trait and the
+/// impl need not be in the same one.
+///
+/// # Panics
+///
+/// Panics if `defaults` holds a method with no default body, which `collect_trait_defaults`
+/// never produces.
 pub fn fill_trait_defaults_in(program: &mut crate::syntax::Program, defaults: &TraitDefaults) {
     if defaults.methods.is_empty() {
         return;
@@ -235,61 +314,19 @@ pub fn fill_trait_defaults_in(program: &mut crate::syntax::Program, defaults: &T
             {
                 continue;
             }
-            // `Self` in the body too, where an adaptor names its own type: `Map<Self, ..> {..}`,
-            // and the trait's own parameters, as the signature gets them: `Option<Item>::None()`.
-            let mut self_subst = trait_subst.clone();
-            self_subst.insert("Self".into(), block.target_type.clone());
-            let body = signature
-                .default_body
-                .clone()
-                .expect("only methods with a default body are collected")
-                .iter()
-                .map(|s| s.substitute(&self_subst))
-                .collect();
-            // A method of a generic impl has the block's parameters in scope, which the
-            // parser arranges for a hand-written one. A default arrives here after that,
-            // so it is done again: without it the copied body is checked with `I`
-            // unbound and reports "Method 'next' not found on type I".
-            let own: Vec<&str> = signature.generics.iter().map(|g| g.name()).collect();
-            let mut generics: Vec<crate::syntax::GenericParam> = block
-                .generics
-                .iter()
-                .filter(|g| !own.contains(&g.name()))
-                .cloned()
-                .collect();
-            generics.extend(signature.generics.iter().cloned());
+            let method = default_method_for(block, signature, &trait_subst);
             block.copied_defaults.push(signature.name.clone());
-            block.methods.push(crate::syntax::Function {
-                name: signature.name.clone(),
-                generics,
-                params: signature
-                    .params
-                    .iter()
-                    .map(|(n, t)| {
-                        (
-                            n.clone(),
-                            substitute_self(&t.substitute(&trait_subst), &block.target_type),
-                        )
-                    })
-                    .collect(),
-                mut_params: signature.mut_params.clone(),
-                topology: crate::syntax::Topology::CPU,
-                return_type: substitute_self(
-                    &signature.return_type.substitute(&trait_subst),
-                    &block.target_type,
-                ),
-                requires: Vec::new(),
-                ensures: Vec::new(),
-                where_transfers: Vec::new(),
-                is_unsafe: false,
-                body,
-                doc_comment: None,
-            });
+            block.methods.push(method);
         }
     }
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use crate::symbol::Symbol;
@@ -303,7 +340,7 @@ mod tests {
         program
     }
 
-    /// The GID is used as intended (docs/parallel_compiler_architecture.md §2): each top-level
+    /// The GID is used as intended (`docs/parallel_compiler_architecture.md` §2): each top-level
     /// symbol's `TypeId` is minted from *content hashes* -- word 0 = module hash, word 1 = symbol
     /// hash -- not a monotonic counter. So the same symbol name in two modules gets distinct GIDs
     /// (module isolation), the same name hashes identically (word 1), and minting is deterministic

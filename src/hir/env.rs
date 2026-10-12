@@ -22,16 +22,24 @@
 // parameter that threaded through ~36 checker signatures (#279 R3).
 //
 //===----------------------------------------------------------------------===//
-use crate::syntax::*;
+use crate::syntax::{
+    Dim, ElementType, EnumDecl, Expr, Function, ImplBlock, Mangle, MemoryDecl, MemorySpace,
+    Program, Statement, StructDecl, Topology, TraitDecl, Type,
+};
 use std::collections::HashMap;
 
+/// A value the compiler has worked out while compiling, such as the result of a `comptime`
+/// block or a constant.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    /// `true` or `false`.
     Bool(bool),
+    /// A floating-point number.
     Number(f64),
     /// An integer, kept as one. Sending it through `Number` would lose every value past
     /// 2^53 and would compute `3 / 2` as 1.5, which is not what the program does.
     Int(i64),
+    /// A place code can run, such as `Topology::GPU(0)`.
     Topology(Topology),
     /// A fixed-size array of scalars, known at compile time. The length is set when the
     /// array is built and never changes, so an index past the end is a compile error.
@@ -39,7 +47,9 @@ pub enum Value {
     /// A place in a byte buffer that a `comptime` block made from a string literal. It only
     /// exists while the block runs; every copy of the pointer sees the same bytes.
     Ptr {
+        /// Which buffer the pointer points into.
         block: usize,
+        /// How many bytes past the start of the buffer it points.
         offset: i64,
     },
     /// The text a `comptime` block's pointer result points at, up to its NUL. Written into the
@@ -50,6 +60,11 @@ pub enum Value {
 impl Value {
     /// This value as a float, whichever kind of number it is. For a caller that wants a
     /// magnitude and does not care how it was stored, such as a tensor dimension.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the caller wants a magnitude; an integer past 2^53 becomes the nearest float"
+    )]
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Int(i) => Some(*i as f64),
@@ -65,20 +80,34 @@ impl Value {
 pub struct DuplicateDecl {
     /// What was re-declared, for the message: `"memory space"` or `"topology"`.
     pub kind: &'static str,
+    /// The name that was declared twice.
     pub name: crate::symbol::Symbol,
     /// The module whose declaration collided with one already indexed.
     pub module: crate::symbol::Symbol,
 }
 
+/// Every declaration of one compilation, from all of its modules, looked up by name. The type
+/// checker reads it and never changes it.
 pub struct GlobalAstEnv<'a> {
+    /// Every `struct`, by name.
     pub structs: HashMap<crate::symbol::Symbol, &'a StructDecl>,
-    #[allow(clippy::type_complexity)]
+    /// Every `enum`, by name.
     pub enums: HashMap<crate::symbol::Symbol, &'a EnumDecl>,
+    /// Every `trait`, by name.
     pub traits: HashMap<crate::symbol::Symbol, &'a TraitDecl>,
+    /// Every `impl` block, by the name of the trait it implements. A block that implements no
+    /// trait is under `_inherent`.
     pub impls: HashMap<crate::symbol::Symbol, Vec<&'a ImplBlock>>,
-    #[allow(clippy::type_complexity)]
+    /// The signature of every function that is not generic, and of every `extern`, by name:
+    /// return type, whether a call needs `unsafe`, parameter types, where it runs, and its
+    /// `requires` and `ensures` conditions.
+    #[allow(
+        clippy::type_complexity,
+        reason = "code in other files reads the parts of this tuple by position"
+    )]
     pub functions:
         HashMap<crate::symbol::Symbol, (Type, bool, Vec<Type>, Topology, Vec<Expr>, Vec<Expr>)>,
+    /// The declaration of every function that is not generic, by name.
     pub syntax_functions: HashMap<crate::symbol::Symbol, &'a Function>,
     /// Bodies the compile-time evaluator can run, owned rather than borrowed.
     ///
@@ -88,6 +117,7 @@ pub struct GlobalAstEnv<'a> {
     /// borrowed from because they are type-checked in place. Only functions a compile-time
     /// context could reach are copied, so this is not a second copy of the program.
     pub comptime_bodies: HashMap<crate::symbol::Symbol, Function>,
+    /// Every generic function, by name, with the hash of the module that declares it.
     pub generic_functions: HashMap<crate::symbol::Symbol, (&'a Function, u64)>, // (func, origin_module_hash)
     /// User-defined memory spaces (`Memory <Name> { ... }`), indexed by name. Populated from
     /// `Program.memories` — the per-compilation home for memory descriptors (no global registry).
@@ -103,7 +133,7 @@ pub struct GlobalAstEnv<'a> {
     pub externs: Vec<&'a crate::syntax::ExternDecl>,
     /// User-defined topologies (`Topology <Name> { ... }`), indexed by name. Populated from
     /// `Program.topologies`; the per-compilation home for topology descriptors, seeded into each
-    /// `TransferCostGraph` — no global registry (see docs/parallel_compiler_architecture.md).
+    /// `TransferCostGraph` — no global registry (see `docs/parallel_compiler_architecture.md`).
     pub topologies: HashMap<crate::symbol::Symbol, &'a crate::arch::TopologyDecl>,
     /// `Memory`/`Topology` names declared by more than one module in this compilation unit, with
     /// the modules that declared them. The tables above are name-keyed, so a duplicate would
@@ -134,11 +164,16 @@ pub struct GlobalAstEnv<'a> {
 }
 
 impl<'a> GlobalAstEnv<'a> {
+    /// Indexes the declarations of `modules`.
+    #[must_use]
     pub fn build(modules: &'a [Program]) -> Self {
         let refs: Vec<&'a Program> = modules.iter().collect();
         Self::build_from_refs(&refs)
     }
 
+    /// Indexes the declarations of `modules`. The same as [`Self::build`], for a caller that
+    /// holds references to its modules.
+    #[must_use]
     pub fn build_from_refs(modules: &[&'a Program]) -> Self {
         let mut env = Self {
             structs: HashMap::new(),
@@ -160,106 +195,8 @@ impl<'a> GlobalAstEnv<'a> {
         };
 
         for &module in modules {
-            let module_hash = crate::hash::compute_module_hash(&module.module_path);
-            for s in &module.structs {
-                env.structs.insert(s.name.clone(), s);
-            }
-            for m in &module.memories {
-                if let Some(prev) = env.memories.insert(m.name.clone(), m) {
-                    // Re-declaring an *identical* space in two modules is harmless (the same
-                    // machine file reached twice); only a genuine disagreement is ambiguous.
-                    if prev != m {
-                        env.duplicate_decls.push(DuplicateDecl {
-                            kind: "memory space",
-                            name: m.name.clone(),
-                            module: module.module_path.clone(),
-                        });
-                    }
-                }
-            }
-            for t in &module.transfer_impls {
-                env.transfer_impls.push(t);
-            }
-            for t in &module.topologies {
-                if let Some(prev) = env.topologies.insert(t.name.clone(), t) {
-                    if prev != t {
-                        env.duplicate_decls.push(DuplicateDecl {
-                            kind: "topology",
-                            name: t.name.clone(),
-                            module: module.module_path.clone(),
-                        });
-                    }
-                }
-            }
-            for e in &module.enums {
-                env.enums.insert(e.name.clone(), e);
-            }
-            for c in &module.consts {
-                if let Some(prev) = env.consts.insert(c.name.clone(), c) {
-                    if prev != c {
-                        env.duplicate_decls.push(DuplicateDecl {
-                            kind: "const",
-                            name: c.name.clone(),
-                            module: module.module_path.clone(),
-                        });
-                    }
-                }
-            }
-            for t in &module.traits {
-                env.traits.insert(t.name.clone(), t);
-            }
-            for i in &module.impls {
-                let trait_name = match &i.trait_name {
-                    Some(name) => name.clone(),
-                    None => "_inherent".to_string().into(),
-                };
-                env.impls.entry(trait_name).or_default().push(i);
-            }
-            for ext in &module.externs {
-                env.externs.push(ext);
-                let param_types: Vec<Type> = ext.params.iter().map(|(_, t)| t.clone()).collect();
-                env.functions.insert(
-                    ext.name.clone(),
-                    (
-                        ext.return_type.clone(),
-                        !ext.is_safe,
-                        param_types,
-                        Topology::CPU,
-                        Vec::new(),
-                        Vec::new(),
-                    ),
-                );
-            }
-            for func in &module.functions {
-                if !func.generics.is_empty() {
-                    env.generic_functions
-                        .insert(func.name.clone(), (func, module_hash));
-                } else {
-                    let param_types: Vec<Type> =
-                        func.params.iter().map(|(_, t)| t.clone()).collect();
-                    env.functions.insert(
-                        func.name.clone(),
-                        (
-                            func.return_type.clone(),
-                            func.is_unsafe,
-                            param_types,
-                            func.topology.clone(),
-                            func.requires.clone(),
-                            func.ensures.clone(),
-                        ),
-                    );
-                    env.syntax_functions.insert(func.name.clone(), func);
-                    // Summarize the return provenance while the body is present. Signature-stripped
-                    // callers (production) leave this empty and refill via
-                    // `annotate_return_provenances` from the full modules.
-                    if !func.body.is_empty() {
-                        env.return_provenances.insert(
-                            func.name.clone(),
-                            crate::hir::provenance::compute_return_provenance(func),
-                        );
-                    }
-                }
-            }
+            env.index_types_and_machines(module);
+            env.index_functions(module);
         }
         let funcs: Vec<&Function> = env.syntax_functions.values().copied().collect();
         crate::hir::provenance::refine_through_calls(&funcs, &mut env.return_provenances);
@@ -290,6 +227,116 @@ impl<'a> GlobalAstEnv<'a> {
             g
         };
         env
+    }
+
+    /// Indexes everything `module` declares except its functions: structs, enums, traits,
+    /// impl blocks, constants, memory spaces, topologies and transfer lowerings.
+    fn index_types_and_machines(&mut self, module: &'a Program) {
+        let env = self;
+        for s in &module.structs {
+            env.structs.insert(s.name.clone(), s);
+        }
+        for m in &module.memories {
+            if let Some(prev) = env.memories.insert(m.name.clone(), m) {
+                // Re-declaring an *identical* space in two modules is harmless (the same
+                // machine file reached twice); only a genuine disagreement is ambiguous.
+                if prev != m {
+                    env.duplicate_decls.push(DuplicateDecl {
+                        kind: "memory space",
+                        name: m.name.clone(),
+                        module: module.module_path.clone(),
+                    });
+                }
+            }
+        }
+        for t in &module.transfer_impls {
+            env.transfer_impls.push(t);
+        }
+        for t in &module.topologies {
+            if let Some(prev) = env.topologies.insert(t.name.clone(), t) {
+                if prev != t {
+                    env.duplicate_decls.push(DuplicateDecl {
+                        kind: "topology",
+                        name: t.name.clone(),
+                        module: module.module_path.clone(),
+                    });
+                }
+            }
+        }
+        for e in &module.enums {
+            env.enums.insert(e.name.clone(), e);
+        }
+        for c in &module.consts {
+            if let Some(prev) = env.consts.insert(c.name.clone(), c) {
+                if prev != c {
+                    env.duplicate_decls.push(DuplicateDecl {
+                        kind: "const",
+                        name: c.name.clone(),
+                        module: module.module_path.clone(),
+                    });
+                }
+            }
+        }
+        for t in &module.traits {
+            env.traits.insert(t.name.clone(), t);
+        }
+        for i in &module.impls {
+            let trait_name = match &i.trait_name {
+                Some(name) => name.clone(),
+                None => "_inherent".to_string().into(),
+            };
+            env.impls.entry(trait_name).or_default().push(i);
+        }
+    }
+
+    /// Indexes the `extern` declarations and the functions of `module`.
+    fn index_functions(&mut self, module: &'a Program) {
+        let env = self;
+        let module_hash = crate::hash::compute_module_hash(&module.module_path);
+        for ext in &module.externs {
+            env.externs.push(ext);
+            let param_types: Vec<Type> = ext.params.iter().map(|(_, t)| t.clone()).collect();
+            env.functions.insert(
+                ext.name.clone(),
+                (
+                    ext.return_type.clone(),
+                    !ext.is_safe,
+                    param_types,
+                    Topology::CPU,
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            );
+        }
+        for func in &module.functions {
+            if func.generics.is_empty() {
+                let param_types: Vec<Type> = func.params.iter().map(|(_, t)| t.clone()).collect();
+                env.functions.insert(
+                    func.name.clone(),
+                    (
+                        func.return_type.clone(),
+                        func.is_unsafe,
+                        param_types,
+                        func.topology.clone(),
+                        func.requires.clone(),
+                        func.ensures.clone(),
+                    ),
+                );
+                env.syntax_functions.insert(func.name.clone(), func);
+                // Summarize the return provenance while the body is present. Signature-stripped
+                // callers (production) leave this empty and refill via
+                // `annotate_return_provenances` from the full modules.
+                if !func.body.is_empty() {
+                    env.return_provenances.insert(
+                        func.name.clone(),
+                        crate::hir::provenance::compute_return_provenance(func),
+                    );
+                }
+            } else {
+                env.generic_functions
+                    .insert(func.name.clone(), (func, module_hash));
+            }
+        }
     }
 
     /// Refill `return_provenances` from modules that still carry function bodies (#243). Production
@@ -360,6 +407,7 @@ impl<'a> GlobalAstEnv<'a> {
     }
 
     /// The return-provenance summary for a callee, or the conservative default when unknown.
+    #[must_use]
     pub fn return_provenance_of(&self, name: &str) -> crate::hir::provenance::ReturnProvenance {
         self.return_provenances
             .get(name)
@@ -368,11 +416,18 @@ impl<'a> GlobalAstEnv<'a> {
     }
 }
 
+/// One borrow that is still in use: a `&` or `&mut` taken of a variable or of a part of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BorrowRecord {
+    /// Whether it is a `&mut` borrow.
     pub is_mut: bool,
+    /// How deeply nested the block is that the borrow was taken in. The borrow ends when that
+    /// block does.
     pub scope_depth: usize,
+    /// The variable the reference was stored in, when it was stored in one.
     pub borrower_name: Option<String>,
+    /// The part of the variable that is borrowed, as the fields taken to reach it. Empty when
+    /// the whole variable is borrowed.
     pub path: Vec<String>,
 }
 
@@ -401,15 +456,26 @@ impl RefProvenance {
     }
 }
 
+/// Checks the types, borrows and memory placements of function bodies, one function at a time.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "code in other files sets these flags by name; each one is a separate yes or no about the code being checked"
+)]
 pub struct TypeChecker<'a> {
+    /// This worker thread's own state.
     pub worker: &'a mut crate::session::LocalWorkerState,
+    /// Every declaration of the compilation, by name.
     pub env: &'a GlobalAstEnv<'a>,
     pub(crate) scopes: Vec<HashMap<crate::symbol::Symbol, (Type, Topology)>>,
+    /// Whether a value may be used on a topology other than the one it lives on.
     pub allow_cross_topology: bool,
+    /// The errors and warnings found so far.
     pub errors: crate::diagnostic::DiagnosticsVec,
     pub(crate) in_unsafe_block: bool,
     pub(crate) active_topology: Topology,
     pub(crate) active_memory: MemorySpace,
+    /// The cost of moving data between memory spaces. The same graph as
+    /// `env.transfer_cost_graph`.
     pub transfer_cost_graph: &'a crate::arch::TransferCostGraph,
     /// Borrow-checking state (active records + NLL liveness), encapsulated so a conflict-check read
     /// cannot bypass the dead-borrow sweep. Replaces the former `active_borrows` /
@@ -440,6 +506,7 @@ pub struct TypeChecker<'a> {
     /// index there is a *store* place, so the `v[i]` -> `v.get(i)` read rewrite must not fire.
     pub(crate) checking_assign_lhs: bool,
     pub(crate) next_id: u32,
+    /// The return type of the function being checked.
     pub current_return_type: Option<Type>,
     /// Name of the function being checked, so a record produced deep inside a body can say
     /// where it came from (a program may have several `spawn` regions in different
@@ -470,6 +537,7 @@ pub struct TypeChecker<'a> {
 }
 
 impl<'a> TypeChecker<'a> {
+    /// A checker with one empty scope, ready to check a function on the CPU.
     pub fn new(
         env: &'a GlobalAstEnv<'a>,
         worker: &'a mut crate::session::LocalWorkerState,
@@ -492,7 +560,7 @@ impl<'a> TypeChecker<'a> {
             transfer_cost_graph,
             borrow: crate::hir::borrow_cx::BorrowCx::default(),
             speculating: false,
-            unreadable_reported: Default::default(),
+            unreadable_reported: std::collections::HashSet::default(),
             indexed_name: None,
             value_unused: false,
             checking_assign_lhs: false,
@@ -505,13 +573,14 @@ impl<'a> TypeChecker<'a> {
             declared_mut_vars: Vec::new(),
             changed_vars: std::collections::HashSet::new(),
             expected_type: None,
-            consteval: Default::default(),
-            mono: Default::default(),
-            seam: Default::default(),
-            traffic: Default::default(),
+            consteval: crate::hir::check_state::ConstEvalState::default(),
+            mono: crate::hir::check_state::MonoState::default(),
+            seam: crate::hir::check_state::SeamState::default(),
+            traffic: crate::hir::check_state::TrafficState::default(),
         }
     }
 
+    /// Opens a block: names declared from here on are gone when the block is closed.
     pub fn push_scope(&mut self) {
         // Conservative by default: the tiles placed in here are treated as still resident
         // outside it. Only `push_releasing_scope` claims otherwise, and only for the scopes
@@ -549,6 +618,7 @@ impl<'a> TypeChecker<'a> {
         self.consteval.env.push(std::collections::HashMap::new());
     }
 
+    /// Closes the innermost block, and ends the borrows taken in it.
     pub fn pop_scope(&mut self) {
         if self.traffic.scope_releases.pop().unwrap_or(false) {
             self.traffic.scope_chain.pop();
@@ -563,6 +633,7 @@ impl<'a> TypeChecker<'a> {
         self.borrow.retain_scope(depth);
     }
 
+    /// Declares `name` with type `ty` in the innermost block, on the topology being checked.
     pub fn insert(&mut self, name: String, ty: Type) {
         let current_top = self.active_topology.clone();
         if let Some(scope) = self.scopes.last_mut() {
@@ -570,6 +641,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Adds every name the statement mentions to `uses`.
     pub fn extract_uses_stmt(stmt: &Statement, uses: &mut std::collections::HashSet<String>) {
         match stmt {
             Statement::ExprStmt(e) => Self::extract_uses_expr(&e.expr, uses),
@@ -614,44 +686,13 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Adds every name the expression mentions to `uses`.
     pub fn extract_uses_expr(expr: &Expr, uses: &mut std::collections::HashSet<String>) {
-        fn topology(value: &Topology, uses: &mut std::collections::HashSet<String>) {
-            match value {
-                Topology::NPU(index) | Topology::AccCore(index) | Topology::GPU(index) => {
-                    TypeChecker::extract_uses_expr(index, uses);
-                }
-                Topology::Slice(base, start, end) => {
-                    topology(base, uses);
-                    TypeChecker::extract_uses_expr(start, uses);
-                    TypeChecker::extract_uses_expr(end, uses);
-                }
-                Topology::CPU
-                | Topology::AMX
-                | Topology::ANE
-                | Topology::CpuAvx512
-                | Topology::CpuNeon
-                | Topology::Current
-                | Topology::Custom(_) => {}
-            }
-        }
-
         match expr {
             Expr::Identifier(id) => {
                 uses.insert(id.name.to_string());
             }
             Expr::MemberAccess(m) => Self::extract_uses_expr(&m.base, uses),
-            Expr::MethodCall(m) => {
-                Self::extract_uses_expr(&m.base, uses);
-                for a in &m.args {
-                    Self::extract_uses_expr(a, uses);
-                }
-            }
-            Expr::FunctionCall(f) => {
-                uses.insert(f.name.to_string());
-                for a in &f.args {
-                    Self::extract_uses_expr(a, uses);
-                }
-            }
             Expr::BinaryOp(b) => {
                 Self::extract_uses_expr(&b.lhs, uses);
                 Self::extract_uses_expr(&b.rhs, uses);
@@ -675,126 +716,18 @@ impl<'a> TypeChecker<'a> {
             // dead -- and the same map is what the dead-borrow sweep consults.
             Expr::Transfer(t) => Self::extract_uses_expr(&t.expr, uses),
             Expr::TransferPredicate(predicate) => {
-                topology(&predicate.from, uses);
-                topology(&predicate.to, uses);
-            }
-            // A `spawn` region is where a placed tensor can legally be read, so the reads
-            // that matter most for residency are inside one. Missing them made two tiles
-            // held across a region look like one, which the space then had room for.
-            Expr::SpawnOn(s) => {
-                topology(&s.top, uses);
-                for stmt in &s.stmts {
-                    Self::extract_uses_stmt(stmt, uses);
-                }
-                if let Some(ret) = &s.ret {
-                    Self::extract_uses_expr(ret, uses);
-                }
-            }
-            Expr::Print(pr) => {
-                for a in &pr.args {
-                    Self::extract_uses_expr(a, uses);
-                }
-            }
-            Expr::Println(pr) => {
-                for a in &pr.args {
-                    Self::extract_uses_expr(a, uses);
-                }
-            }
-            Expr::Match(m) => {
-                Self::extract_uses_expr(&m.expr, uses);
-                for arm in &m.arms {
-                    for stmt in &arm.body {
-                        Self::extract_uses_stmt(stmt, uses);
-                    }
-                }
+                Self::extract_uses_topology(&predicate.from, uses);
+                Self::extract_uses_topology(&predicate.to, uses);
             }
             Expr::Range(r) => {
                 Self::extract_uses_expr(&r.start, uses);
                 Self::extract_uses_expr(&r.end, uses);
             }
-            Expr::Topology(topology_expr) => topology(&topology_expr.top, uses),
+            Expr::Topology(topology_expr) => Self::extract_uses_topology(&topology_expr.top, uses),
             Expr::Dereference(d) => Self::extract_uses_expr(&d.expr, uses),
-            Expr::StructInit(s) => {
-                for f in &s.fields {
-                    Self::extract_uses_expr(&f.1, uses);
-                }
-            }
-            Expr::Array(a) => {
-                for e in &a.elements {
-                    Self::extract_uses_expr(e, uses);
-                }
-            }
-            Expr::If(i) => {
-                Self::extract_uses_expr(&i.cond, uses);
-                for s in &i.then_block {
-                    Self::extract_uses_stmt(s, uses);
-                }
-                if let Some(eb) = &i.else_block {
-                    for s in eb {
-                        Self::extract_uses_stmt(s, uses);
-                    }
-                }
-            }
-            Expr::UnsafeBlock(u) => {
-                for s in &u.stmts {
-                    Self::extract_uses_stmt(s, uses);
-                }
-                if let Some(ret) = &u.ret {
-                    Self::extract_uses_expr(ret, uses);
-                }
-            }
-            Expr::ComptimeBlock(c) => {
-                for stmt in &c.stmts {
-                    Self::extract_uses_stmt(stmt, uses);
-                }
-                if let Some(ret) = &c.ret {
-                    Self::extract_uses_expr(ret, uses);
-                }
-            }
-            Expr::Grad(g) => {
-                for arg in &g.args {
-                    Self::extract_uses_expr(arg, uses);
-                }
-            }
             Expr::AsCast(c) => Self::extract_uses_expr(&c.expr, uses),
             Expr::Closure(c) => {
                 Self::extract_uses_expr(&c.body, uses);
-            }
-            Expr::EnumVariant(v) => {
-                for e in v.payload.iter().flatten() {
-                    Self::extract_uses_expr(e, uses);
-                }
-            }
-            Expr::IndirectCall(c) => {
-                Self::extract_uses_expr(&c.callee, uses);
-                for a in &c.args {
-                    Self::extract_uses_expr(a, uses);
-                }
-            }
-            Expr::VecMacro(v) => {
-                for e in &v.elements {
-                    Self::extract_uses_expr(e, uses);
-                }
-            }
-            Expr::InlineMlir(m) => {
-                for (_, e, _) in &m.inputs {
-                    Self::extract_uses_expr(e, uses);
-                }
-                for e in &m.clobbers {
-                    Self::extract_uses_expr(e, uses);
-                }
-            }
-            Expr::Jvp(j) => {
-                for a in &j.args {
-                    Self::extract_uses_expr(a, uses);
-                }
-                Self::extract_uses_expr(&j.tangent, uses);
-            }
-            Expr::Vjp(v) => {
-                for a in &v.args {
-                    Self::extract_uses_expr(a, uses);
-                }
-                Self::extract_uses_expr(&v.cotangent, uses);
             }
             // No names inside. A macro call is expanded before the checker runs.
             Expr::Number(_)
@@ -802,6 +735,133 @@ impl<'a> TypeChecker<'a> {
             | Expr::MemorySpace(_)
             | Expr::SizeOf(_)
             | Expr::MacroCall(_) => {}
+            // Calls, blocks and lists of expressions.
+            Expr::MethodCall(_)
+            | Expr::FunctionCall(_)
+            | Expr::IndirectCall(_)
+            | Expr::Grad(_)
+            | Expr::Jvp(_)
+            | Expr::Vjp(_)
+            | Expr::Print(_)
+            | Expr::Println(_)
+            | Expr::StructInit(_)
+            | Expr::Array(_)
+            | Expr::VecMacro(_)
+            | Expr::EnumVariant(_)
+            | Expr::InlineMlir(_)
+            | Expr::SpawnOn(_)
+            | Expr::Match(_)
+            | Expr::If(_)
+            | Expr::UnsafeBlock(_)
+            | Expr::ComptimeBlock(_) => Self::extract_uses_nested(expr, uses),
+        }
+    }
+
+    /// The part of [`Self::extract_uses_expr`] for an expression that holds a list of
+    /// expressions or a block of statements: a call, a literal, an `if`, a `match`, a block.
+    fn extract_uses_nested(expr: &Expr, uses: &mut std::collections::HashSet<String>) {
+        match expr {
+            Expr::MethodCall(m) => {
+                Self::extract_uses_expr(&m.base, uses);
+                Self::extract_uses_all(&m.args, uses);
+            }
+            Expr::FunctionCall(f) => {
+                uses.insert(f.name.to_string());
+                Self::extract_uses_all(&f.args, uses);
+            }
+            // A `spawn` region is where a placed tensor can legally be read, so the reads
+            // that matter most for residency are inside one. Missing them made two tiles
+            // held across a region look like one, which the space then had room for.
+            Expr::SpawnOn(s) => {
+                Self::extract_uses_topology(&s.top, uses);
+                Self::extract_uses_block(&s.stmts, s.ret.as_deref(), uses);
+            }
+            Expr::Print(pr) => Self::extract_uses_all(&pr.args, uses),
+            Expr::Println(pr) => Self::extract_uses_all(&pr.args, uses),
+            Expr::Match(m) => {
+                Self::extract_uses_expr(&m.expr, uses);
+                for arm in &m.arms {
+                    Self::extract_uses_block(&arm.body, None, uses);
+                }
+            }
+            Expr::StructInit(s) => Self::extract_uses_all(s.fields.iter().map(|f| &f.1), uses),
+            Expr::Array(a) => Self::extract_uses_all(&a.elements, uses),
+            Expr::If(i) => {
+                Self::extract_uses_expr(&i.cond, uses);
+                Self::extract_uses_block(&i.then_block, None, uses);
+                if let Some(eb) = &i.else_block {
+                    Self::extract_uses_block(eb, None, uses);
+                }
+            }
+            Expr::UnsafeBlock(u) => Self::extract_uses_block(&u.stmts, u.ret.as_deref(), uses),
+            Expr::ComptimeBlock(c) => Self::extract_uses_block(&c.stmts, c.ret.as_deref(), uses),
+            Expr::Grad(g) => Self::extract_uses_all(&g.args, uses),
+            Expr::EnumVariant(v) => Self::extract_uses_all(v.payload.iter().flatten(), uses),
+            Expr::IndirectCall(c) => {
+                Self::extract_uses_expr(&c.callee, uses);
+                Self::extract_uses_all(&c.args, uses);
+            }
+            Expr::VecMacro(v) => Self::extract_uses_all(&v.elements, uses),
+            Expr::InlineMlir(m) => {
+                Self::extract_uses_all(m.inputs.iter().map(|(_, e, _)| e), uses);
+                Self::extract_uses_all(&m.clobbers, uses);
+            }
+            Expr::Jvp(j) => {
+                Self::extract_uses_all(&j.args, uses);
+                Self::extract_uses_expr(&j.tangent, uses);
+            }
+            Expr::Vjp(v) => {
+                Self::extract_uses_all(&v.args, uses);
+                Self::extract_uses_expr(&v.cotangent, uses);
+            }
+            // Every other kind of expression is handled by `extract_uses_expr`, which has
+            // no catch-all, so a new kind of expression cannot be missed.
+            _ => {}
+        }
+    }
+
+    /// Adds every name that each of `exprs` mentions to `uses`.
+    fn extract_uses_all<'e>(
+        exprs: impl IntoIterator<Item = &'e Expr>,
+        uses: &mut std::collections::HashSet<String>,
+    ) {
+        for e in exprs {
+            Self::extract_uses_expr(e, uses);
+        }
+    }
+
+    /// Adds every name mentioned in a block, and in the value it ends with, to `uses`.
+    fn extract_uses_block(
+        stmts: &[Statement],
+        ret: Option<&Expr>,
+        uses: &mut std::collections::HashSet<String>,
+    ) {
+        for stmt in stmts {
+            Self::extract_uses_stmt(stmt, uses);
+        }
+        if let Some(ret) = ret {
+            Self::extract_uses_expr(ret, uses);
+        }
+    }
+
+    /// Adds every name mentioned in the index or the bounds of a topology to `uses`.
+    fn extract_uses_topology(value: &Topology, uses: &mut std::collections::HashSet<String>) {
+        match value {
+            Topology::NPU(index) | Topology::AccCore(index) | Topology::GPU(index) => {
+                TypeChecker::extract_uses_expr(index, uses);
+            }
+            Topology::Slice(base, start, end) => {
+                Self::extract_uses_topology(base, uses);
+                TypeChecker::extract_uses_expr(start, uses);
+                TypeChecker::extract_uses_expr(end, uses);
+            }
+            Topology::CPU
+            | Topology::AMX
+            | Topology::ANE
+            | Topology::CpuAvx512
+            | Topology::CpuNeon
+            | Topology::Current
+            | Topology::Custom(_) => {}
         }
     }
 
@@ -854,6 +914,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// The moves of two paths joined: moved if either path moved it.
+    #[must_use]
     pub fn union_moved(
         mut a: Vec<std::collections::HashSet<String>>,
         b: Vec<std::collections::HashSet<String>>,
@@ -895,6 +956,7 @@ impl<'a> TypeChecker<'a> {
             .rposition(|scope| scope.contains_key(name))
     }
 
+    /// Whether the variable `name` has been moved out of and not given a value since.
     pub fn is_moved(&self, name: &str) -> bool {
         // Only the binding that is actually in scope. A `let` of the same name in an inner
         // block is a different variable, and an outer one's mark says nothing about it.
@@ -904,6 +966,8 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// The type of the variable `name` and the topology it was declared on, from the
+    /// innermost block that declares it.
     pub fn lookup(&self, name: &str) -> Option<&(Type, Topology)> {
         for scope in self.scopes.iter().rev() {
             if let Some(ty) = scope.get(name) {
@@ -913,6 +977,8 @@ impl<'a> TypeChecker<'a> {
         None
     }
 
+    /// The same as [`Self::lookup`], with the depth of the block that declares the name. The
+    /// outermost block has depth 0.
     pub fn lookup_with_depth(&self, name: &str) -> Option<(&Type, &Topology, usize)> {
         for (i, scope) in self.scopes.iter().enumerate().rev() {
             if let Some((ty, top)) = scope.get(name) {
@@ -922,6 +988,9 @@ impl<'a> TypeChecker<'a> {
         None
     }
 
+    /// Matches the pattern `generic_ty` against `concrete_ty`, and records in `mapping` what
+    /// each type variable of the pattern stands for. Returns false, and leaves `mapping` as it
+    /// was, when they do not match.
     pub fn unify_types(
         &mut self,
         generic_ty: &Type,
@@ -990,6 +1059,113 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Matches a tensor pattern against a concrete tensor type. Each side is the element
+    /// type, the dimensions and the placement of one `Type::Tensor`.
+    fn unify_tensor(
+        (e1, d1, t1): (&ElementType, &[Dim], &Option<crate::syntax::Placement>),
+        (e2, d2, t2): (&ElementType, &[Dim], &Option<crate::syntax::Placement>),
+        mapping: &mut std::collections::HashMap<crate::symbol::Symbol, Type>,
+    ) -> bool {
+        // A pattern that names no place applies wherever the receiver lives; one that
+        // names a place applies only there.
+        let e1_match = Self::unify_tensor_elem(e1, e2, mapping);
+        if !e1_match || (t1.is_some() && t1 != t2) {
+            return false;
+        }
+        // Rank is static, so the two lists have to be the same length. Per dimension:
+        // `?` in the pattern matches any extent; a name binds to a compile-time extent
+        // and refuses a run-time one, since a `const` parameter cannot stand for a
+        // value that does not exist until then; anything else matches itself.
+        if d1.len() != d2.len() {
+            return false;
+        }
+        for (dim1, dim2) in d1.iter().zip(d2.iter()) {
+            match (dim1, dim2) {
+                (Dim::Dyn, _) => {}
+                (Dim::Static(Expr::Identifier(id)), Dim::Static(Expr::Number(n))) => {
+                    let extent = Type::Generic(n.value.clone(), None);
+                    if !Self::bind_dim(&id.name, extent, mapping) {
+                        return false;
+                    }
+                }
+                (Dim::Static(Expr::Identifier(id)), Dim::Static(Expr::Identifier(id2))) => {
+                    let extent = Type::Generic(id2.name.clone(), None);
+                    if !Self::bind_dim(&id.name, extent, mapping) {
+                        return false;
+                    }
+                }
+                (Dim::Static(Expr::Identifier(_)), Dim::Dyn) => return false,
+                _ if dim1 != dim2 => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// Matches each pattern in `generic` against the type at the same position in `concrete`.
+    /// The caller has checked that the two lists are the same length.
+    fn unify_type_lists(
+        &mut self,
+        generic: &[Type],
+        concrete: &[Type],
+        mapping: &mut std::collections::HashMap<crate::symbol::Symbol, Type>,
+    ) -> bool {
+        for (a1, a2) in generic.iter().zip(concrete.iter()) {
+            if !self.unify_types_internal(a1, a2, mapping) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Matches a `ClosureK<Args.., Ret>` pattern, whose type arguments are `gi_args`, against
+    /// the closure literal named `cn`.
+    fn unify_closure_literal(
+        &mut self,
+        gi_args: &[Type],
+        cn: &crate::symbol::Symbol,
+        mapping: &mut std::collections::HashMap<crate::symbol::Symbol, Type>,
+    ) -> bool {
+        if let Some((params, ret)) = self.mono.closure_signatures.get(cn).cloned() {
+            if gi_args.len() != params.len() + 1 {
+                return false;
+            }
+            for (a, p) in gi_args.iter().zip(params.iter()) {
+                if !self.unify_types_internal(a, p, mapping) {
+                    return false;
+                }
+            }
+            self.unify_types_internal(&gi_args[gi_args.len() - 1], &ret, mapping)
+        } else {
+            false
+        }
+    }
+
+    /// Matches a `Pinned<T, Top>` pattern against a concrete one. Each side is the payload
+    /// type and the topology.
+    fn unify_pinned(
+        &mut self,
+        (t1, top1): (&Type, &Topology),
+        (t2, top2): (&Type, &Topology),
+        mapping: &mut std::collections::HashMap<crate::symbol::Symbol, Type>,
+    ) -> bool {
+        // A topology variable (`Pinned<_, D>` with D a `<D: Topology>` param) binds
+        // to the argument's concrete topology; a concrete topology must match. Then
+        // unify the payload (which may itself carry type variables).
+        let tops_ok = match top1 {
+            Topology::Custom(name) if self.mono.pending_topo_vars.contains(name) => {
+                self.mono
+                    .pending_topo_bindings
+                    .insert(name.clone(), top2.clone());
+                true
+            }
+            _ => top1 == top2,
+        };
+        tops_ok && self.unify_types_internal(t1, t2, mapping)
+    }
+
+    /// The matching behind [`Self::unify_types`]. It writes to `mapping` as it goes, so
+    /// `mapping` can hold bindings from a match that failed part of the way through.
     fn unify_types_internal(
         &mut self,
         generic_ty: &Type,
@@ -1006,40 +1182,7 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             (Type::Tensor(e1, d1, t1), Type::Tensor(e2, d2, t2)) => {
-                // A pattern that names no place applies wherever the receiver lives; one that
-                // names a place applies only there.
-                let e1_match = Self::unify_tensor_elem(e1, e2, mapping);
-                if !e1_match || (t1.is_some() && t1 != t2) {
-                    return false;
-                }
-                // Rank is static, so the two lists have to be the same length. Per dimension:
-                // `?` in the pattern matches any extent; a name binds to a compile-time extent
-                // and refuses a run-time one, since a `const` parameter cannot stand for a
-                // value that does not exist until then; anything else matches itself.
-                if d1.len() != d2.len() {
-                    return false;
-                }
-                for (dim1, dim2) in d1.iter().zip(d2.iter()) {
-                    match (dim1, dim2) {
-                        (Dim::Dyn, _) => {}
-                        (Dim::Static(Expr::Identifier(id)), Dim::Static(Expr::Number(n))) => {
-                            let extent = Type::Generic(n.value.clone(), None);
-                            if !Self::bind_dim(&id.name, extent, mapping) {
-                                return false;
-                            }
-                        }
-                        (Dim::Static(Expr::Identifier(id)), Dim::Static(Expr::Identifier(id2))) => {
-                            let extent = Type::Generic(id2.name.clone(), None);
-                            if !Self::bind_dim(&id.name, extent, mapping) {
-                                return false;
-                            }
-                        }
-                        (Dim::Static(Expr::Identifier(_)), Dim::Dyn) => return false,
-                        _ if dim1 != dim2 => return false,
-                        _ => {}
-                    }
-                }
-                true
+                Self::unify_tensor((e1, d1, t1), (e2, d2, t2), mapping)
             }
             (Type::Pointer(t1, m1, mut1), Type::Pointer(t2, m2, mut2)) => {
                 m1 == m2 && mut1 == mut2 && self.unify_types_internal(t1, t2, mapping)
@@ -1062,32 +1205,15 @@ impl<'a> TypeChecker<'a> {
                 m1 == m2 && self.unify_types_internal(t1, t2, mapping)
             }
             (Type::GenericInstance(b1, args1), Type::GenericInstance(b2, args2)) => {
-                if args1.len() != args2.len() {
-                    return false;
-                }
-                if !self.unify_types_internal(b1, b2, mapping) {
-                    return false;
-                }
-                for (a1, a2) in args1.iter().zip(args2.iter()) {
-                    if !self.unify_types_internal(a1, a2, mapping) {
-                        return false;
-                    }
-                }
-                true
+                args1.len() == args2.len()
+                    && self.unify_types_internal(b1, b2, mapping)
+                    && self.unify_type_lists(args1, args2, mapping)
             }
             (Type::Function(p1, r1, u1), Type::Function(p2, r2, u2)) => {
-                if p1.len() != p2.len() || u1 != u2 {
-                    return false;
-                }
-                if !self.unify_types_internal(r1, r2, mapping) {
-                    return false;
-                }
-                for (a1, a2) in p1.iter().zip(p2.iter()) {
-                    if !self.unify_types_internal(a1, a2, mapping) {
-                        return false;
-                    }
-                }
-                true
+                p1.len() == p2.len()
+                    && u1 == u2
+                    && self.unify_types_internal(r1, r2, mapping)
+                    && self.unify_type_lists(p1, p2, mapping)
             }
             // A closure literal checks to `Struct("Closure_N")`, erasing its call signature.
             // Matching it against a `ClosureK<Args.., Ret>` parameter (e.g. `.map`'s
@@ -1098,35 +1224,11 @@ impl<'a> TypeChecker<'a> {
                 if cn.starts_with("Closure_")
                     && matches!(&**inner, Type::Struct(n, _) if n.starts_with("Closure")) =>
             {
-                if let Some((params, ret)) = self.mono.closure_signatures.get(cn).cloned() {
-                    if gi_args.len() != params.len() + 1 {
-                        return false;
-                    }
-                    for (a, p) in gi_args.iter().zip(params.iter()) {
-                        if !self.unify_types_internal(a, p, mapping) {
-                            return false;
-                        }
-                    }
-                    self.unify_types_internal(&gi_args[gi_args.len() - 1], &ret, mapping)
-                } else {
-                    false
-                }
+                self.unify_closure_literal(gi_args, cn, mapping)
             }
             (Type::Struct(n1, _), Type::Struct(n2, _)) => n1 == n2,
             (Type::Pinned(t1, top1), Type::Pinned(t2, top2)) => {
-                // A topology variable (`Pinned<_, D>` with D a `<D: Topology>` param) binds
-                // to the argument's concrete topology; a concrete topology must match. Then
-                // unify the payload (which may itself carry type variables).
-                let tops_ok = match top1 {
-                    Topology::Custom(name) if self.mono.pending_topo_vars.contains(name) => {
-                        self.mono
-                            .pending_topo_bindings
-                            .insert(name.clone(), top2.clone());
-                        true
-                    }
-                    _ => top1 == top2,
-                };
-                tops_ok && self.unify_types_internal(t1, t2, mapping)
+                self.unify_pinned((t1, top1), (t2, top2), mapping)
             }
             (t1, t2) => t1 == t2,
         }
@@ -1209,42 +1311,42 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// The same substitution as `subst_topo_in_stmt`, over the statements of a block and the
+    /// value it ends with.
+    fn subst_topo_in_block(
+        stmts: &mut [crate::syntax::Statement],
+        ret: Option<&mut Expr>,
+        tm: &std::collections::HashMap<crate::symbol::Symbol, Topology>,
+    ) {
+        for s in stmts {
+            Self::subst_topo_in_stmt(s, tm);
+        }
+        if let Some(r) = ret {
+            Self::subst_topo_in_expr(r, tm);
+        }
+    }
+
+    /// The same substitution as `subst_topo_in_stmt`, over one expression.
     fn subst_topo_in_expr(
         expr: &mut Expr,
         tm: &std::collections::HashMap<crate::symbol::Symbol, Topology>,
     ) {
         use crate::syntax::Expr as E;
-        let recur_block = |stmts: &mut Vec<crate::syntax::Statement>| {
-            for s in stmts {
-                Self::subst_topo_in_stmt(s, tm);
-            }
-        };
         match expr {
             E::SpawnOn(e) => {
                 e.top = Self::substitute_topology(e.top.clone(), tm);
-                recur_block(&mut e.stmts);
-                if let Some(r) = e.ret.as_deref_mut() {
-                    Self::subst_topo_in_expr(r, tm);
-                }
+                Self::subst_topo_in_block(&mut e.stmts, e.ret.as_deref_mut(), tm);
             }
             E::If(e) => {
                 Self::subst_topo_in_expr(&mut e.cond, tm);
-                recur_block(&mut e.then_block);
+                Self::subst_topo_in_block(&mut e.then_block, None, tm);
                 if let Some(eb) = &mut e.else_block {
-                    recur_block(eb);
+                    Self::subst_topo_in_block(eb, None, tm);
                 }
             }
-            E::UnsafeBlock(e) => {
-                recur_block(&mut e.stmts);
-                if let Some(r) = e.ret.as_deref_mut() {
-                    Self::subst_topo_in_expr(r, tm);
-                }
-            }
+            E::UnsafeBlock(e) => Self::subst_topo_in_block(&mut e.stmts, e.ret.as_deref_mut(), tm),
             E::ComptimeBlock(e) => {
-                recur_block(&mut e.stmts);
-                if let Some(r) = e.ret.as_deref_mut() {
-                    Self::subst_topo_in_expr(r, tm);
-                }
+                Self::subst_topo_in_block(&mut e.stmts, e.ret.as_deref_mut(), tm);
             }
             E::BinaryOp(e) => {
                 Self::subst_topo_in_expr(&mut e.lhs, tm);
@@ -1290,12 +1392,15 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    pub fn instantiate_function(
-        &mut self,
+    /// The name of the copy of `generic_func` made for the types in `mapping` and the
+    /// topologies in `topo_mapping`: the function's name, then `$` and each one in turn.
+    fn mangled_instance_name(
         generic_func: &Function,
         mapping: &std::collections::HashMap<crate::symbol::Symbol, Type>,
         topo_mapping: &std::collections::HashMap<crate::symbol::Symbol, Topology>,
-    ) -> Function {
+    ) -> String {
+        // Writing into a `String` cannot fail, so the results of `write!` are dropped.
+        use std::fmt::Write as _;
         let mut mangled_name = generic_func.name.to_string();
         // `T::Item` follows from `T`, so it adds nothing to the name.
         let mut sorted_keys: Vec<&crate::symbol::Symbol> = mapping
@@ -1305,7 +1410,7 @@ impl<'a> TypeChecker<'a> {
         sorted_keys.sort();
         for g_name in sorted_keys {
             if let Some(ty) = mapping.get(g_name) {
-                mangled_name.push_str(&format!("${}", ty.mangle()));
+                let _ = write!(mangled_name, "${}", ty.mangle());
             }
         }
         // Distinguish topology instantiations (`f$GPU` vs `f$NPU`).
@@ -1313,9 +1418,22 @@ impl<'a> TypeChecker<'a> {
         topo_keys.sort();
         for g_name in topo_keys {
             if let Some(top) = topo_mapping.get(g_name) {
-                mangled_name.push_str(&format!("${:?}", top.kind()));
+                let _ = write!(mangled_name, "${:?}", top.kind());
             }
         }
+        mangled_name
+    }
+
+    /// Makes the copy of the generic function `generic_func` in which each type variable is
+    /// replaced by the type `mapping` gives it, and each topology variable by the topology
+    /// `topo_mapping` gives it.
+    pub fn instantiate_function(
+        &mut self,
+        generic_func: &Function,
+        mapping: &std::collections::HashMap<crate::symbol::Symbol, Type>,
+        topo_mapping: &std::collections::HashMap<crate::symbol::Symbol, Topology>,
+    ) -> Function {
+        let mangled_name = Self::mangled_instance_name(generic_func, mapping, topo_mapping);
 
         let new_params = generic_func
             .params
@@ -1368,10 +1486,14 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// `path` with every `/` and `.` replaced by `_`, so it can be part of a symbol name.
+    #[must_use]
     pub fn mangle_path(path: &str) -> String {
-        path.replace("/", "_").replace(".", "_")
+        path.replace(['/', '.'], "_")
     }
 
+    /// Checks one function: its signature, its body, and what the body leaves unused. A
+    /// generic function is skipped, because its copies are checked where they are made.
     pub fn check_function(&mut self, func: &mut Function) {
         if !func.generics.is_empty() {
             return;
@@ -1386,62 +1508,80 @@ impl<'a> TypeChecker<'a> {
                 func.return_type
             ));
         }
-        // A nominal type in the signature that names no declaration. An unknown name in type
-        // position parses as a user nominal and nothing downstream asks whether it was ever
-        // declared, so `Wibble<Frobnicate>` compiled and did nothing -- and an obsolete
-        // constructor kept "working" in the documentation long after it was removed.
-        //
-        // `Struct(name, None)` is a legitimate state on its own: a cross-module generic carries an
-        // unresolved base that later code resolves by name. What is checked here is stronger --
-        // that no declaration of that name exists anywhere the checker can see.
-        {
-            fn walk(t: &Type, out: &mut Vec<String>) {
-                match t {
-                    Type::Struct(n, None) | Type::Enum(n, None) => out.push(n.to_string()),
-                    Type::Struct(_, _) | Type::Enum(_, _) => {}
-                    Type::Pointer(i, ..)
-                    | Type::Ref(i, _)
-                    | Type::Pinned(i, _)
-                    | Type::Verified(i)
-                    | Type::Borrow { inner: i, .. } => walk(i, out),
-                    Type::GenericInstance(b, args) => {
-                        walk(b, out);
-                        args.iter().for_each(|a| walk(a, out));
-                    }
-                    Type::Function(ps, r, _) | Type::Closure(ps, r) => {
-                        ps.iter().for_each(|a| walk(a, out));
-                        walk(r, out);
-                    }
-                    _ => {}
-                }
-            }
-            let mut names = Vec::new();
-            for (_, t) in &func.params {
-                walk(t, &mut names);
-            }
-            walk(&func.return_type, &mut names);
-            for n in names {
-                // `void`/`none`/`!` are spelled as nominals but are builtins, and a `Closure_N` is
-                // synthesized by the compiler rather than written by anyone.
-                if n == "void" || n == "none" || n == "!" || n.starts_with("Closure_") {
-                    continue;
-                }
-                let sym = crate::symbol::Symbol::from(n.as_str());
-                if !self.env.structs.contains_key(&sym) && !self.env.enums.contains_key(&sym) {
+        self.check_signature_types_are_declared(func);
+        let exits = self.check_body_returns(func);
+
+        let mut saved = self.enter_function(func);
+        self.bind_parameters(func);
+        self.check_function_body(func);
+
+        // Each `return` checked the `ensures` where it stood. A body that can also reach its end
+        // without one is checked here, from what is known at the end.
+        if !exits && !self.speculating {
+            for ens in &func.ensures {
+                if !self.prove_expr(ens) {
                     self.errors.error_with_code(
-                        crate::diagnostic::DiagnosticCode::E3029,
-                        format!("no type named '{n}' is declared or imported"),
-                        func.body
-                            .first()
-                            .map(|st| crate::diagnostic::SourceSpan::from_ast_span(&st.span())),
+                        crate::diagnostic::DiagnosticCode::E8001,
+                        format!(
+                            "Function '{}' cannot prove postcondition (ensures) at compile time",
+                            func.name
+                        ),
+                        None,
                     );
                 }
             }
         }
+        self.consteval.current_ensures = std::mem::take(&mut saved.ensures);
 
-        // A non-void function whose body can complete without returning. Left to codegen this
-        // surfaced as `block with no terminator` naming an arith op, with no source location and
-        // no statement of what was wrong -- unreadable for the most ordinary mistake there is.
+        self.warn_unused_names(func);
+
+        // The whole function has been checked; verify the working set of each memory space
+        // it places tiles into fits (or is `overcommit`). Clears the per-function placement map.
+        self.check_cumulative_capacity();
+
+        self.pop_scope();
+        self.leave_function(saved);
+    }
+
+    /// Reports a nominal type in the signature that names no declaration. An unknown name in type
+    /// position parses as a user nominal and nothing downstream asks whether it was ever
+    /// declared, so `Wibble<Frobnicate>` compiled and did nothing -- and an obsolete
+    /// constructor kept "working" in the documentation long after it was removed.
+    ///
+    /// `Struct(name, None)` is a legitimate state on its own: a cross-module generic carries an
+    /// unresolved base that later code resolves by name. What is checked here is stronger --
+    /// that no declaration of that name exists anywhere the checker can see.
+    fn check_signature_types_are_declared(&mut self, func: &Function) {
+        let mut names = Vec::new();
+        for (_, t) in &func.params {
+            unresolved_nominals(t, &mut names);
+        }
+        unresolved_nominals(&func.return_type, &mut names);
+        for n in names {
+            // `void`/`none`/`!` are spelled as nominals but are builtins, and a `Closure_N` is
+            // synthesized by the compiler rather than written by anyone.
+            if n == "void" || n == "none" || n == "!" || n.starts_with("Closure_") {
+                continue;
+            }
+            let sym = crate::symbol::Symbol::from(n.as_str());
+            if !self.env.structs.contains_key(&sym) && !self.env.enums.contains_key(&sym) {
+                self.errors.error_with_code(
+                    crate::diagnostic::DiagnosticCode::E3029,
+                    format!("no type named '{n}' is declared or imported"),
+                    func.body
+                        .first()
+                        .map(|st| crate::diagnostic::SourceSpan::from_ast_span(&st.span())),
+                );
+            }
+        }
+    }
+
+    /// Reports a non-void function whose body can complete without returning. Left to codegen this
+    /// surfaced as `block with no terminator` naming an arith op, with no source location and
+    /// no statement of what was wrong -- unreadable for the most ordinary mistake there is.
+    ///
+    /// Returns whether every path through the body ends in a `return` or never finishes.
+    fn check_body_returns(&mut self, func: &Function) -> bool {
         let functions = &self.env.functions;
         let never = |name: &str| {
             functions
@@ -1474,7 +1614,13 @@ impl<'a> TypeChecker<'a> {
                     .map(|st| crate::diagnostic::SourceSpan::from_ast_span(&st.span())),
             );
         }
+        exits
+    }
 
+    /// Sets the checker up for the body of `func`, and returns what it held for the function
+    /// around it. A function can be checked from inside the body of another, so everything
+    /// that is kept per function is swapped out here and put back by `leave_function`.
+    fn enter_function(&mut self, func: &Function) -> SavedFunctionState {
         let prev_constraints = self.consteval.constraints.clone();
         let prev_ensures =
             std::mem::replace(&mut self.consteval.current_ensures, func.ensures.clone());
@@ -1520,6 +1666,55 @@ impl<'a> TypeChecker<'a> {
         // callee's source.
         let prev_borrows = self.borrow.take();
         let prev_borrowers = self.borrow.take_borrowers();
+        SavedFunctionState {
+            constraints: prev_constraints,
+            ensures: prev_ensures,
+            ret_ty: prev_ret_ty,
+            function: prev_fn,
+            placements: prev_placements,
+            call_sites: prev_call_sites,
+            scope_chain: prev_scope_chain,
+            scope_releases: prev_scope_releases,
+            used_vars: prev_used_vars,
+            declared_vars: prev_declared_vars,
+            declared_mut_vars: prev_declared_mut_vars,
+            changed_vars: prev_changed_vars,
+            top: prev_top,
+            mem: prev_mem,
+            params: prev_params,
+            provenance: prev_provenance,
+            views: prev_views,
+            borrows: prev_borrows,
+            borrowers: prev_borrowers,
+        }
+    }
+
+    /// Puts back what `enter_function` swapped out, except the `ensures` conditions, which
+    /// `check_function` puts back earlier.
+    fn leave_function(&mut self, saved: SavedFunctionState) {
+        self.traffic.memory_placements = saved.placements;
+        self.traffic.call_sites = saved.call_sites;
+        self.traffic.scope_chain = saved.scope_chain;
+        self.traffic.scope_releases = saved.scope_releases;
+        self.current_return_type = saved.ret_ty;
+        self.current_function = saved.function;
+        self.consteval.constraints = saved.constraints;
+        self.active_topology = saved.top;
+        self.active_memory = saved.mem;
+        self.borrow.current_params = saved.params;
+        self.borrow.ref_provenance = saved.provenance;
+        self.borrow.views = saved.views;
+        self.borrow.restore(saved.borrows);
+        self.borrow.restore_borrowers(saved.borrowers);
+        self.used_vars = saved.used_vars;
+        self.declared_vars = saved.declared_vars;
+        self.declared_mut_vars = saved.declared_mut_vars;
+        self.changed_vars = saved.changed_vars;
+    }
+
+    /// Declares the parameters of `func` in the scope of its body, and adds its `requires`
+    /// conditions to what is known to hold.
+    fn bind_parameters(&mut self, func: &Function) {
         for (name, ty) in &func.params {
             self.insert(name.to_string(), ty.clone());
             self.borrow.current_params.insert(name.clone(), ty.clone());
@@ -1535,7 +1730,10 @@ impl<'a> TypeChecker<'a> {
         for req in &func.requires {
             self.consteval.constraints.push(req.clone());
         }
+    }
 
+    /// Checks the statements of the body of `func`.
+    fn check_function_body(&mut self, func: &mut Function) {
         // Pre-scan: gather the value contracts the consumer's asserts impose, so a
         // transfer seam (checked before the consumer's spawn body) can consult them.
         // Only when seam verification is enabled (otherwise we pay nothing for it).
@@ -1569,25 +1767,11 @@ impl<'a> TypeChecker<'a> {
         Self::drop_spent_comptime_lambdas(&mut func.body);
 
         self.seam.contracts = prev_contracts;
+    }
 
-        // Each `return` checked the `ensures` where it stood. A body that can also reach its end
-        // without one is checked here, from what is known at the end.
-        if !exits && !self.speculating {
-            for ens in &func.ensures {
-                if !self.prove_expr(ens) {
-                    self.errors.error_with_code(
-                        crate::diagnostic::DiagnosticCode::E8001,
-                        format!(
-                            "Function '{}' cannot prove postcondition (ensures) at compile time",
-                            func.name
-                        ),
-                        None,
-                    );
-                }
-            }
-        }
-        self.consteval.current_ensures = prev_ensures;
-
+    /// Warns about each parameter and variable of `func` that is never read, and each
+    /// `let mut` variable that never changes.
+    fn warn_unused_names(&mut self, func: &Function) {
         // W1009: Unused function parameters
         for (param_name, _) in &func.params {
             let name_str: &str = param_name.as_ref();
@@ -1597,7 +1781,7 @@ impl<'a> TypeChecker<'a> {
             {
                 self.errors.warn(
                     crate::diagnostic::DiagnosticCode::W1009,
-                    format!("Unused function parameter '{}'", param_name),
+                    format!("Unused function parameter '{param_name}'"),
                     None,
                 );
             }
@@ -1609,13 +1793,13 @@ impl<'a> TypeChecker<'a> {
             if !name_str.starts_with('_') && !self.used_vars.contains(&var_name) {
                 let diag = self.errors.warn(
                     crate::diagnostic::DiagnosticCode::W1001,
-                    format!("Unused variable '{}'", var_name),
+                    format!("Unused variable '{var_name}'"),
                     Some(crate::diagnostic::SourceSpan::from_ast_span(&var_span)),
                 );
                 diag.fix_its.push(crate::diagnostic::FixIt {
                     message: "prefix with underscore to suppress".into(),
                     span: crate::diagnostic::SourceSpan::from_ast_span(&var_span),
-                    replacement: format!("_{}", var_name).into(),
+                    replacement: format!("_{var_name}").into(),
                 });
             }
         }
@@ -1641,32 +1825,10 @@ impl<'a> TypeChecker<'a> {
                 );
             }
         }
-
-        // The whole function has been checked; verify the working set of each memory space
-        // it places tiles into fits (or is `overcommit`). Clears the per-function placement map.
-        self.check_cumulative_capacity();
-
-        self.pop_scope();
-        self.traffic.memory_placements = prev_placements;
-        self.traffic.call_sites = prev_call_sites;
-        self.traffic.scope_chain = prev_scope_chain;
-        self.traffic.scope_releases = prev_scope_releases;
-        self.current_return_type = prev_ret_ty;
-        self.current_function = prev_fn;
-        self.consteval.constraints = prev_constraints;
-        self.active_topology = prev_top;
-        self.active_memory = prev_mem;
-        self.borrow.current_params = prev_params;
-        self.borrow.ref_provenance = prev_provenance;
-        self.borrow.views = prev_views;
-        self.borrow.restore(prev_borrows);
-        self.borrow.restore_borrowers(prev_borrowers);
-        self.used_vars = prev_used_vars;
-        self.declared_vars = prev_declared_vars;
-        self.declared_mut_vars = prev_declared_mut_vars;
-        self.changed_vars = prev_changed_vars;
     }
 
+    /// Parses the text of a type, such as `Vec<i32>`. Text that is not a type but is an
+    /// expression, such as `4`, becomes a `Type::Const`; anything else is `Type::Unknown`.
     pub fn parse_ty_str(&self, s: &str) -> Type {
         let mut lexer = crate::lexer::Lexer::new(s);
         let tokens = lexer.tokenize();
@@ -1749,6 +1911,59 @@ impl<'a> TypeChecker<'a> {
             }
             _ => ty,
         }
+    }
+}
+
+/// What the checker held for the function around the one being checked. `enter_function`
+/// fills it and `leave_function` puts it back. Each field is the saved value of the
+/// `TypeChecker` state it is named after.
+struct SavedFunctionState {
+    constraints: Vec<Expr>,
+    ensures: Vec<Expr>,
+    ret_ty: Option<Type>,
+    function: String,
+    placements: HashMap<MemorySpace, HashMap<String, crate::hir::check_state::Placement>>,
+    call_sites: HashMap<String, crate::hir::check_state::CallSite>,
+    scope_chain: Vec<u32>,
+    scope_releases: Vec<bool>,
+    used_vars: std::collections::HashSet<crate::symbol::Symbol>,
+    declared_vars: Vec<(crate::symbol::Symbol, crate::syntax::Span)>,
+    declared_mut_vars: Vec<(crate::symbol::Symbol, crate::syntax::Span)>,
+    changed_vars: std::collections::HashSet<String>,
+    top: Topology,
+    mem: MemorySpace,
+    params: HashMap<crate::symbol::Symbol, Type>,
+    provenance: HashMap<crate::symbol::Symbol, RefProvenance>,
+    views: HashMap<crate::symbol::Symbol, crate::hir::check::views::View>,
+    borrows: HashMap<crate::symbol::Symbol, Vec<BorrowRecord>>,
+    borrowers: HashMap<String, std::collections::HashSet<String>>,
+}
+
+/// Adds to `out` the name of every struct or enum type inside `t` that has not been matched
+/// to a declaration yet.
+fn unresolved_nominals(t: &Type, out: &mut Vec<String>) {
+    match t {
+        Type::Struct(n, None) | Type::Enum(n, None) => out.push(n.to_string()),
+        Type::Pointer(i, ..)
+        | Type::Ref(i, _)
+        | Type::Pinned(i, _)
+        | Type::Verified(i)
+        | Type::Borrow { inner: i, .. } => unresolved_nominals(i, out),
+        Type::GenericInstance(b, args) => {
+            unresolved_nominals(b, out);
+            for a in args {
+                unresolved_nominals(a, out);
+            }
+        }
+        Type::Function(ps, r, _) | Type::Closure(ps, r) => {
+            for a in ps {
+                unresolved_nominals(a, out);
+            }
+            unresolved_nominals(r, out);
+        }
+        // A struct or enum that is already matched to its declaration, or a type with no
+        // other type inside it.
+        _ => {}
     }
 }
 
@@ -1848,6 +2063,11 @@ fn push_uses_stmt(stmt: &Statement, out: &mut Vec<String>) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod build_cost_tests {
     use crate::hir::GlobalAstEnv;
 
@@ -1888,8 +2108,8 @@ mod build_cost_tests {
     #[test]
     fn building_the_env_sweeps_the_transfer_graph_once() {
         const MACHINES: usize = 12;
-        let src: String = (0..MACHINES).map(machine).collect::<Vec<_>>().join("\n")
-            + "\nfn main() -> i32 { return 0; }\n";
+        let mut src: String = (0..MACHINES).map(machine).collect::<Vec<_>>().join("\n");
+        src.push_str("\nfn main() -> i32 { return 0; }\n");
         let program = parse(&src);
         let programs = vec![program];
 

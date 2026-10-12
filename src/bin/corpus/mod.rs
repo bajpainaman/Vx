@@ -183,7 +183,7 @@ impl CorpusParams {
     pub fn id(&self) -> String {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in self.canonical_string().bytes() {
-            h ^= b as u64;
+            h ^= u64::from(b);
             h = h.wrapping_mul(0x100_0000_01b3);
         }
         format!("{h:016x}")
@@ -523,9 +523,10 @@ fn module_source(p: &CorpusParams, m: usize) -> (String, Vec<Vec<String>>) {
 /// `corpus_id`. Because the id is a digest of the parameters, a matching id means matching
 /// parameters; a directory holding some other corpus is regenerated rather than silently measured.
 pub fn generate(params: &CorpusParams, out: Option<&Path>) -> Corpus {
-    let dir = out
-        .map(|d| d.to_path_buf())
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("vx_corpus_{}", params.id())));
+    let dir = out.map_or_else(
+        || std::env::temp_dir().join(format!("vx_corpus_{}", params.id())),
+        std::path::Path::to_path_buf,
+    );
 
     let mut sources = Vec::with_capacity(params.modules);
     let mut distinct = std::collections::HashSet::new();
@@ -545,8 +546,7 @@ pub fn generate(params: &CorpusParams, out: Option<&Path>) -> Corpus {
 
     let manifest_path = dir.join("manifest.json");
     let reused = std::fs::read_to_string(&manifest_path)
-        .map(|got| got.contains(&format!("\"corpus_id\": \"{}\"", params.id())))
-        .unwrap_or(false);
+        .is_ok_and(|got| got.contains(&format!("\"corpus_id\": \"{}\"", params.id())));
 
     let corpus = Corpus {
         params: params.clone(),
@@ -597,10 +597,9 @@ pub fn arg<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
 
 /// Parse a comma-separated list, e.g. `--modules 8,64,512`.
 pub fn arg_list<T: std::str::FromStr>(args: &[String], name: &str, default: Vec<T>) -> Vec<T> {
-    args.windows(2)
-        .find(|w| w[0] == name)
-        .map(|w| w[1].split(',').filter_map(|t| t.parse().ok()).collect())
-        .unwrap_or(default)
+    args.windows(2).find(|w| w[0] == name).map_or(default, |w| {
+        w[1].split(',').filter_map(|t| t.parse().ok()).collect()
+    })
 }
 
 /// Build params from argv, taking `modules`/`fns` from a caller that may be sweeping them.

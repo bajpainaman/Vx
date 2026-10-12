@@ -21,9 +21,7 @@ static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 fn init_rayon() {
     INIT_RAYON.call_once(|| {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(2);
+        let cores = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
         let threads = if cores > 2 { cores - 2 } else { 1 };
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -58,12 +56,11 @@ pub(crate) fn expect_matches(out: &str, expect: &str) -> bool {
     let mut rest = expect;
     while let Some(start) = rest.find("{{") {
         segments.push(&rest[..start]);
-        match rest[start..].find("}}") {
-            Some(end) => rest = &rest[start + end + 2..],
-            None => {
-                rest = "";
-                break;
-            }
+        if let Some(end) = rest[start..].find("}}") {
+            rest = &rest[start + end + 2..]
+        } else {
+            rest = "";
+            break;
         }
     }
     segments.push(rest);
@@ -94,7 +91,7 @@ fn run_frontend_test(path: &Path, expect_pass: bool) -> Result<(), String> {
         if !expect_pass || xfail {
             return Ok(());
         }
-        return Err(format!("Parse failed on {:?}: {}", path, e));
+        return Err(format!("Parse failed on {path:?}: {e}"));
     }
     let mut program_arr = loader.into_programs().expect("the fixture should load");
 
@@ -133,7 +130,7 @@ fn run_frontend_test(path: &Path, expect_pass: bool) -> Result<(), String> {
         if !expect_pass || xfail {
             return Ok(());
         }
-        return Err(format!("Macro expansion failed on {:?}: {}", path, e));
+        return Err(format!("Macro expansion failed on {path:?}: {e}"));
     }
 
     let global_session = std::sync::Arc::new(vxc::session::GlobalSession::new(1));
@@ -164,13 +161,10 @@ fn run_frontend_test(path: &Path, expect_pass: bool) -> Result<(), String> {
                 path, checker.errors
             ));
         }
-    } else {
-        if is_valid {
-            return Err(format!(
-                "Expected semantic failure on {:?}, but it passed",
-                path
-            ));
-        }
+    } else if is_valid {
+        return Err(format!(
+            "Expected semantic failure on {path:?}, but it passed"
+        ));
     }
 
     // A file that states CHECK lines gets them executed. This runner used to stop at the
@@ -184,10 +178,10 @@ fn run_frontend_test(path: &Path, expect_pass: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Match `input` against a file's CHECK directives using the real FileCheck.
+/// Match `input` against a file's CHECK directives using the real `FileCheck`.
 ///
 /// The middle-end runner compiles in process -- it drives passes the CLI has no flag for --
-/// so there is no RUN line to hand a shell. Piping what it produced into FileCheck gets the
+/// so there is no RUN line to hand a shell. Piping what it produced into `FileCheck` gets the
 /// same matching the lit tiers have: `{{regex}}` holes, CHECK-NEXT, CHECK-DAG, capture
 /// variables. It replaces an ordered substring scan that understood only plain `CHECK:` and
 /// had to refuse everything else to avoid passing vacuously (Vx#407).
@@ -197,23 +191,23 @@ fn filecheck(input: &str, match_file: &Path, prefix: Option<&str>) -> Result<(),
     let mut cmd = std::process::Command::new("FileCheck");
     cmd.arg(match_file);
     if let Some(p) = prefix {
-        cmd.arg(format!("--check-prefix={}", p));
+        cmd.arg(format!("--check-prefix={p}"));
     }
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not run FileCheck (is it on PATH?): {}", e))?;
+        .map_err(|e| format!("could not run FileCheck (is it on PATH?): {e}"))?;
     child
         .stdin
         .take()
         .unwrap()
         .write_all(input.as_bytes())
-        .map_err(|e| format!("writing to FileCheck: {}", e))?;
+        .map_err(|e| format!("writing to FileCheck: {e}"))?;
     let out = child
         .wait_with_output()
-        .map_err(|e| format!("waiting on FileCheck: {}", e))?;
+        .map_err(|e| format!("waiting on FileCheck: {e}"))?;
     if out.status.success() {
         return Ok(());
     }
@@ -270,7 +264,7 @@ fn run_middle_end_test(path: &Path) -> Result<(), String> {
         }
     }
     if let Err(e) = expander.expand_module(&mut program) {
-        return Err(format!("Macro expansion failed on {:?}: {}", path, e));
+        return Err(format!("Macro expansion failed on {path:?}: {e}"));
     }
 
     let global_session = std::sync::Arc::new(vxc::session::GlobalSession::new(1));
@@ -291,7 +285,7 @@ fn run_middle_end_test(path: &Path) -> Result<(), String> {
         checker.seam.lowering_edge = Some((
             t.from.clone(),
             t.to.clone(),
-            t.topology.display_name().to_string(),
+            t.topology.display_name().clone(),
         ));
         for f in &mut t.methods {
             checker.check_function(f);
@@ -363,14 +357,12 @@ fn run_middle_end_test(path: &Path) -> Result<(), String> {
     ) {
         (Err(e), None) => {
             return Err(format!(
-                "{:?} emits MLIR its own compiler cannot lower: {}",
-                path, e
+                "{path:?} emits MLIR its own compiler cannot lower: {e}"
             ))
         }
         (Ok(_), Some(reason)) => {
             return Err(format!(
-                "{:?} is marked `XFAIL-LOWER: {}`, but it lowers now. Remove the marker.",
-                path, reason
+                "{path:?} is marked `XFAIL-LOWER: {reason}`, but it lowers now. Remove the marker."
             ))
         }
         _ => {}
@@ -391,8 +383,7 @@ fn run_warning_test(path: &Path) -> Result<(), String> {
         .collect();
     if want.is_empty() {
         return Err(format!(
-            "Warning test {:?} has no `// WARN:` directives",
-            path
+            "Warning test {path:?} has no `// WARN:` directives"
         ));
     }
     // `// NO-WARN:` is the other direction: text that must NOT appear in any warning. A
@@ -408,7 +399,7 @@ fn run_warning_test(path: &Path) -> Result<(), String> {
     let mut loader = vxc::module_loader::ModuleLoader::new();
     loader
         .load_main(path.to_str().unwrap())
-        .map_err(|e| format!("Parse failed on {:?}: {}", path, e))?;
+        .map_err(|e| format!("Parse failed on {path:?}: {e}"))?;
     let mut program_arr = loader.into_programs().expect("the fixture should load");
     let syntax_idx = program_arr
         .iter()
@@ -437,7 +428,7 @@ fn run_warning_test(path: &Path) -> Result<(), String> {
     }
     expander
         .expand_module(&mut program)
-        .map_err(|e| format!("Macro expansion failed on {:?}: {}", path, e))?;
+        .map_err(|e| format!("Macro expansion failed on {path:?}: {e}"))?;
 
     let global_session = std::sync::Arc::new(vxc::session::GlobalSession::new(1));
     let mut all_programs = program_arr.clone();
@@ -457,7 +448,7 @@ fn run_warning_test(path: &Path) -> Result<(), String> {
         .errors
         .iter()
         .filter(|d| d.level == vxc::diagnostic::DiagnosticLevel::Error)
-        .map(|d| d.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
     if !errors.is_empty() {
         return Err(format!(
@@ -471,7 +462,7 @@ fn run_warning_test(path: &Path) -> Result<(), String> {
         .errors
         .iter()
         .filter(|d| d.level == vxc::diagnostic::DiagnosticLevel::Warning)
-        .map(|d| d.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
     for w in &want {
         if !warnings.iter().any(|got| got.contains(w.as_str())) {
@@ -486,9 +477,8 @@ fn run_warning_test(path: &Path) -> Result<(), String> {
     for w in &unwanted {
         if let Some(got) = warnings.iter().find(|got| got.contains(w.as_str())) {
             return Err(format!(
-                "NO-WARN check failed on {:?}: `{}` was not supposed to be warned about, \
-                 but got `{}`.",
-                path, w, got
+                "NO-WARN check failed on {path:?}: `{w}` was not supposed to be warned about, \
+                 but got `{got}`."
             ));
         }
     }
@@ -553,7 +543,7 @@ fn run_backend_test(path: &Path) -> Result<(), String> {
         }
     }
     if let Err(e) = expander.expand_module(&mut program) {
-        return Err(format!("Macro expansion failed on {:?}: {}", path, e));
+        return Err(format!("Macro expansion failed on {path:?}: {e}"));
     }
 
     let global_session = std::sync::Arc::new(vxc::session::GlobalSession::new(1));
@@ -676,8 +666,7 @@ fn run_backend_test(path: &Path) -> Result<(), String> {
     for expect in expect_lines {
         if !expect_matches(&out, &expect) {
             return Err(format!(
-                "Backend output mismatch on {:?}.\nExpected to find: `{}`\nActual Output:\n{}",
-                path, expect, out
+                "Backend output mismatch on {path:?}.\nExpected to find: `{expect}`\nActual Output:\n{out}"
             ));
         }
     }
@@ -739,7 +728,7 @@ fn test_optimizations() -> Result<(), String> {
                 let path = entry.path();
                 let ext = path.extension().and_then(|s| s.to_str());
                 if path.is_file() && (ext == Some("mlr") || ext == Some("vx")) {
-                    println!("Running test_optimizations on {:?}", path);
+                    println!("Running test_optimizations on {path:?}");
                     if let Err(e) = run_optimization_test(&path) {
                         return Some(e);
                     }
@@ -767,7 +756,7 @@ fn test_optimizations() -> Result<(), String> {
 /// `// XFAIL-RUN:` marks a fixture whose RUN line cannot pass yet. Read in both directions, as
 /// `XFAIL-LOWER` is: a marked fixture whose RUN line starts passing fails too.
 fn run_the_run_lines(path: &Path) -> Result<(), String> {
-    let source = fs::read_to_string(path).map_err(|e| format!("{:?}: {}", path, e))?;
+    let source = fs::read_to_string(path).map_err(|e| format!("{path:?}: {e}"))?;
 
     // The same gate the fixture runners apply. `run_middle_end_test` skipped a macOS-only file
     // and this ran its RUN line anyway, so a CHECK for IR that only a macOS-registered plugin
@@ -779,7 +768,7 @@ fn run_the_run_lines(path: &Path) -> Result<(), String> {
     let runs: Vec<&str> = source
         .lines()
         .filter_map(|l| l.trim().strip_prefix("// RUN:"))
-        .map(|c| c.trim())
+        .map(str::trim)
         .collect();
     let xfail_run = source
         .lines()
@@ -787,8 +776,7 @@ fn run_the_run_lines(path: &Path) -> Result<(), String> {
         .map(|l| l.split_once("XFAIL-RUN:").unwrap().1.trim().to_string());
     if runs.is_empty() {
         return Err(format!(
-            "{:?} has no RUN line, so nothing states what the compiler should do with it",
-            path
+            "{path:?} has no RUN line, so nothing states what the compiler should do with it"
         ));
     }
 
@@ -804,12 +792,12 @@ fn run_the_run_lines(path: &Path) -> Result<(), String> {
             .replace("%s", &path.to_string_lossy())
             .replace("%t", &tmp_base.to_string_lossy());
         // `vxc` as a bare word is the binary under test, not whatever is on PATH.
-        let cmd = cmd.replacen("vxc ", &format!("{} ", vxc), 1);
+        let cmd = cmd.replacen("vxc ", &format!("{vxc} "), 1);
         let out = std::process::Command::new("bash")
             .arg("-c")
             .arg(&cmd)
             .output()
-            .map_err(|e| format!("{:?}: could not run `{}`: {}", path, run, e))?;
+            .map_err(|e| format!("{path:?}: could not run `{run}`: {e}"))?;
         if !out.status.success() {
             failure = Some(format!(
                 "{:?}: RUN line failed: {}\n{}",
@@ -828,8 +816,7 @@ fn run_the_run_lines(path: &Path) -> Result<(), String> {
     match (failure, xfail_run) {
         (Some(why), None) => Err(why),
         (None, Some(reason)) => Err(format!(
-            "{:?} is marked `XFAIL-RUN: {}`, but its RUN line passes now. Remove the marker.",
-            path, reason
+            "{path:?} is marked `XFAIL-RUN: {reason}`, but its RUN line passes now. Remove the marker."
         )),
         _ => Ok(()),
     }
@@ -899,10 +886,10 @@ fn run_optimization_test(path: &Path) -> Result<(), String> {
 }
 
 /// Execute a file's `// RUN:` lines through a shell, so `| FileCheck %s` runs the real
-/// FileCheck and every directive it understands works: `{{regex}}` holes, `CHECK-NEXT`,
+/// `FileCheck` and every directive it understands works: `{{regex}}` holes, `CHECK-NEXT`,
 /// `CHECK-SAME`, `CHECK-DAG`, `CHECK-COUNT`, capture variables.
 ///
-/// This used to reimplement FileCheck as an ordered substring scan over `CHECK:` and
+/// This used to reimplement `FileCheck` as an ordered substring scan over `CHECK:` and
 /// `CHECK-NOT:`, which meant the pipe in the RUN line was decoration -- anything else a
 /// file wrote had to be refused, or it would pass while asserting nothing (Vx#407).
 ///
@@ -926,7 +913,7 @@ fn run_lit_test(path: &Path, force_legacy: bool) -> Result<(), String> {
         .filter(|l| l.trim_start().starts_with("// RUN:"))
         .collect();
     if run_lines.is_empty() {
-        return Err(format!("{:?} has no // RUN: line", path));
+        return Err(format!("{path:?} has no // RUN: line"));
     }
 
     // `// XFAIL: *` marks a RUN line that cannot pass yet because the compiler is wrong,
@@ -943,9 +930,8 @@ fn run_lit_test(path: &Path, force_legacy: bool) -> Result<(), String> {
         .any(|l| l.trim_start().starts_with("// CHECK"));
     if states_checks && !xfail && !run_lines.iter().any(|l| l.contains("FileCheck")) {
         return Err(format!(
-            "{:?} states CHECK lines, but no RUN line pipes into FileCheck, so nothing \
-             matches them.",
-            path
+            "{path:?} states CHECK lines, but no RUN line pipes into FileCheck, so nothing \
+             matches them."
         ));
     }
 
@@ -999,7 +985,7 @@ fn run_lit_test(path: &Path, force_legacy: bool) -> Result<(), String> {
         // happened to satisfy the CHECK lines.
         let output = std::process::Command::new("bash")
             .arg("-c")
-            .arg(format!("set -o pipefail; {}", cmd))
+            .arg(format!("set -o pipefail; {cmd}"))
             .env("PATH", &path_var)
             .env("RUST_BACKTRACE", "1")
             .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -1025,9 +1011,8 @@ fn run_lit_test(path: &Path, force_legacy: bool) -> Result<(), String> {
     }
     if xfail {
         return Err(format!(
-            "{:?} is marked XFAIL, but every RUN line succeeded. The bug it waits on is \
-             fixed: drop the XFAIL and restore the assertions.",
-            path
+            "{path:?} is marked XFAIL, but every RUN line succeeded. The bug it waits on is \
+             fixed: drop the XFAIL and restore the assertions."
         ));
     }
     Ok(())
@@ -1077,9 +1062,9 @@ fn test_middle_end_fail() -> Result<(), String> {
 #[test]
 fn test_crash() -> Result<(), String> {
     for i in 0..5 {
-        println!("test_crash iteration {}", i);
+        println!("test_crash iteration {i}");
         run_backend_test(Path::new("tests/backend/pass/plugin_npe.vx"))?;
-        println!("test_crash iteration {} done", i);
+        println!("test_crash iteration {i} done");
     }
     Ok(())
 }
@@ -1090,7 +1075,7 @@ fn test_backend() -> Result<(), String> {
     run_directory_tests(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/backend/pass"),
         |path| {
-            println!("Running test_backend on {:?}", path);
+            println!("Running test_backend on {path:?}");
             run_backend_test(path)?;
             // Any file that states CHECK lines, or whose RUN line names FileCheck, gets
             // those RUN lines executed. Matching on one exact spelling of the RUN line
@@ -1123,7 +1108,7 @@ fn test_frontend_pass_modules() -> Result<(), String> {
         "tests/frontend/pass/modules_nested",
     ] {
         run_directory_tests(Path::new(env!("CARGO_MANIFEST_DIR")).join(dir), |path| {
-            println!("Running test_frontend_pass_modules on {:?}", path);
+            println!("Running test_frontend_pass_modules on {path:?}");
             run_frontend_test(path, true)
         })?;
     }
@@ -1142,10 +1127,7 @@ fn test_frontend_pass_formal_verification() -> Result<(), String> {
     run_directory_tests(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/pass/formal_verification"),
         |path| {
-            println!(
-                "Running test_frontend_pass_formal_verification on {:?}",
-                path
-            );
+            println!("Running test_frontend_pass_formal_verification on {path:?}");
             run_frontend_test(path, true)
         },
     )
@@ -1163,10 +1145,7 @@ fn test_frontend_fail_formal_verification() -> Result<(), String> {
     run_directory_tests(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/fail/formal_verification"),
         |path| {
-            println!(
-                "Running test_frontend_fail_formal_verification on {:?}",
-                path
-            );
+            println!("Running test_frontend_fail_formal_verification on {path:?}");
             run_shell_tests(path)
         },
     )
@@ -1177,7 +1156,7 @@ fn test_frontend_fail_unimplemented_smt() -> Result<(), String> {
     run_directory_tests(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/fail/unimplemented_smt"),
         |path| {
-            println!("Running test_frontend_fail_unimplemented_smt on {:?}", path);
+            println!("Running test_frontend_fail_unimplemented_smt on {path:?}");
             run_shell_tests(path)
         },
     )
@@ -1190,7 +1169,7 @@ fn test_frontend_pass_packages() -> Result<(), String> {
     run_directory_tests(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frontend/pass/packages"),
         |path| {
-            println!("Running test_frontend_pass_packages on {:?}", path);
+            println!("Running test_frontend_pass_packages on {path:?}");
             run_shell_tests(path)
         },
     )
@@ -1201,7 +1180,7 @@ fn test_backend_pass_autodiff() -> Result<(), String> {
     run_directory_tests(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/backend/pass/autodiff"),
         |path| {
-            println!("Running test_backend_pass_autodiff on {:?}", path);
+            println!("Running test_backend_pass_autodiff on {path:?}");
             run_backend_autodiff_test(path)
         },
     )
@@ -1256,7 +1235,7 @@ fn run_backend_autodiff_test(path: &Path) -> Result<(), String> {
         }
     }
     if let Err(e) = expander.expand_module(&mut program) {
-        return Err(format!("Macro expansion failed on {:?}: {}", path, e));
+        return Err(format!("Macro expansion failed on {path:?}: {e}"));
     }
 
     let global_session = std::sync::Arc::new(vxc::session::GlobalSession::new(1));
@@ -1344,8 +1323,7 @@ fn run_backend_autodiff_test(path: &Path) -> Result<(), String> {
         for expect in expect_lines {
             if !mlir_str.contains(&expect) {
                 return Err(format!(
-                    "MLIR Output mismatch on {:?}.\nExpected to find: `{}`\nActual MLIR:\n{}",
-                    path, expect, mlir_str
+                    "MLIR Output mismatch on {path:?}.\nExpected to find: `{expect}`\nActual MLIR:\n{mlir_str}"
                 ));
             }
         }
@@ -1365,8 +1343,7 @@ fn run_backend_autodiff_test(path: &Path) -> Result<(), String> {
     for expect in expect_lines {
         if !mlir_str.contains(&expect) && !out.contains(&expect) {
             return Err(format!(
-                "Output mismatch on {:?}.\nExpected to find: `{}`\nActual Output:\n{}\nMLIR:\n{}",
-                path, expect, out, mlir_str
+                "Output mismatch on {path:?}.\nExpected to find: `{expect}`\nActual Output:\n{out}\nMLIR:\n{mlir_str}"
             ));
         }
     }
@@ -1391,7 +1368,10 @@ fn vx_files_under(dir: &Path, skip: &[&str], out: &mut Vec<std::path::PathBuf>) 
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
-    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    let mut entries: Vec<_> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.path())
+        .collect();
     entries.sort();
     for path in entries {
         if path.is_dir() {
@@ -1454,16 +1434,16 @@ where
                     let result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test_fn(&path)));
                     match result {
-                        Ok(Err(msg)) => return Some(format!("Test {:?} failed: {}", path, msg)),
+                        Ok(Err(msg)) => return Some(format!("Test {path:?} failed: {msg}")),
                         Err(e) => {
                             let msg = if let Some(s) = e.downcast_ref::<&str>() {
                                 s.to_string()
                             } else if let Some(s) = e.downcast_ref::<String>() {
-                                s.to_string()
+                                s.clone()
                             } else {
                                 "Unknown panic".to_string()
                             };
-                            return Some(format!("Test {:?} panicked: {}", path, msg));
+                            return Some(format!("Test {path:?} panicked: {msg}"));
                         }
                         Ok(Ok(())) => {}
                     }
@@ -1512,7 +1492,7 @@ fn test_melior_matmul() -> Result<(), String> {
         vxc::resolver::collect_trait_defaults(program_arr.iter().chain(std::iter::once(&program)));
     let expander = vxc::parser::MacroExpander::new(&global_macros, &trait_defaults);
     if let Err(e) = expander.expand_module(&mut program) {
-        return Err(format!("Macro expansion failed on {:?}: {}", path, e));
+        return Err(format!("Macro expansion failed on {path:?}: {e}"));
     }
 
     let global_session = std::sync::Arc::new(vxc::session::GlobalSession::new(1));

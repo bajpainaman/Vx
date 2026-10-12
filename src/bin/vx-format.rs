@@ -35,16 +35,16 @@ struct Cli {
 fn process_file(file_path: &str, indent_spaces: usize) -> anyhow::Result<()> {
     let path = Path::new(file_path);
     if !path.exists() {
-        anyhow::bail!("File not found: {}", file_path);
+        anyhow::bail!("File not found: {file_path}");
     }
 
     let content = fs::read_to_string(path)?;
     let formatted = format_file(&content, indent_spaces);
-    if formatted != content {
-        fs::write(path, formatted)?;
-        println!("Formatted {}", file_path);
+    if formatted == content {
+        println!("Unchanged {file_path}");
     } else {
-        println!("Unchanged {}", file_path);
+        fs::write(path, formatted)?;
+        println!("Formatted {file_path}");
     }
     Ok(())
 }
@@ -54,7 +54,7 @@ fn main() {
 
     cli.files.par_iter().for_each(|file_path| {
         if let Err(e) = process_file(file_path, cli.indent) {
-            eprintln!("Error processing {}: {:?}", file_path, e);
+            eprintln!("Error processing {file_path}: {e:?}");
         }
     });
 }

@@ -210,7 +210,7 @@ enum CodegenPath {
     Flat,
     Ast(Vec<String>),
     /// The flat path declined and the AST fallback then FAILED to compile (nonzero exit):
-    /// the program does not build on the default path at all. Tracked in KNOWN_BROKEN (Vx#398)
+    /// the program does not build on the default path at all. Tracked in `KNOWN_BROKEN` (Vx#398)
     /// so the set can only shrink.
     AstBroken(Vec<String>),
 }
@@ -286,7 +286,10 @@ fn flat_path_coverage_of_the_backend_corpus_holds() {
         "optimizations/pass",
         "warnings/pass",
     ];
-    let expected: BTreeSet<String> = KNOWN_DECLINES.iter().map(|s| s.to_string()).collect();
+    let expected: BTreeSet<String> = KNOWN_DECLINES
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
 
     let mut declined = BTreeSet::new();
     let mut fallback_broken = BTreeSet::new();
@@ -386,7 +389,10 @@ fn flat_path_coverage_of_the_backend_corpus_holds() {
         flat_count + declined.len()
     );
 
-    let broken_expected: BTreeSet<String> = KNOWN_BROKEN.iter().map(|s| s.to_string()).collect();
+    let broken_expected: BTreeSet<String> = KNOWN_BROKEN
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
     let newly_broken: Vec<_> = fallback_broken
         .difference(&broken_expected)
         .cloned()

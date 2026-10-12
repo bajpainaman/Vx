@@ -76,7 +76,7 @@ fn filter_existing_checks(content: &str, prefixes: &[String]) -> Vec<String> {
     for line in content.lines() {
         let mut is_check = false;
         for prefix in prefixes {
-            let check_str = format!("// {}:", prefix);
+            let check_str = format!("// {prefix}:");
             if line.trim().starts_with(&check_str) {
                 is_check = true;
                 break;
@@ -94,7 +94,7 @@ fn filter_existing_checks(content: &str, prefixes: &[String]) -> Vec<String> {
             break;
         }
     }
-    new_lines.push("".to_string());
+    new_lines.push(String::new());
     new_lines
 }
 
@@ -133,7 +133,7 @@ fn extract_mlir_checks(stdout: &str, prefix: &str) -> Vec<String> {
         if !in_mlir || line.trim().is_empty() {
             continue;
         }
-        checks.push(format!("// {}: {}", prefix, line));
+        checks.push(format!("// {prefix}: {line}"));
     }
     checks
 }
@@ -151,25 +151,25 @@ fn extract_llvm_checks(stdout: &str, prefix: &str) -> Vec<String> {
         if !in_llvm || line.trim().is_empty() {
             continue;
         }
-        checks.push(format!("// {}: {}", prefix, line));
+        checks.push(format!("// {prefix}: {line}"));
     }
     checks
 }
 
 fn process_test_file(file_path: &str, vxc_bin: &Path) {
-    println!("Updating {}...", file_path);
+    println!("Updating {file_path}...");
 
     let original_content = match fs::read_to_string(file_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Warning: Failed to read {}: {}", file_path, e);
+            eprintln!("Warning: Failed to read {file_path}: {e}");
             return;
         }
     };
 
     let (runs, prefixes) = parse_run_lines(&original_content, file_path);
     if runs.is_empty() {
-        eprintln!("Warning: No RUN lines found in {}", file_path);
+        eprintln!("Warning: No RUN lines found in {file_path}");
         return;
     }
 
@@ -180,7 +180,7 @@ fn process_test_file(file_path: &str, vxc_bin: &Path) {
 
         let exec_name = args.remove(0);
         if exec_name != "vxc" && exec_name != "vx-opt" {
-            eprintln!("Unknown executable in RUN line: {}", exec_name);
+            eprintln!("Unknown executable in RUN line: {exec_name}");
             continue;
         }
 
@@ -200,18 +200,16 @@ fn process_test_file(file_path: &str, vxc_bin: &Path) {
         };
 
         new_lines.extend(checks);
-        new_lines.push("".to_string());
+        new_lines.push(String::new());
     }
 
     let new_content = new_lines.join("\n");
-    if new_content != original_content {
-        if let Err(e) = fs::write(file_path, new_content) {
-            eprintln!("Error writing {}: {}", file_path, e);
-        } else {
-            println!("  Updated.");
-        }
-    } else {
+    if new_content == original_content {
         println!("  Unchanged.");
+    } else if let Err(e) = fs::write(file_path, new_content) {
+        eprintln!("Error writing {file_path}: {e}");
+    } else {
+        println!("  Updated.");
     }
 }
 

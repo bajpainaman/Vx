@@ -20,6 +20,11 @@ instantiate_option_ffi!(i64, i64);
 instantiate_option_ffi!(f64, f64);
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 

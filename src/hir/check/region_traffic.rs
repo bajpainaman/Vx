@@ -38,7 +38,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::{BinaryOp, Expr, MemorySpace, Statement, Topology, Type, TypeChecker, UnaryOp};
 use crate::hir::check::raw::overflowed;
 use std::collections::BTreeMap;
 
@@ -74,12 +74,22 @@ impl RegionAcc {
         e
     }
 
+    /// Adds `bytes` to what has been read from `buffer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the total no longer fits in 64 bits.
     fn add_read(&mut self, buffer: &str, space: &MemorySpace, bytes: u64) -> Result<(), String> {
         let e = self.slot(buffer, space);
         e.read = e.read.checked_add(bytes).ok_or_else(overflowed)?;
         Ok(())
     }
 
+    /// Adds `bytes` to what has been written to `buffer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the total no longer fits in 64 bits.
     fn add_written(&mut self, buffer: &str, space: &MemorySpace, bytes: u64) -> Result<(), String> {
         let e = self.slot(buffer, space);
         e.written = e.written.checked_add(bytes).ok_or_else(overflowed)?;
@@ -94,7 +104,7 @@ impl RegionAcc {
         for (key, b) in &other.per_buffer {
             let e = out.per_buffer.entry(key.clone()).or_default();
             if e.space.is_none() {
-                e.space = b.space.clone();
+                e.space.clone_from(&b.space);
             }
             e.read = e.read.max(b.read);
             e.written = e.written.max(b.written);
@@ -121,6 +131,30 @@ type PlacedMap = std::collections::HashMap<String, Placed>;
 /// Names bound inside the region body: `Some` when the binding is placed, `None` when the walk
 /// has determined it is not. A body-local `let` shadows an outer name of the same spelling.
 type Bindings = std::collections::HashMap<String, Option<Placed>>;
+
+/// What a walk over one `spawn` region carries from one statement to the next.
+struct RegionWalk<'a> {
+    /// How many times the code being walked runs: the product of the trip counts of the
+    /// loops around it.
+    mult: u64,
+    /// Bytes counted so far, per buffer.
+    acc: RegionAcc,
+    /// `false` once the two sides of a branch moved different bytes, which makes the count
+    /// an upper bound instead of an exact figure.
+    exact: bool,
+    /// The placed names of the scopes around the region.
+    outer: &'a PlacedMap,
+}
+
+/// What a call argument is, as far as placement goes.
+enum CallArg {
+    /// A placed tensor, or a part of one.
+    Placed,
+    /// Known not to be a placed tensor.
+    NotPlaced,
+    /// The walk cannot tell, so it could be a placed tensor.
+    Unresolvable,
+}
 
 /// Does this subtree contain any index access at all?
 ///
@@ -160,12 +194,12 @@ fn mentions_any(e: &Expr, names: impl Iterator<Item = String>) -> bool {
         .any(|n| rendered.contains(&format!("\"{n}\"")))
 }
 
-impl<'a> TypeChecker<'a> {
+impl TypeChecker<'_> {
     /// The memory space a value of type `ty` is PLACED in, or `None` if it is not placed.
     ///
     /// Deliberately not `value_memory_space`, which falls back to the space of the ambient
     /// topology when a type carries no placement of its own. Inside a `spawn on(Topology::GPU)`
-    /// that fallback reports GPU_HBM for an ordinary `Tensor<f32>([1, 2])` declared in the
+    /// that fallback reports `GPU_HBM` for an ordinary `Tensor<f32>([1, 2])` declared in the
     /// body -- a scratch tile that was never transferred anywhere. Counting it would put
     /// kernel-local scratch into the device-memory traffic figure, which is exactly the kind
     /// of plausible-but-wrong number this stage must not publish.
@@ -195,7 +229,12 @@ impl<'a> TypeChecker<'a> {
     /// review established: rounding i4 to a byte made a faithful copy report the same 2.0
     /// ratio that is this stage's evidence of waste, and a figure indistinguishable from the
     /// thing it exists to detect is worse than no figure.
-    fn region_elem_bytes(&self, ty: &Type) -> Result<u64, String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when `ty` is not a tensor, or its elements have no known width or
+    /// are not a whole number of bytes.
+    fn region_elem_bytes(ty: &Type) -> Result<u64, String> {
         // `as_tensor_operand` already peels `Pinned`/`Ref`/`Borrow`/`Pointer` down to the
         // tensor, so the placement wrapper needs no unwrapping here.
         let (elem, _, _) = Self::as_tensor_operand(ty)
@@ -219,7 +258,7 @@ impl<'a> TypeChecker<'a> {
     pub(crate) fn placed_names_snapshot(&self) -> PlacedMap {
         let mut out = PlacedMap::new();
         // Outermost first, so an inner scope's binding overwrites (shadows) an outer one.
-        for scope in self.scopes.iter() {
+        for scope in &self.scopes {
             for (name, (ty, _)) in scope {
                 let Some(space) = self.placed_space(ty) else {
                     // Shadowed by an UNPLACED binding of the same name: the outer placed
@@ -228,7 +267,7 @@ impl<'a> TypeChecker<'a> {
                     out.remove(name.as_ref());
                     continue;
                 };
-                let entry = match self.region_elem_bytes(ty) {
+                let entry = match Self::region_elem_bytes(ty) {
                     Ok(elem) => Ok((space, elem)),
                     Err(why) => Err(why),
                 };
@@ -240,7 +279,7 @@ impl<'a> TypeChecker<'a> {
 
     /// What a name denotes during a region walk: a body-local binding first (it shadows),
     /// then the snapshot of the enclosing scopes.
-    fn region_placed(&self, name: &str, outer: &PlacedMap, binds: &Bindings) -> Option<Placed> {
+    fn region_placed(name: &str, outer: &PlacedMap, binds: &Bindings) -> Option<Placed> {
         if let Some(entry) = binds.get(name) {
             return entry.clone();
         }
@@ -252,8 +291,12 @@ impl<'a> TypeChecker<'a> {
     ///
     /// `a[i][d]` nests: the outer `IndexAccess`'s base is another `IndexAccess`. Peeling to
     /// the identifier is what makes a rank-2 access ONE touch rather than two.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the base is not a plain name, or names a placed buffer whose
+    /// element size cannot be counted.
     fn indexed_buffer(
-        &self,
         e: &Expr,
         outer: &PlacedMap,
         binds: &Bindings,
@@ -282,7 +325,7 @@ impl<'a> TypeChecker<'a> {
             );
         };
         let name = id.name.as_ref().to_string();
-        match self.region_placed(&name, outer, binds) {
+        match Self::region_placed(&name, outer, binds) {
             Some(Ok((space, elem))) => Ok(Some((name, space, elem))),
             Some(Err(why)) => Err(why),
             None => Ok(None),
@@ -301,14 +344,14 @@ impl<'a> TypeChecker<'a> {
     /// `Not` but not `Neg`. Checked integer arithmetic here, and anything not exactly foldable
     /// -- `Div`, whose truncation this does not model, included -- still returns `None`, which
     /// is the refusal direction.
-    fn const_i64(&self, e: &Expr) -> Option<i64> {
+    fn const_i64(e: &Expr) -> Option<i64> {
         match e {
             Expr::Number(n) => n.value.as_ref().parse::<i64>().ok(),
             Expr::UnaryOp(u) if matches!(u.op, UnaryOp::Neg) => {
-                self.const_i64(&u.expr)?.checked_neg()
+                Self::const_i64(&u.expr)?.checked_neg()
             }
             Expr::BinaryOp(b) => {
-                let (l, r) = (self.const_i64(&b.lhs)?, self.const_i64(&b.rhs)?);
+                let (l, r) = (Self::const_i64(&b.lhs)?, Self::const_i64(&b.rhs)?);
                 match b.op {
                     BinaryOp::Add => l.checked_add(r),
                     BinaryOp::Sub => l.checked_sub(r),
@@ -329,28 +372,38 @@ impl<'a> TypeChecker<'a> {
         let Expr::Range(r) = iterable else {
             return None;
         };
-        let lit = |e: &Expr| -> Option<i64> { self.const_i64(&self.fold_raw_extent(e)) };
+        let lit = |e: &Expr| -> Option<i64> { Self::const_i64(&self.fold_raw_extent(e)) };
         let (a, b) = (lit(&r.start)?, lit(&r.end)?);
-        Some(if b > a { (b - a) as u64 } else { 0 })
+        Some(if b > a { b.abs_diff(a) } else { 0 })
     }
 
     /// Count one `spawn` region, or say why it cannot be counted.
     ///
     /// Run while the region's scope is still live, so free names in the body resolve to the
     /// enclosing function's placed values.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when anything in the region cannot be counted exactly, or a total
+    /// no longer fits in 64 bits.
     pub(crate) fn derive_spawn_traffic(
         &self,
         stmts: &[Statement],
         ret: Option<&Expr>,
         outer: &PlacedMap,
     ) -> Result<(crate::report::Traffic, Vec<crate::report::BufferTraffic>), String> {
-        let mut acc = RegionAcc::default();
-        let mut exact = true;
+        let mut walk = RegionWalk {
+            mult: 1,
+            acc: RegionAcc::default(),
+            exact: true,
+            outer,
+        };
         let mut binds = Bindings::new();
-        self.region_stmts(stmts, 1, &mut acc, &mut exact, outer, &mut binds, true)?;
+        self.region_stmts(stmts, &mut walk, &mut binds, true)?;
         if let Some(r) = ret {
-            self.region_expr(r, 1, &mut acc, &mut exact, outer, &mut binds)?;
+            self.region_expr(r, &mut walk, &mut binds)?;
         }
+        let RegionWalk { acc, exact, .. } = walk;
 
         // Per buffer, sorted by name (the BTreeMap already is), then folded into per-space
         // totals sorted by space name so the record is stable run to run.
@@ -393,94 +446,29 @@ impl<'a> TypeChecker<'a> {
         ))
     }
 
-    // Eight parameters, one over the lint's threshold. This is a recursive walker threading four
-    // pieces of mutable state (`acc`, `exact`, `binds`, and the `mult`/`top_level` position) down
-    // an AST, and the alternative -- bundling them into a context struct -- is a refactor of the
-    // traversal rather than a fix for a lint. Left as-is deliberately; see Vx#361, which is where
-    // this became visible.
-    #[allow(clippy::too_many_arguments)]
+    /// Counts the statements of a block. `top_level` is true for the region's own body and
+    /// false for a block nested inside it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when a statement cannot be counted exactly.
     fn region_stmts(
         &self,
         stmts: &[Statement],
-        mult: u64,
-        acc: &mut RegionAcc,
-        exact: &mut bool,
-        outer: &PlacedMap,
+        walk: &mut RegionWalk<'_>,
         binds: &mut Bindings,
         top_level: bool,
     ) -> Result<(), String> {
         for s in stmts {
             match s {
-                Statement::LetDecl(l) => {
-                    self.region_expr(&l.expr, mult, acc, exact, outer, binds)?;
-                    // Record what this name now denotes, so a later index through it is
-                    // attributed to the right space -- and so a scratch tile declared in the
-                    // body is remembered as unplaced rather than resolved against an outer
-                    // name that happens to match.
-                    //
-                    // An initializer the resolver does not recognise (a call, an if-, a
-                    // match-expression) can still RETURN a placed tensor, and calling that
-                    // "unplaced" published exact-zero traffic for every read through the
-                    // binding (found by the codegen review). At the region's top level the
-                    // checker has already typed the binding and its scope is still live, so
-                    // its answer is authoritative. In a nested block that scope is gone by
-                    // walk time and a name lookup could hit an OUTER same-name binding, so
-                    // the honest verdict is Err -- uncountable, with a reason -- not a guess
-                    // in either direction.
-                    let placed = self
-                        .region_binding_placed(&l.expr, outer, binds)
-                        .or_else(|| {
-                            if !Self::init_can_carry_placement(&l.expr) {
-                                return None;
-                            }
-                            // A type annotation settles it wherever the binding lives: an
-                            // annotated-unplaced `let m_new : f32 = if ...` is provably not a
-                            // tensor, nested or not, and an annotated-placed one carries its
-                            // space on its face. Without this, every scalar if-expression
-                            // binding inside a loop was refused -- which took a blocked
-                            // fixture's count from exact to absent, the wrong direction.
-                            if let Some(ann) = &l.ty_ann {
-                                return self.placed_space(ann).map(|space| {
-                                    match self.region_elem_bytes(ann) {
-                                        Ok(elem) => Ok((space, elem)),
-                                        Err(why) => Err(why),
-                                    }
-                                });
-                            }
-                            if top_level {
-                                match self.lookup(l.name.as_ref()) {
-                                    Some((ty, _)) => match self.placed_space(ty) {
-                                        Some(space) => {
-                                            let ty = ty.clone();
-                                            Some(match self.region_elem_bytes(&ty) {
-                                                Ok(elem) => Ok((space, elem)),
-                                                Err(why) => Err(why),
-                                            })
-                                        }
-                                        None => None,
-                                    },
-                                    None => {
-                                        Some(Err("a region binding's type could not be resolved"
-                                            .to_string()))
-                                    }
-                                }
-                            } else {
-                                Some(Err(
-                                    "a nested region binding is initialized by an expression \
-                                     this counter cannot resolve"
-                                        .to_string(),
-                                ))
-                            }
-                        });
-                    binds.insert(l.name.as_ref().to_string(), placed);
-                }
+                Statement::LetDecl(l) => self.region_let(l, walk, binds, top_level)?,
                 Statement::Return(r) => {
                     if let Some(e) = &r.expr {
-                        self.region_expr(e, mult, acc, exact, outer, binds)?
+                        self.region_expr(e, walk, binds)?;
                     }
                 }
                 Statement::ExprStmt(e) => {
-                    self.region_expr(&e.expr, mult, acc, exact, outer, binds)?
+                    self.region_expr(&e.expr, walk, binds)?;
                 }
                 Statement::Assign(a) => {
                     // The right-hand side is evaluated first, and every placed index in it is
@@ -489,9 +477,9 @@ impl<'a> TypeChecker<'a> {
                     // ordinary expression (which is what the lowering counter does, where an
                     // lhs is never an indexed tile) would book `o[i][d] = ...` as a read of
                     // `o` that the program never performs.
-                    self.region_expr(&a.rhs, mult, acc, exact, outer, binds)?;
-                    self.region_subscripts(&a.lhs, mult, acc, exact, outer, binds)?;
-                    self.region_write(&a.lhs, mult, acc, outer, binds)?;
+                    self.region_expr(&a.rhs, walk, binds)?;
+                    self.region_subscripts(&a.lhs, walk, binds)?;
+                    Self::region_write(&a.lhs, walk, binds)?;
                 }
                 Statement::CompoundAssign(c) => {
                     // `x += y` reads the destination, then writes it. Missing the read is the
@@ -502,29 +490,14 @@ impl<'a> TypeChecker<'a> {
                     // count its subscripts twice -- harmless for `o[i][d]`, where the indices
                     // are scalars, but a real over-count for `o[p[0]] += ...`, where the
                     // subscript is itself a read of a placed buffer.
-                    self.region_expr(&c.rhs, mult, acc, exact, outer, binds)?;
-                    self.region_expr(&c.lhs, mult, acc, exact, outer, binds)?;
-                    self.region_write(&c.lhs, mult, acc, outer, binds)?;
+                    self.region_expr(&c.rhs, walk, binds)?;
+                    self.region_expr(&c.lhs, walk, binds)?;
+                    Self::region_write(&c.lhs, walk, binds)?;
                 }
                 Statement::Assert(a) => {
-                    self.region_expr(&a.expr, mult, acc, exact, outer, binds)?
+                    self.region_expr(&a.expr, walk, binds)?;
                 }
-                Statement::ForLoop(fl) => {
-                    self.region_expr(&fl.iterable, mult, acc, exact, outer, binds)?;
-                    let trips = self.region_trip_count(&fl.iterable).ok_or_else(|| {
-                        "a loop bound in the region is not statically known, so the number of \
-                         times its body runs cannot be counted"
-                            .to_string()
-                    })?;
-                    let next = mult.checked_mul(trips).ok_or_else(|| {
-                        "the region's loop nest trip count overflows a 64-bit counter".to_string()
-                    })?;
-                    // The induction variable is a fresh scalar, and the body's own bindings
-                    // must not leak out of the loop.
-                    let mut inner = binds.clone();
-                    inner.insert(fl.iter.clone(), None);
-                    self.region_stmts(&fl.body, next, acc, exact, outer, &mut inner, false)?;
-                }
+                Statement::ForLoop(fl) => self.region_for_loop(fl, walk, binds)?,
                 Statement::Loop(_) => {
                     return Err(
                         "the region contains an unbounded `loop`, which runs an unknown number \
@@ -550,6 +523,113 @@ impl<'a> TypeChecker<'a> {
                 Statement::Drop(_) | Statement::Error(_) => {}
             }
         }
+        Ok(())
+    }
+
+    /// Counts a `let`: the reads of its initializer, and then what the new name stands for.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the initializer cannot be counted exactly.
+    fn region_let(
+        &self,
+        l: &crate::syntax::LetDeclStmt,
+        walk: &mut RegionWalk<'_>,
+        binds: &mut Bindings,
+        top_level: bool,
+    ) -> Result<(), String> {
+        self.region_expr(&l.expr, walk, binds)?;
+        // Record what this name now denotes, so a later index through it is
+        // attributed to the right space -- and so a scratch tile declared in the
+        // body is remembered as unplaced rather than resolved against an outer
+        // name that happens to match.
+        //
+        // An initializer the resolver does not recognise (a call, an if-, a
+        // match-expression) can still RETURN a placed tensor, and calling that
+        // "unplaced" published exact-zero traffic for every read through the
+        // binding (found by the codegen review). At the region's top level the
+        // checker has already typed the binding and its scope is still live, so
+        // its answer is authoritative. In a nested block that scope is gone by
+        // walk time and a name lookup could hit an OUTER same-name binding, so
+        // the honest verdict is Err -- uncountable, with a reason -- not a guess
+        // in either direction.
+        let placed = self
+            .region_binding_placed(&l.expr, walk.outer, binds)
+            .or_else(|| {
+                if !Self::init_can_carry_placement(&l.expr) {
+                    return None;
+                }
+                // A type annotation settles it wherever the binding lives: an
+                // annotated-unplaced `let m_new : f32 = if ...` is provably not a
+                // tensor, nested or not, and an annotated-placed one carries its
+                // space on its face. Without this, every scalar if-expression
+                // binding inside a loop was refused -- which took a blocked
+                // fixture's count from exact to absent, the wrong direction.
+                if let Some(ann) = &l.ty_ann {
+                    return self.placed_space(ann).map(|space| {
+                        match Self::region_elem_bytes(ann) {
+                            Ok(elem) => Ok((space, elem)),
+                            Err(why) => Err(why),
+                        }
+                    });
+                }
+                if top_level {
+                    match self.lookup(l.name.as_ref()) {
+                        Some((ty, _)) => match self.placed_space(ty) {
+                            Some(space) => {
+                                let ty = ty.clone();
+                                Some(match Self::region_elem_bytes(&ty) {
+                                    Ok(elem) => Ok((space, elem)),
+                                    Err(why) => Err(why),
+                                })
+                            }
+                            None => None,
+                        },
+                        None => Some(Err(
+                            "a region binding's type could not be resolved".to_string()
+                        )),
+                    }
+                } else {
+                    Some(Err(
+                        "a nested region binding is initialized by an expression \
+                         this counter cannot resolve"
+                            .to_string(),
+                    ))
+                }
+            });
+        binds.insert(l.name.as_ref().to_string(), placed);
+        Ok(())
+    }
+
+    /// Counts a `for` loop over a range: its body runs once per value in the range.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the range is not known at compile time, the trip count no
+    /// longer fits in 64 bits, or the body cannot be counted exactly.
+    fn region_for_loop(
+        &self,
+        fl: &crate::syntax::ForLoopStmt,
+        walk: &mut RegionWalk<'_>,
+        binds: &mut Bindings,
+    ) -> Result<(), String> {
+        self.region_expr(&fl.iterable, walk, binds)?;
+        let trips = self.region_trip_count(&fl.iterable).ok_or_else(|| {
+            "a loop bound in the region is not statically known, so the number of \
+             times its body runs cannot be counted"
+                .to_string()
+        })?;
+        let outside = walk.mult;
+        let next = outside.checked_mul(trips).ok_or_else(|| {
+            "the region's loop nest trip count overflows a 64-bit counter".to_string()
+        })?;
+        // The induction variable is a fresh scalar, and the body's own bindings
+        // must not leak out of the loop.
+        let mut inner = binds.clone();
+        inner.insert(fl.iter.clone(), None);
+        walk.mult = next;
+        self.region_stmts(&fl.body, walk, &mut inner, false)?;
+        walk.mult = outside;
         Ok(())
     }
 
@@ -597,12 +677,12 @@ impl<'a> TypeChecker<'a> {
                 // staging a device tile does. Only the ELEMENT SIZE comes from the source, so
                 // an unplaced source is sized from its checked type rather than making the
                 // destination unplaced -- which would drop every access to it.
-                let elem = match self.region_placed(id.name.as_ref(), outer, binds) {
+                let elem = match Self::region_placed(id.name.as_ref(), outer, binds) {
                     Some(Ok((_, elem))) => Ok(elem),
                     // The source could not be sized, so neither can the destination.
                     Some(Err(why)) => Err(why),
                     None => match self.lookup(id.name.as_ref()) {
-                        Some((ty, _)) => self.region_elem_bytes(ty),
+                        Some((ty, _)) => Self::region_elem_bytes(ty),
                         None => Err("a tile staged inside the region comes from a value whose \
                                      type this counter cannot see, so its bytes cannot be sized"
                             .to_string()),
@@ -610,12 +690,12 @@ impl<'a> TypeChecker<'a> {
                 };
                 Some(elem.map(|e| (t.space.clone(), e)))
             }
-            Expr::Identifier(id) => self.region_placed(id.name.as_ref(), outer, binds),
+            Expr::Identifier(id) => Self::region_placed(id.name.as_ref(), outer, binds),
             // `let q = &mut ad[i][d]` binds a reference INTO a placed buffer. Recognising
             // it keeps the binding from reading as unplaced scratch; the write through it
             // is refused above, because following the reference is what this walk cannot do.
             Expr::Borrow(b) => self.region_binding_placed(&b.expr, outer, binds),
-            Expr::IndexAccess(_) => match self.indexed_buffer(init, outer, binds) {
+            Expr::IndexAccess(_) => match Self::indexed_buffer(init, outer, binds) {
                 Ok(Some((_, space, elem))) => Some(Ok((space, elem))),
                 Ok(None) => None,
                 Err(why) => Some(Err(why)),
@@ -626,18 +706,19 @@ impl<'a> TypeChecker<'a> {
 
     /// Walk the subscript expressions of an assignment destination, which are ordinary reads:
     /// `o[p[0]] = ...` reads `p` before it writes `o`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when a subscript cannot be counted exactly.
     fn region_subscripts(
         &self,
         lhs: &Expr,
-        mult: u64,
-        acc: &mut RegionAcc,
-        exact: &mut bool,
-        outer: &PlacedMap,
+        walk: &mut RegionWalk<'_>,
         binds: &mut Bindings,
     ) -> Result<(), String> {
         let mut cur = lhs;
         while let Expr::IndexAccess(ix) = cur {
-            self.region_expr(&ix.index, mult, acc, exact, outer, binds)?;
+            self.region_expr(&ix.index, walk, binds)?;
             cur = &ix.base;
         }
         Ok(())
@@ -647,14 +728,12 @@ impl<'a> TypeChecker<'a> {
     /// The destination's subscripts are the caller's business, so that a caller which has
     /// already walked them does not walk them twice. A destination that is not a placed index
     /// (a scalar local, an unplaced scratch tile) moves nothing.
-    fn region_write(
-        &self,
-        lhs: &Expr,
-        mult: u64,
-        acc: &mut RegionAcc,
-        outer: &PlacedMap,
-        binds: &Bindings,
-    ) -> Result<(), String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the destination is written through a dereference, cannot be
+    /// resolved to a named buffer, or the total no longer fits in 64 bits.
+    fn region_write(lhs: &Expr, walk: &mut RegionWalk<'_>, binds: &Bindings) -> Result<(), String> {
         // A write THROUGH a dereference reaches whatever the reference points at, and this
         // walk cannot follow a reference to its referent. `let q = &mut ad[i][d]; *q = 3.0;`
         // wrote 16 bytes of device memory while the record said `written_bytes: 0,
@@ -670,213 +749,250 @@ impl<'a> TypeChecker<'a> {
         if !matches!(lhs, Expr::IndexAccess(_)) {
             return Ok(());
         }
-        if let Some((name, space, elem)) = self.indexed_buffer(lhs, outer, binds)? {
-            let bytes = elem.checked_mul(mult).ok_or_else(overflowed)?;
-            acc.add_written(&name, &space, bytes)?;
+        if let Some((name, space, elem)) = Self::indexed_buffer(lhs, walk.outer, binds)? {
+            let bytes = elem.checked_mul(walk.mult).ok_or_else(overflowed)?;
+            walk.acc.add_written(&name, &space, bytes)?;
         }
         Ok(())
     }
 
+    /// Counts the reads an expression performs on placed buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when a part of the expression cannot be counted exactly.
     fn region_expr(
         &self,
         e: &Expr,
-        mult: u64,
-        acc: &mut RegionAcc,
-        exact: &mut bool,
-        outer: &PlacedMap,
+        walk: &mut RegionWalk<'_>,
         binds: &mut Bindings,
     ) -> Result<(), String> {
         match e {
-            Expr::IndexAccess(ix) => {
-                // Index sub-expressions are reads in their own right, and they are counted
-                // whether or not the base turns out to be placed.
-                self.region_expr(&ix.index, mult, acc, exact, outer, binds)?;
-                let mut base: &Expr = &ix.base;
-                while let Expr::IndexAccess(inner) = base {
-                    self.region_expr(&inner.index, mult, acc, exact, outer, binds)?;
-                    base = &inner.base;
-                }
-                if let Some((name, space, elem)) = self.indexed_buffer(e, outer, binds)? {
-                    let bytes = elem.checked_mul(mult).ok_or_else(overflowed)?;
-                    acc.add_read(&name, &space, bytes)?;
-                } else {
-                    // Not a placed buffer, but the base may still contain one
-                    // (`scratch[q[i]]` reads q through an unplaced base).
-                    self.region_expr(base, mult, acc, exact, outer, binds)?;
-                }
-                Ok(())
-            }
+            Expr::IndexAccess(ix) => self.region_index_read(e, ix, walk, binds),
             Expr::FunctionCall(fc) => {
                 for a in &fc.args {
-                    self.region_expr(a, mult, acc, exact, outer, binds)?;
+                    self.region_expr(a, walk, binds)?;
                 }
-                self.region_call_opacity(&fc.args, None, outer, binds)
+                self.region_call_opacity(&fc.args, None, walk.outer, binds)
             }
             Expr::MethodCall(mc) => {
-                self.region_expr(&mc.base, mult, acc, exact, outer, binds)?;
+                self.region_expr(&mc.base, walk, binds)?;
                 for a in &mc.args {
-                    self.region_expr(a, mult, acc, exact, outer, binds)?;
+                    self.region_expr(a, walk, binds)?;
                 }
-                self.region_call_opacity(&mc.args, Some(&mc.base), outer, binds)
+                self.region_call_opacity(&mc.args, Some(&mc.base), walk.outer, binds)
             }
-            Expr::If(ifx) => {
-                self.region_expr(&ifx.cond, mult, acc, exact, outer, binds)?;
-                // `if comptime` is decided at compile time, so exactly one arm survives into
-                // the emitted code and the count is exact. Weighing it as a runtime branch
-                // would report the maximum of two arms for a body whose answer the compiler
-                // already knows -- the same correction the lowering counter carries.
-                if ifx.is_comptime {
-                    if let Some(crate::hir::env::Value::Bool(taken)) =
-                        self.eval_expr(&ifx.cond, &std::collections::HashMap::new())
-                    {
-                        let block = if taken {
-                            Some(&ifx.then_block)
-                        } else {
-                            ifx.else_block.as_ref()
-                        };
-                        if let Some(b) = block {
-                            let mut inner = binds.clone();
-                            self.region_stmts(b, mult, acc, exact, outer, &mut inner, false)?;
-                        }
-                        return Ok(());
-                    }
-                }
-                let mut then_acc = acc.clone();
-                let mut then_binds = binds.clone();
-                self.region_stmts(
-                    &ifx.then_block,
-                    mult,
-                    &mut then_acc,
-                    exact,
-                    outer,
-                    &mut then_binds,
-                    false,
-                )?;
-                let mut else_acc = acc.clone();
-                if let Some(eb) = &ifx.else_block {
-                    let mut else_binds = binds.clone();
-                    self.region_stmts(
-                        eb,
-                        mult,
-                        &mut else_acc,
-                        exact,
-                        outer,
-                        &mut else_binds,
-                        false,
-                    )?;
-                }
-                // Inexact only when the arms DISAGREE: a branch whose arms move identical
-                // bytes has one answer, and flagging it would differ from the same program
-                // written without the branch.
-                if then_acc != else_acc {
-                    *exact = false;
-                }
-                *acc = then_acc.max_with(&else_acc);
-                Ok(())
-            }
-            Expr::Match(m) => {
-                self.region_expr(&m.expr, mult, acc, exact, outer, binds)?;
-                let entry = acc.clone();
-                let mut outcomes: Vec<RegionAcc> = Vec::new();
-                for arm in &m.arms {
-                    let mut arm_acc = entry.clone();
-                    let mut arm_binds = binds.clone();
-                    self.region_stmts(
-                        &arm.body,
-                        mult,
-                        &mut arm_acc,
-                        exact,
-                        outer,
-                        &mut arm_binds,
-                        false,
-                    )?;
-                    outcomes.push(arm_acc);
-                }
-                if outcomes.windows(2).any(|w| w[0] != w[1]) {
-                    *exact = false;
-                }
-                let mut worst = entry;
-                for o in &outcomes {
-                    worst = worst.max_with(o);
-                }
-                *acc = worst;
-                Ok(())
-            }
-            Expr::UnsafeBlock(u) => {
-                let mut inner = binds.clone();
-                self.region_stmts(&u.stmts, mult, acc, exact, outer, &mut inner, false)?;
-                if let Some(r) = &u.ret {
-                    self.region_expr(r, mult, acc, exact, outer, &mut inner)?;
-                }
-                Ok(())
-            }
-            Expr::ComptimeBlock(c) => {
-                let mut inner = binds.clone();
-                self.region_stmts(&c.stmts, mult, acc, exact, outer, &mut inner, false)?;
-                if let Some(r) = &c.ret {
-                    self.region_expr(r, mult, acc, exact, outer, &mut inner)?;
-                }
-                Ok(())
-            }
+            Expr::If(ifx) => self.region_if(ifx, walk, binds),
+            Expr::Match(m) => self.region_match(m, walk, binds),
+            Expr::UnsafeBlock(u) => self.region_block(&u.stmts, u.ret.as_deref(), walk, binds),
+            Expr::ComptimeBlock(c) => self.region_block(&c.stmts, c.ret.as_deref(), walk, binds),
             // A `transfer` inside the region stages a tile; the MOVEMENT it performs is
             // counted by that transfer's own route record, so counting it here too would
             // double it. Its operand's subscripts are still ordinary reads.
-            Expr::Transfer(t) => self.region_expr(&t.expr, mult, acc, exact, outer, binds),
+            Expr::Transfer(t) => self.region_expr(&t.expr, walk, binds),
             // A nested `spawn` gets its own record; counting its body here as well would
             // report the same movement twice.
             Expr::SpawnOn(_) => Err("the region encloses a nested `spawn`, whose movement is \
                  reported on that region's own record and is not included here"
                 .to_string()),
             Expr::BinaryOp(b) => {
-                self.region_expr(&b.lhs, mult, acc, exact, outer, binds)?;
-                self.region_expr(&b.rhs, mult, acc, exact, outer, binds)
+                self.region_expr(&b.lhs, walk, binds)?;
+                self.region_expr(&b.rhs, walk, binds)
             }
             Expr::RelationalOp(r) => {
-                self.region_expr(&r.lhs, mult, acc, exact, outer, binds)?;
-                self.region_expr(&r.rhs, mult, acc, exact, outer, binds)
+                self.region_expr(&r.lhs, walk, binds)?;
+                self.region_expr(&r.rhs, walk, binds)
             }
             Expr::LogicalOp(l) => {
-                self.region_expr(&l.lhs, mult, acc, exact, outer, binds)?;
-                self.region_expr(&l.rhs, mult, acc, exact, outer, binds)
+                self.region_expr(&l.lhs, walk, binds)?;
+                self.region_expr(&l.rhs, walk, binds)
             }
-            Expr::UnaryOp(u) => self.region_expr(&u.expr, mult, acc, exact, outer, binds),
-            Expr::Borrow(b) => self.region_expr(&b.expr, mult, acc, exact, outer, binds),
-            Expr::Dereference(d) => self.region_expr(&d.expr, mult, acc, exact, outer, binds),
-            Expr::AsCast(c) => self.region_expr(&c.expr, mult, acc, exact, outer, binds),
+            Expr::UnaryOp(u) => self.region_expr(&u.expr, walk, binds),
+            Expr::Borrow(b) => self.region_expr(&b.expr, walk, binds),
+            Expr::Dereference(d) => self.region_expr(&d.expr, walk, binds),
+            Expr::AsCast(c) => self.region_expr(&c.expr, walk, binds),
             Expr::Range(r) => {
-                self.region_expr(&r.start, mult, acc, exact, outer, binds)?;
-                self.region_expr(&r.end, mult, acc, exact, outer, binds)
+                self.region_expr(&r.start, walk, binds)?;
+                self.region_expr(&r.end, walk, binds)
             }
-            Expr::MemberAccess(m) => self.region_expr(&m.base, mult, acc, exact, outer, binds),
+            Expr::MemberAccess(m) => self.region_expr(&m.base, walk, binds),
             Expr::Identifier(_) | Expr::Number(_) | Expr::StringLiteral(_) => Ok(()),
-            // Anything else is refused rather than assumed empty -- but only when it could
-            // hide a movement, matching the lowering counter's catch-all. A subtree with no
-            // indexing in it cannot touch a placed buffer.
-            other => {
-                if contains_index(other) {
-                    return Err(
-                        "the region contains a construct this counter does not know how to \
-                         weigh, and it indexes something"
-                            .to_string(),
-                    );
+            other => Self::region_unknown(other, walk.outer, binds),
+        }
+    }
+
+    /// Counts `base[index]`, the index expression `e`: a read of the buffer when the base is
+    /// a placed one, and the reads its subscripts perform either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the base cannot be resolved to a named buffer, a subscript
+    /// cannot be counted, or a total no longer fits in 64 bits.
+    fn region_index_read(
+        &self,
+        e: &Expr,
+        ix: &crate::syntax::IndexAccessExpr,
+        walk: &mut RegionWalk<'_>,
+        binds: &mut Bindings,
+    ) -> Result<(), String> {
+        // Index sub-expressions are reads in their own right, and they are counted
+        // whether or not the base turns out to be placed.
+        self.region_expr(&ix.index, walk, binds)?;
+        let mut base: &Expr = &ix.base;
+        while let Expr::IndexAccess(inner) = base {
+            self.region_expr(&inner.index, walk, binds)?;
+            base = &inner.base;
+        }
+        if let Some((name, space, elem)) = Self::indexed_buffer(e, walk.outer, binds)? {
+            let bytes = elem.checked_mul(walk.mult).ok_or_else(overflowed)?;
+            walk.acc.add_read(&name, &space, bytes)?;
+        } else {
+            // Not a placed buffer, but the base may still contain one
+            // (`scratch[q[i]]` reads q through an unplaced base).
+            self.region_expr(base, walk, binds)?;
+        }
+        Ok(())
+    }
+
+    /// Counts an `if`. Only one side runs, so each buffer gets the larger of the two sides'
+    /// counts, and the total stops being exact when the sides differ.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the condition or a side cannot be counted exactly.
+    fn region_if(
+        &self,
+        ifx: &crate::syntax::IfExpr,
+        walk: &mut RegionWalk<'_>,
+        binds: &mut Bindings,
+    ) -> Result<(), String> {
+        self.region_expr(&ifx.cond, walk, binds)?;
+        // `if comptime` is decided at compile time, so exactly one arm survives into
+        // the emitted code and the count is exact. Weighing it as a runtime branch
+        // would report the maximum of two arms for a body whose answer the compiler
+        // already knows -- the same correction the lowering counter carries.
+        if ifx.is_comptime {
+            if let Some(crate::hir::env::Value::Bool(taken)) =
+                self.eval_expr(&ifx.cond, &std::collections::HashMap::new())
+            {
+                let block = if taken {
+                    Some(&ifx.then_block)
+                } else {
+                    ifx.else_block.as_ref()
+                };
+                if let Some(b) = block {
+                    let mut inner = binds.clone();
+                    self.region_stmts(b, walk, &mut inner, false)?;
                 }
-                // No indexing, but it may still hand a placed tensor somewhere opaque.
-                let placed_names = outer.keys().cloned().chain(
-                    binds
-                        .iter()
-                        .filter(|(_, v)| v.is_some())
-                        .map(|(k, _)| k.clone()),
-                );
-                if mentions_any(other, placed_names) {
-                    return Err(
-                        "the region mentions a placed tensor inside a construct this counter \
-                         does not know how to weigh"
-                            .to_string(),
-                    );
-                }
-                Ok(())
+                return Ok(());
             }
         }
+        // Both sides start from the count at the `if`.
+        let entry = walk.acc.clone();
+        let mut then_binds = binds.clone();
+        self.region_stmts(&ifx.then_block, walk, &mut then_binds, false)?;
+        let then_acc = std::mem::replace(&mut walk.acc, entry);
+        if let Some(eb) = &ifx.else_block {
+            let mut else_binds = binds.clone();
+            self.region_stmts(eb, walk, &mut else_binds, false)?;
+        }
+        // Inexact only when the arms DISAGREE: a branch whose arms move identical
+        // bytes has one answer, and flagging it would differ from the same program
+        // written without the branch.
+        if then_acc != walk.acc {
+            walk.exact = false;
+        }
+        walk.acc = then_acc.max_with(&walk.acc);
+        Ok(())
+    }
+
+    /// Counts a `match`. Only one arm runs, so each buffer gets the largest of the arms'
+    /// counts, and the total stops being exact when two arms differ.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the matched value or an arm cannot be counted exactly.
+    fn region_match(
+        &self,
+        m: &crate::syntax::MatchExpr,
+        walk: &mut RegionWalk<'_>,
+        binds: &mut Bindings,
+    ) -> Result<(), String> {
+        self.region_expr(&m.expr, walk, binds)?;
+        let entry = walk.acc.clone();
+        let mut outcomes: Vec<RegionAcc> = Vec::new();
+        for arm in &m.arms {
+            // Every arm starts from the count at the `match`.
+            walk.acc = entry.clone();
+            let mut arm_binds = binds.clone();
+            self.region_stmts(&arm.body, walk, &mut arm_binds, false)?;
+            outcomes.push(walk.acc.clone());
+        }
+        if outcomes.windows(2).any(|w| w[0] != w[1]) {
+            walk.exact = false;
+        }
+        let mut worst = entry;
+        for o in &outcomes {
+            worst = worst.max_with(o);
+        }
+        walk.acc = worst;
+        Ok(())
+    }
+
+    /// Counts a block that is written as an expression, such as `unsafe { .. }`: its
+    /// statements, then the value it ends with. Names the block binds do not leak out of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when something in the block cannot be counted exactly.
+    fn region_block(
+        &self,
+        stmts: &[Statement],
+        ret: Option<&Expr>,
+        walk: &mut RegionWalk<'_>,
+        binds: &Bindings,
+    ) -> Result<(), String> {
+        let mut inner = binds.clone();
+        self.region_stmts(stmts, walk, &mut inner, false)?;
+        if let Some(r) = ret {
+            self.region_expr(r, walk, &mut inner)?;
+        }
+        Ok(())
+    }
+
+    /// An expression the walk has no rule for. It moves nothing when it neither indexes
+    /// anything nor mentions a placed tensor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the expression indexes something or mentions a placed tensor,
+    /// because it could then hide a read or a write.
+    fn region_unknown(other: &Expr, outer: &PlacedMap, binds: &Bindings) -> Result<(), String> {
+        // Anything else is refused rather than assumed empty -- but only when it could
+        // hide a movement, matching the lowering counter's catch-all. A subtree with no
+        // indexing in it cannot touch a placed buffer.
+        if contains_index(other) {
+            return Err(
+                "the region contains a construct this counter does not know how to \
+                 weigh, and it indexes something"
+                    .to_string(),
+            );
+        }
+        // No indexing, but it may still hand a placed tensor somewhere opaque.
+        let placed_names = outer.keys().cloned().chain(
+            binds
+                .iter()
+                .filter(|(_, v)| v.is_some())
+                .map(|(k, _)| k.clone()),
+        );
+        if mentions_any(other, placed_names) {
+            return Err(
+                "the region mentions a placed tensor inside a construct this counter \
+                 does not know how to weigh"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// A call whose arguments (or receiver) include a placed buffer makes the region
@@ -886,6 +1002,11 @@ impl<'a> TypeChecker<'a> {
     /// Scoped to placed arguments on purpose. `(m - m_new).exp()` and `print(scalar)` move
     /// nothing a caller can see, and poisoning on every call would make almost every real
     /// kernel uncountable -- an honest `null` that is never anything else is not information.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when an argument or the receiver is a placed tensor, mentions one,
+    /// or cannot be told apart from one.
     fn region_call_opacity(
         &self,
         args: &[Expr],
@@ -904,55 +1025,18 @@ impl<'a> TypeChecker<'a> {
         // placed even though `h` is not. Members resolve through the struct environment;
         // a chain that resolves to a scalar or unplaced tensor is legitimately fine
         // (`f(cfg.max)` must not be refused as "a placed tensor").
-        enum Arg {
-            Placed,
-            NotPlaced,
-            Unresolvable,
-        }
-        let classify = |e: &Expr| -> Arg {
-            let mut cur = e;
-            loop {
-                match cur {
-                    Expr::IndexAccess(ix) => cur = &ix.base,
-                    Expr::Borrow(b) => cur = &b.expr,
-                    Expr::Dereference(d) => cur = &d.expr,
-                    _ => break,
-                }
-            }
-            match cur {
-                Expr::Identifier(id) => match self.region_placed(id.name.as_ref(), outer, binds) {
-                    // `Err` is a binding whose placement is known-uncountable (sub-byte,
-                    // opaque initializer): not classifiable, so not passable.
-                    Some(_) => Arg::Placed,
-                    None => Arg::NotPlaced,
-                },
-                Expr::MemberAccess(_) => match self.member_field_type(cur, outer, binds) {
-                    Some(ty) => {
-                        if self.placed_space(&ty).is_some() {
-                            Arg::Placed
-                        } else {
-                            Arg::NotPlaced
-                        }
-                    }
-                    None => Arg::Unresolvable,
-                },
-                // Literals and arithmetic cannot be a placed tensor unless they CONTAIN a
-                // mention of one, which the general mentions_any guard below covers.
-                _ => Arg::NotPlaced,
-            }
-        };
         let mut unresolvable = false;
         for a in args.iter().chain(receiver) {
-            match classify(a) {
-                Arg::Placed => {
+            match self.classify_call_arg(a, outer, binds) {
+                CallArg::Placed => {
                     return Err(
                         "the region passes a placed tensor to a call, and the callee's own \
                          accesses are not counted here"
                             .to_string(),
                     )
                 }
-                Arg::Unresolvable => unresolvable = true,
-                Arg::NotPlaced => {}
+                CallArg::Unresolvable => unresolvable = true,
+                CallArg::NotPlaced => {}
             }
         }
         if unresolvable {
@@ -992,6 +1076,41 @@ impl<'a> TypeChecker<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Whether the call argument `e` is a placed tensor, looking through the indexing,
+    /// borrows and dereferences around the name.
+    fn classify_call_arg(&self, e: &Expr, outer: &PlacedMap, binds: &Bindings) -> CallArg {
+        let mut cur = e;
+        loop {
+            match cur {
+                Expr::IndexAccess(ix) => cur = &ix.base,
+                Expr::Borrow(b) => cur = &b.expr,
+                Expr::Dereference(d) => cur = &d.expr,
+                _ => break,
+            }
+        }
+        match cur {
+            Expr::Identifier(id) => match Self::region_placed(id.name.as_ref(), outer, binds) {
+                // `Err` is a binding whose placement is known-uncountable (sub-byte,
+                // opaque initializer): not classifiable, so not passable.
+                Some(_) => CallArg::Placed,
+                None => CallArg::NotPlaced,
+            },
+            Expr::MemberAccess(_) => match self.member_field_type(cur, outer, binds) {
+                Some(ty) => {
+                    if self.placed_space(&ty).is_some() {
+                        CallArg::Placed
+                    } else {
+                        CallArg::NotPlaced
+                    }
+                }
+                None => CallArg::Unresolvable,
+            },
+            // Literals and arithmetic cannot be a placed tensor unless they CONTAIN a
+            // mention of one, which the general `mentions_any` guard in the caller covers.
+            _ => CallArg::NotPlaced,
+        }
     }
 
     /// The type of a (possibly nested) struct-field access rooted at an identifier, resolved

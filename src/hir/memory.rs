@@ -30,15 +30,20 @@ use std::collections::{HashMap, HashSet};
 /// a 16 TB/s link (256 ps) distinguishable from the next size up, and `u64` still spans ~213 days.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct DerivedCost {
+    /// The cost: a number of cycles, or a number of picoseconds, as `per` says.
     pub value: u64,
+    /// The unit of `value`: `Cycle` means cycles, `Second` means picoseconds.
     pub per: RatePer,
 }
 
 /// One transfer, as an element of a set that is in flight together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flow {
+    /// The space the data moves out of.
     pub src: MemorySpace,
+    /// The space the data moves into.
     pub dst: MemorySpace,
+    /// How many bytes are moved.
     pub bytes: u64,
 }
 
@@ -50,7 +55,9 @@ pub struct Flow {
 /// smooth falloff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sharing {
+    /// The space that more than one flow passes through.
     pub space: MemorySpace,
+    /// How many flows pass through `space`, counting this one.
     pub flows: usize,
 }
 
@@ -72,12 +79,14 @@ pub struct FlowCost {
 
 impl FlowCost {
     /// Whether any space on this flow's route carries another flow.
+    #[must_use]
     pub fn is_contended(&self) -> bool {
         !self.sharing.is_empty()
     }
 
     /// The most-shared space on this route and its user count -- the bottleneck a contention law
     /// would price first. `None` when the flow is exclusive.
+    #[must_use]
     pub fn worst_sharing(&self) -> Option<&Sharing> {
         self.sharing.iter().max_by_key(|s| s.flows)
     }
@@ -95,6 +104,7 @@ const PICOS_PER_SEC: u64 = 1_000_000_000_000;
 /// applied to one and not the other, and the two answers would have disagreed about the same tile.
 /// `None` or a zero granule means no rounding. Idempotent by construction, which S3 asserts
 ///.
+#[must_use]
 pub fn granule_round(bytes: u64, granule: Option<u64>) -> u64 {
     match granule {
         Some(g) if g > 0 => bytes.div_ceil(g).saturating_mul(g),
@@ -110,24 +120,27 @@ pub fn granule_round(bytes: u64, granule: Option<u64>) -> u64 {
 /// on the fleet's own corpus -- produced no cost at all. The *result* still fits `u64`
 /// comfortably (64 GiB over a 100 GB/s link is 6.9e10 ps), so only the intermediate needs the
 /// width; the final narrowing is checked rather than truncating.
+#[must_use]
 pub fn hop_cost(bytes: u64, bw: crate::syntax::Bandwidth) -> Option<u64> {
     match bw.per {
         RatePer::Cycle => Some(bytes.div_ceil(bw.bytes)),
         RatePer::Second => {
-            let scaled = (bytes as u128).checked_mul(PICOS_PER_SEC as u128)?;
-            u64::try_from(scaled.div_ceil(bw.bytes as u128)).ok()
+            let scaled = u128::from(bytes).checked_mul(u128::from(PICOS_PER_SEC))?;
+            u64::try_from(scaled.div_ceil(u128::from(bw.bytes))).ok()
         }
     }
 }
 
 /// Bit width of a tensor element (dense packing, e.g. `I4` = 4 bits) — a thin wrapper over the single
 /// width source `ElementType::bits`. `None` for an un-instantiated generic element.
+#[must_use]
 pub fn element_bits(elem: &ElementType) -> Option<u64> {
-    elem.bits().map(|b| b as u64)
+    elem.bits().map(u64::from)
 }
 
 /// Bytes one tensor element takes in memory. A tensor does not pack its elements: a `bool` or
 /// `i4` element takes a whole byte, like a scalar of that type.
+#[must_use]
 pub fn element_bytes(elem: &ElementType) -> Option<u64> {
     element_bits(elem).map(|b| b.div_ceil(8))
 }
@@ -139,7 +152,7 @@ pub fn element_bytes(elem: &ElementType) -> Option<u64> {
 ///
 /// Deliberately exact `u64` rather than the checker's `f64` `eval_expr`: these become byte counts
 /// compared against a declared capacity, and a model-shape product (layers x context x heads x
-/// head_dim x batch) reaches magnitudes where float rounding would silently shift a verdict.
+/// `head_dim` x batch) reaches magnitudes where float rounding would silently shift a verdict.
 /// Overflow, division by zero, and a negative intermediate all yield `None` rather than wrapping.
 fn const_dim(e: &Expr) -> Option<u64> {
     match e {
@@ -179,6 +192,7 @@ fn const_dim(e: &Expr) -> Option<u64> {
 /// is arithmetic — a KV cache is `2 * layers * context` by `heads * head_dim` — and requiring a
 /// bare literal meant every such placement was silently reported "unverified" (W1029) instead of
 /// admitted or rejected, which would have made an admission matrix over realistic configs vacuous.
+#[must_use]
 pub fn static_tensor_bytes(elem: &ElementType, dims: &[Dim]) -> Option<u64> {
     if dims.is_empty() {
         return None;
@@ -190,10 +204,15 @@ pub fn static_tensor_bytes(elem: &ElementType, dims: &[Dim]) -> Option<u64> {
     element_bytes(elem)?.checked_mul(count)
 }
 
+/// What one space on a transfer's path contributes to the cost: its bandwidth, the clock its
+/// cycles are counted in, and its declared number of replicas.
+type PathTerm = (Bandwidth, Option<u64>, Option<u64>);
+
 /// A per-compilation view of the declared memory hierarchy. Nodes are `MemorySpace`s (a
 /// declared space's identity is `MemorySpace::from_name(name)`, so `Memory GPU_HBM { ... }`
 /// describes the built-in `GPU_HBM`); edges are `within:` parent links.
 pub struct MemoryHierarchy<'a> {
+    /// Each declared space and its declaration.
     spaces: HashMap<MemorySpace, &'a MemoryDecl>,
 }
 
@@ -201,25 +220,38 @@ pub struct MemoryHierarchy<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum MemoryCoherenceIssue {
     /// `within:` reaches `space` again — a containment cycle.
-    Cycle { space: MemorySpace },
+    Cycle {
+        /// A space that is its own ancestor.
+        space: MemorySpace,
+    },
     /// `child`'s capacity exceeds its `parent`'s — a sub-space larger than what contains it.
     CapacityExceedsParent {
+        /// The space that is too large.
         child: MemorySpace,
+        /// The space that `child` is declared `within:`.
         parent: MemorySpace,
+        /// The declared capacity of `child`, in bytes.
         child_bytes: u64,
+        /// The declared capacity of `parent`, in bytes.
         parent_bytes: u64,
     },
     /// A declared property (`capacity` / `bandwidth` / `granule`) is non-positive (zero).
     NonPositiveProperty {
+        /// The space with the zero property.
         space: MemorySpace,
+        /// The name of the property: `capacity`, `bandwidth` or `granule`.
         property: &'static str,
     },
     /// A sub-space's `scope` is *broader* than its parent's — locality must narrow (never
     /// widen) going down the hierarchy (e.g. a `device`-scoped space inside an `sm` one).
     ScopeWidensInChild {
+        /// The space whose scope is too broad.
         child: MemorySpace,
+        /// The space that `child` is declared `within:`.
         parent: MemorySpace,
+        /// The declared scope of `child`.
         child_scope: Scope,
+        /// The declared scope of `parent`.
         parent_scope: Scope,
     },
 }
@@ -235,17 +267,20 @@ impl<'a> MemoryHierarchy<'a> {
     }
 
     /// The descriptor declared for a space, if any.
+    #[must_use]
     pub fn descriptor(&self, space: &MemorySpace) -> Option<&'a MemoryDecl> {
         self.spaces.get(space).copied()
     }
 
     /// The declared `within:` parent of a space, if any.
+    #[must_use]
     pub fn parent(&self, space: &MemorySpace) -> Option<MemorySpace> {
         self.spaces.get(space).and_then(|d| d.parent.clone())
     }
 
     /// Ancestors of `space`, nearest first, excluding `space`. Cycle-safe: stops on the first
     /// repeated node so a malformed (cyclic) declaration cannot loop forever.
+    #[must_use]
     pub fn ancestors(&self, space: &MemorySpace) -> Vec<MemorySpace> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -262,12 +297,14 @@ impl<'a> MemoryHierarchy<'a> {
     }
 
     /// True if `inner` is contained (transitively) within `outer`.
+    #[must_use]
     pub fn contains(&self, outer: &MemorySpace, inner: &MemorySpace) -> bool {
         outer != inner && self.ancestors(inner).iter().any(|a| a == outer)
     }
 
     /// The nearest common ancestor of `a` and `b` in the containment tree, if any. A space is
     /// treated as its own ancestor, so `nearest_common_ancestor(x, child_of_x) == Some(x)`.
+    #[must_use]
     pub fn nearest_common_ancestor(&self, a: &MemorySpace, b: &MemorySpace) -> Option<MemorySpace> {
         let mut a_chain: HashSet<MemorySpace> = HashSet::new();
         a_chain.insert(a.clone());
@@ -296,6 +333,7 @@ impl<'a> MemoryHierarchy<'a> {
     ///
     /// Split out from `derived_transfer_cost` because the route is also what says which flows
     /// contend: two transfers collide exactly where their routes share a space.
+    #[must_use]
     pub fn route_spaces(&self, src: &MemorySpace, dst: &MemorySpace) -> Option<Vec<MemorySpace>> {
         if src == dst {
             return None;
@@ -330,6 +368,7 @@ impl<'a> MemoryHierarchy<'a> {
     /// now *visible and typed* -- a caller can see "this flow shares HBM with three others and was
     /// priced as though it were alone" -- instead of being invisible in a signature that could not
     /// have said otherwise.
+    #[must_use]
     pub fn derived_transfer_costs(&self, flows: &[Flow]) -> Vec<FlowCost> {
         let routes: Vec<Option<Vec<MemorySpace>>> = flows
             .iter()
@@ -383,6 +422,7 @@ impl<'a> MemoryHierarchy<'a> {
     /// space lacks a `bandwidth`, or the path's bandwidths mix rate units (cycles vs seconds).
     /// (Explicit topology-declared `transfer … : C` edges remain the fixed reachability cost;
     /// this is the additive roofline estimate, not a replacement for that graph.)
+    #[must_use]
     pub fn derived_transfer_cost(
         &self,
         src: &MemorySpace,
@@ -390,12 +430,40 @@ impl<'a> MemoryHierarchy<'a> {
         bytes: u64,
     ) -> Option<DerivedCost> {
         let path = self.route_spaces(src, dst)?;
+        let terms = Self::per_instance_terms(self.path_terms(&path)?);
+        let streamed = self.is_streamed(&path, src, dst);
+        let combine = |acc: u64, term: u64| -> u64 {
+            if streamed {
+                acc.max(term)
+            } else {
+                acc.saturating_add(term)
+            }
+        };
+
+        let all_cycles = terms.iter().all(|(bw, _)| bw.per == RatePer::Cycle);
+        if all_cycles {
+            // Stay in cycles. A cycle count is clock-invariant, so converting it to wall time here
+            // would throw away the one property that survives an unpinned clock.
+            let mut total: u64 = 0;
+            for (bw, _) in &terms {
+                total = combine(total, hop_cost(bytes, *bw)?);
+            }
+            return Some(DerivedCost {
+                value: total,
+                per: RatePer::Cycle,
+            });
+        }
+
+        Self::cost_in_picoseconds(&terms, bytes, streamed)
+    }
+
+    /// The bandwidth, clock and replica count of every space on `path`. `None` when the path is
+    /// empty, or when a space on it is not declared or has no bandwidth or a zero bandwidth.
+    fn path_terms(&self, path: &[MemorySpace]) -> Option<Vec<PathTerm>> {
         // Collect the terms first, because whether the path can be summed natively depends on all
         // of them: a path is kept in cycles only if *every* space on it is cycle-denominated.
-        #[allow(clippy::type_complexity)]
-        let mut terms: Vec<(crate::syntax::Bandwidth, Option<u64>, Option<u64>)> =
-            Vec::with_capacity(path.len());
-        for s in &path {
+        let mut terms: Vec<PathTerm> = Vec::with_capacity(path.len());
+        for s in path {
             let d = self.descriptor(s)?;
             let bw = d.bandwidth?;
             if bw.bytes == 0 {
@@ -406,7 +474,12 @@ impl<'a> MemoryHierarchy<'a> {
         if terms.is_empty() {
             return None;
         }
+        Some(terms)
+    }
 
+    /// Divide the bandwidth of each shared space by the replica count, so that every term is the
+    /// rate of one instance. Returns each bandwidth with its clock.
+    fn per_instance_terms(terms: Vec<PathTerm>) -> Vec<(Bandwidth, Option<u64>)> {
         // Put every term in the same DENOMINATION before summing any of them.
         //
         // A `scope: sm` space quotes the rate of one instance; a device-scoped space quotes an
@@ -424,7 +497,7 @@ impl<'a> MemoryHierarchy<'a> {
             .filter_map(|(_, _, r)| *r)
             .max()
             .filter(|r| *r > 1);
-        let terms: Vec<(Bandwidth, Option<u64>)> = terms
+        terms
             .into_iter()
             .map(|(mut bw, clock, own)| {
                 if let Some(r) = replicas {
@@ -435,8 +508,12 @@ impl<'a> MemoryHierarchy<'a> {
                 }
                 (bw, clock)
             })
-            .collect();
+            .collect()
+    }
 
+    /// Whether the costs of the spaces on `path` combine by taking the largest one (`true`)
+    /// instead of adding them (`false`).
+    fn is_streamed(&self, path: &[MemorySpace], src: &MemorySpace, dst: &MemorySpace) -> bool {
         // How the legs combine, from the DESTINATION's declaration.
         //
         // The destination decides because it is the destination's fill mechanism that determines
@@ -472,46 +549,33 @@ impl<'a> MemoryHierarchy<'a> {
         let through_registers = path.iter().any(|s| {
             s != src && s != dst && self.descriptor(s).and_then(|d| d.scope) == Some(Scope::Thread)
         });
-        let streamed = !through_registers
-            && self.descriptor(dst).map(|d| d.crossing) == Some(crate::syntax::Crossing::Streamed);
-        let combine = |acc: u64, term: u64| -> u64 {
-            if streamed {
-                acc.max(term)
-            } else {
-                acc.saturating_add(term)
-            }
-        };
+        !through_registers
+            && self.descriptor(dst).map(|d| d.crossing) == Some(crate::syntax::Crossing::Streamed)
+    }
 
-        let all_cycles = terms.iter().all(|(bw, _)| bw.per == RatePer::Cycle);
-        if all_cycles {
-            // Stay in cycles. A cycle count is clock-invariant, so converting it to wall time here
-            // would throw away the one property that survives an unpinned clock.
-            let mut total: u64 = 0;
-            for (bw, _) in &terms {
-                total = combine(total, hop_cost(bytes, *bw)?);
-            }
-            return Some(DerivedCost {
-                value: total,
-                per: RatePer::Cycle,
-            });
-        }
-
+    /// The cost in picoseconds of a path that has at least one space with a `B/s` bandwidth.
+    /// `None` when a `B/cyc` space declares no clock or a zero clock, or when the cost overflows.
+    fn cost_in_picoseconds(
+        terms: &[(Bandwidth, Option<u64>)],
+        bytes: u64,
+        streamed: bool,
+    ) -> Option<DerivedCost> {
         // Otherwise the path mixes `B/s` and `B/cyc` and everything is converted to picoseconds.
         // A cycle-denominated space must declare the clock those cycles are counted in; without it
         // the conversion would require inventing a frequency, which is exactly the silent
         // translation PREDICTIONS.md decision 5 forbids. Refusing is the honest answer, and the
         // fleet files declare `clock:` precisely so this path stays derivable.
         let mut total_ps: u128 = 0;
-        for (bw, clock_hz) in &terms {
+        for (bw, clock_hz) in terms {
             let ps = match bw.per {
-                RatePer::Second => hop_cost(bytes, *bw)? as u128,
+                RatePer::Second => u128::from(hop_cost(bytes, *bw)?),
                 RatePer::Cycle => {
-                    let hz = (*clock_hz)? as u128;
+                    let hz = u128::from((*clock_hz)?);
                     if hz == 0 {
                         return None;
                     }
-                    let cycles = bytes.div_ceil(bw.bytes) as u128;
-                    cycles.checked_mul(PICOS_PER_SEC as u128)?.div_ceil(hz)
+                    let cycles = u128::from(bytes.div_ceil(bw.bytes));
+                    cycles.checked_mul(u128::from(PICOS_PER_SEC))?.div_ceil(hz)
                 }
             };
             total_ps = if streamed {
@@ -543,6 +607,7 @@ impl<'a> MemoryHierarchy<'a> {
     }
 
     /// Every coherence violation in the declared hierarchy, in a deterministic order.
+    #[must_use]
     pub fn coherence_issues(&self) -> Vec<MemoryCoherenceIssue> {
         let mut issues = Vec::new();
         for (space, decl) in &self.spaces {
@@ -605,12 +670,17 @@ impl<'a> MemoryHierarchy<'a> {
             }
         }
         // `HashMap` iteration is unordered; sort for stable diagnostics.
-        issues.sort_by_key(|i| format!("{:?}", i));
+        issues.sort_by_key(|i| format!("{i:?}"));
         issues
     }
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use crate::syntax::Management;
@@ -1218,7 +1288,8 @@ mod tests {
             .expect("derivable");
         assert_eq!(cost.per, RatePer::Cycle);
         assert_eq!(cost.value, 926);
-        let effective = 16384.0 / cost.value as f64;
+        let cycles = u32::try_from(cost.value).expect("926 fits in a u32");
+        let effective = 16384.0 / f64::from(cycles);
         assert!(
             (16.0..=19.0).contains(&effective),
             "effective {effective} B/cyc should bracket the measured 16.6"

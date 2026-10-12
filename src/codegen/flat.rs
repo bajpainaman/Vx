@@ -36,6 +36,7 @@ use crate::syntax::scalar_of;
 use crate::syntax::{is_void_ty, Dim, ElementType, Function, Type};
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 mod emit;
 
@@ -58,7 +59,7 @@ fn mlir_float_literal(value: f64) -> String {
 /// for choosing a conversion op, since sign-extension keys off the *source* type. Used to coerce a
 /// stored value to a tensor's element type at a `memref.store`.
 fn elem_from_mlir_scalar(s: &str) -> Option<ElementType> {
-    use ElementType::*;
+    use ElementType::{Bool, BF16, F16, F32, F64, I128, I16, I32, I4, I64, I8};
     Some(match s {
         "f16" => F16,
         "bf16" => BF16,
@@ -76,12 +77,12 @@ fn elem_from_mlir_scalar(s: &str) -> Option<ElementType> {
 }
 
 fn is_signed(e: &ElementType) -> bool {
-    use ElementType::*;
+    use ElementType::{I128, I16, I32, I4, I64, I8};
     matches!(e, I4 | I8 | I16 | I32 | I64 | I128)
 }
 
 fn int_bits(e: &ElementType) -> Option<u32> {
-    use ElementType::*;
+    use ElementType::{Bool, USize, I128, I16, I32, I4, I64, I8, U128, U16, U32, U4, U64, U8};
     Some(match e {
         Bool => 1,
         I4 | U4 => 4,
@@ -95,7 +96,7 @@ fn int_bits(e: &ElementType) -> Option<u32> {
 }
 
 fn float_bits(e: &ElementType) -> Option<u32> {
-    use ElementType::*;
+    use ElementType::{BF16, F16, F32, F64};
     Some(match e {
         F16 | BF16 => 16,
         F32 => 32,
@@ -147,7 +148,9 @@ fn cast_op(src: &ElementType, tgt: &ElementType) -> Option<&'static str> {
 /// (`scalar_gid`), so we invert by testing the finite set of scalar variants — the flat-driven
 /// counterpart of reading a scalar type off the AST.
 fn elem_of_gid(gid: TypeId) -> Option<ElementType> {
-    use ElementType::*;
+    use ElementType::{
+        Bool, USize, BF16, F16, F32, F64, I128, I16, I32, I4, I64, I8, U128, U16, U32, U4, U64, U8,
+    };
     [
         F16, F32, F64, BF16, I4, U4, I8, U8, I16, U16, I32, U32, I64, U64, I128, U128, USize, Bool,
     ]
@@ -162,8 +165,7 @@ fn elem_of_gid(gid: TypeId) -> Option<ElementType> {
 /// isn't modelled. (#242)
 fn pointee_agg_gid(ty: &Type, ctx: &EmitCtx) -> Option<TypeId> {
     let inner = match ty {
-        Type::Borrow { inner, .. } => inner.as_ref(),
-        Type::Pointer(inner, ..) => inner.as_ref(),
+        Type::Borrow { inner, .. } | Type::Pointer(inner, ..) => inner.as_ref(),
         _ => return None,
     };
     ctx.agg_gid(inner)
@@ -176,8 +178,9 @@ fn pointee_agg_gid(ty: &Type, ctx: &EmitCtx) -> Option<TypeId> {
 /// down to the runtime type, as the AST codegen's `lower_type` does.
 fn peel_wrappers(ty: &Type) -> &Type {
     match ty {
-        Type::Verified(inner) => peel_wrappers(inner),
-        Type::Ref(inner, _) | Type::Pinned(inner, _) => peel_wrappers(inner),
+        Type::Verified(inner) | Type::Ref(inner, _) | Type::Pinned(inner, _) => {
+            peel_wrappers(inner)
+        }
         _ => ty,
     }
 }
@@ -196,7 +199,7 @@ fn tensor_memref_of_type(ty: &Type) -> Option<String> {
             for d in dims {
                 shape.push(match d {
                     Dim::Dyn => DYN_DIM.to_string(),
-                    _ => d.literal()?.parse::<i64>().ok()?.to_string(),
+                    Dim::Static(_) => d.literal()?.parse::<i64>().ok()?.to_string(),
                 });
             }
             tensor_memref_ty(elem, &shape)
@@ -273,7 +276,7 @@ fn is_ptr_ty(ty: &Type) -> bool {
 /// The `vx.placed` mark of a placed parameter or result. On-chip memory, by its built-in kind or
 /// its declared scope, is scratch nothing frees.
 fn placed_attr(p: &crate::syntax::Placement, ctx: &EmitCtx) -> String {
-    let id = crate::arch::memory_space_dispatch_id(&p.space) as u64;
+    let id = u64::from(crate::arch::memory_space_dispatch_id(&p.space).cast_unsigned());
     let on_chip = declared_scratch(id, ctx)
         || crate::codegen::generator::on_chip(crate::arch::builtin_address_space(&p.space));
     crate::codegen::generator::placed_attr(&p.space, on_chip)
@@ -295,11 +298,16 @@ pub(crate) fn placed_device(id: u64, ctx: &EmitCtx) -> Option<i32> {
         crate::syntax::MemorySpace::CPUDRAM,
     ]
     .iter()
-    .any(|m| crate::arch::memory_space_dispatch_id(m) as u64 == id);
+    .any(|m| u64::from(crate::arch::memory_space_dispatch_id(m).cast_unsigned()) == id);
     if id == 0 || host_or_on_chip || declared_scratch(id, ctx) {
         return None;
     }
-    Some(id as i32)
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a dispatch id is made from an `i32`, so it fits in one"
+    )]
+    let device = id as i32;
+    Some(device)
 }
 
 fn param_alias_attrs(ty: &Type, ctx: &EmitCtx) -> String {
@@ -468,7 +476,9 @@ fn cmp_op(rel: u64, e: &ElementType) -> Option<(&'static str, &'static str)> {
 /// return element type (`None` for a non-scalar/void return, which this subset declines). Keyed by
 /// the callee's GID — the identity a `Call` instruction carries in its `type_idx`.
 pub struct Callee {
+    /// The MLIR symbol name that `func.call` uses.
     pub name: String,
+    /// The element type of a scalar return value; `None` when the callee returns anything else.
     pub ret: Option<ElementType>,
     /// The GID of the callee's return type when it is a nominal aggregate (struct/enum) -- the call
     /// then returns an `!llvm.struct` by value, spilled to a slot at the call site (#215).
@@ -572,7 +582,8 @@ fn build_agg_names(registry: &ImmutableGlobalRegistry, aggs: &AggMap) -> HashMap
 /// Build the GID→callee map from the frozen registry's function signatures. A callee returning a
 /// nominal aggregate resolves its layout GID via `aggs`/`agg_names` (name fallback for a cross-module
 /// mono).
-pub fn build_callee_map(
+#[must_use]
+pub(crate) fn build_callee_map(
     registry: &ImmutableGlobalRegistry,
     aggs: &AggMap,
     agg_names: &HashMap<String, TypeId>,
@@ -636,7 +647,9 @@ pub fn build_callee_map(
 /// recovers the GEP field index by `offsets.position(|o| o == offset)` — and each field's MLIR type
 /// string, so a field op prints the right load/store type (a scalar's element or `!llvm.ptr`).
 pub struct AggLayout {
+    /// The `!llvm.struct<(...)>` type of the whole aggregate.
     pub struct_ty: String,
+    /// Each field's byte offset, in declaration order.
     pub offsets: Vec<u64>,
     /// Each field's MLIR type (`"i32"`, `"!llvm.ptr"`, …) in declaration order, index-aligned with
     /// `offsets`. A field op loads/stores at `field_tys[field_idx]`.
@@ -661,11 +674,112 @@ pub struct AggLayout {
 /// an aggregate absent from the map declines, keeping the AST path the oracle.
 pub type AggMap = HashMap<TypeId, AggLayout>;
 
+/// How one struct field appears in MLIR: its type, the layout GID of the aggregate it points to
+/// (a pointer field only), and the layout GID of the aggregate it holds by value (a nested
+/// struct only).
+type FieldShape = (String, Option<TypeId>, Option<TypeId>);
+
+/// The MLIR shape of one struct field, or `None` when the field cannot be modelled. `decl_ty` is
+/// the field's declared type, when the registry still has it.
+fn agg_field_shape(
+    ty: &crate::layout::FieldTy,
+    decl_ty: Option<&Type>,
+    registry: &ImmutableGlobalRegistry,
+    name_to_gid: &HashMap<&str, TypeId>,
+) -> Option<FieldShape> {
+    use crate::layout::FieldTy;
+    Some(match ty {
+        FieldTy::Scalar(e) => (mlir_scalar(e)?.to_string(), None, None),
+        FieldTy::Vector(e, lanes) => (mlir_vector(e, *lanes)?, None, None),
+        // A pointer field (`*mut T`/`&T`, layout-erased to `Opaque`) is an opaque `!llvm.ptr`
+        // — the shape of `Vec`'s `data` field (#242). Recover its pointee aggregate (if any)
+        // from the declared field type so a chained field access through it resolves.
+        FieldTy::Opaque => {
+            let pointee = decl_ty
+                .and_then(pointer_pointee_name)
+                .and_then(|n| name_to_gid.get(n.as_str()).copied());
+            ("!llvm.ptr".to_string(), pointee, None)
+        }
+        // A tensor field is its memref descriptor by value, one shape per rank.
+        FieldTy::Tensor(_, rank) => (memref_descriptor_ty(*rank), None, None),
+        FieldTy::Nominal(nested_gid) if registry.is_payload_free_enum(*nested_gid) => {
+            ("i32".to_string(), None, None)
+        }
+        // A by-value nested-aggregate field (`VecMap { iter: VecIter, .. }`): its MLIR type is
+        // the nested aggregate's `!llvm.struct` (recursively resolved), stored/loaded whole. The
+        // nested layout must itself be fully modelled (all scalar/pointer/nested fields), else the
+        // whole enclosing struct declines. (#242)
+        FieldTy::Nominal(nested_gid) => {
+            let nested_ty = agg_struct_ty_of(*nested_gid, registry, &mut Vec::new()).ok()?;
+            (nested_ty, None, Some(*nested_gid))
+        }
+    })
+}
+
+/// The `AggMap` entry for one layout, or `None` when the layout is a stub or has a field that
+/// cannot be modelled.
+fn agg_layout_entry(
+    registry: &ImmutableGlobalRegistry,
+    name_to_gid: &HashMap<&str, TypeId>,
+    gid: TypeId,
+    def: &crate::registry::TypeDefinition,
+) -> Option<(TypeId, AggLayout)> {
+    if def.align_bytes == 0 {
+        return None; // an unmodelled stub
+    }
+    // A declared struct with no fields -- a closure that captures nothing -- is the empty
+    // `!llvm.struct<()>`, which its environment slot allocates like any other. An enum has no
+    // fields either and no struct body to emit; it is not in `structs`.
+    if def.fields.is_empty() {
+        if !registry.structs.contains_key(&gid) {
+            return None;
+        }
+        return Some((
+            gid,
+            AggLayout {
+                struct_ty: "!llvm.struct<()>".to_string(),
+                offsets: Vec::new(),
+                field_tys: Vec::new(),
+                field_pointee: Vec::new(),
+                field_agg: Vec::new(),
+            },
+        ));
+    }
+    // The declared field types (with generic pointees intact) for pointee resolution; the frozen
+    // `layouts` erase them to `Opaque`. GID-keyed since #291 — the caller iterates `layouts`, so
+    // the definition's own GID is the key.
+    let decl_fields = registry.structs.get(&gid);
+    let mut field_tys = Vec::with_capacity(def.fields.len());
+    let mut offsets = Vec::with_capacity(def.fields.len());
+    let mut field_pointee = Vec::with_capacity(def.fields.len());
+    let mut field_agg: Vec<Option<TypeId>> = Vec::with_capacity(def.fields.len());
+    for (fi, f) in def.fields.iter().enumerate() {
+        let decl_ty = decl_fields
+            .and_then(|sf| sf.fields.get(fi))
+            .map(|(_, ft)| ft);
+        let (field_ty, pointee, nested) = agg_field_shape(&f.ty, decl_ty, registry, name_to_gid)?;
+        field_tys.push(field_ty);
+        field_pointee.push(pointee);
+        field_agg.push(nested);
+        offsets.push(f.offset as u64);
+    }
+    Some((
+        gid,
+        AggLayout {
+            struct_ty: format!("!llvm.struct<({})>", field_tys.join(", ")),
+            offsets,
+            field_tys,
+            field_pointee,
+            field_agg,
+        },
+    ))
+}
+
 /// Build the GID→aggregate-layout map from the frozen registry's nominal layouts. Skips a struct
 /// with any by-value nominal field or an unmodelled (0-align stub) layout; a pointer (`Opaque`)
 /// field is modelled as `!llvm.ptr`.
+#[must_use]
 pub fn build_agg_map(registry: &ImmutableGlobalRegistry, sched: crate::config::Schedule) -> AggMap {
-    use crate::layout::FieldTy;
     // Name -> layout GID for every modelled nominal, to resolve a pointer field's pointee aggregate
     // (its layout is instance-independent when the field is behind a pointer, so the base name suffices
     // — `VecIter`'s `vec : *const Vec<T>` resolves to the `Vec` layout GID for any `T`).
@@ -679,116 +793,7 @@ pub fn build_agg_map(registry: &ImmutableGlobalRegistry, sched: crate::config::S
     // own GID, so the map is the same whatever order the entries are produced in. (See
     // `build_callee_map` for why this is worth parallelising.)
     let layout_of = |(gid, def): (&TypeId, &crate::registry::TypeDefinition)| {
-        if def.align_bytes == 0 {
-            return None; // an unmodelled stub
-        }
-        // A declared struct with no fields -- a closure that captures nothing -- is the empty
-        // `!llvm.struct<()>`, which its environment slot allocates like any other. An enum has no
-        // fields either and no struct body to emit; it is not in `structs`.
-        if def.fields.is_empty() {
-            if !registry.structs.contains_key(gid) {
-                return None;
-            }
-            return Some((
-                *gid,
-                AggLayout {
-                    struct_ty: "!llvm.struct<()>".to_string(),
-                    offsets: Vec::new(),
-                    field_tys: Vec::new(),
-                    field_pointee: Vec::new(),
-                    field_agg: Vec::new(),
-                },
-            ));
-        }
-        // The declared field types (with generic pointees intact) for pointee resolution; the frozen
-        // `layouts` erase them to `Opaque`. GID-keyed since #291 — this loop iterates `layouts`, so
-        // the definition's own GID is the key.
-        let decl_fields = registry.structs.get(gid);
-        let mut field_tys = Vec::with_capacity(def.fields.len());
-        let mut offsets = Vec::with_capacity(def.fields.len());
-        let mut field_pointee = Vec::with_capacity(def.fields.len());
-        let mut field_agg: Vec<Option<TypeId>> = Vec::with_capacity(def.fields.len());
-        let mut modelled = true;
-        for (fi, f) in def.fields.iter().enumerate() {
-            match &f.ty {
-                FieldTy::Scalar(e) => match mlir_scalar(e) {
-                    Some(mt) => {
-                        field_tys.push(mt.to_string());
-                        field_pointee.push(None);
-                        field_agg.push(None);
-                    }
-                    None => {
-                        modelled = false;
-                        break;
-                    }
-                },
-                FieldTy::Vector(e, lanes) => match mlir_vector(e, *lanes) {
-                    Some(mt) => {
-                        field_tys.push(mt);
-                        field_pointee.push(None);
-                        field_agg.push(None);
-                    }
-                    None => {
-                        modelled = false;
-                        break;
-                    }
-                },
-                // A pointer field (`*mut T`/`&T`, layout-erased to `Opaque`) is an opaque `!llvm.ptr`
-                // — the shape of `Vec`'s `data` field (#242). Recover its pointee aggregate (if any)
-                // from the declared field type so a chained field access through it resolves.
-                FieldTy::Opaque => {
-                    field_tys.push("!llvm.ptr".to_string());
-                    let pointee = decl_fields
-                        .and_then(|sf| sf.fields.get(fi))
-                        .and_then(|(_, ft)| pointer_pointee_name(ft))
-                        .and_then(|n| name_to_gid.get(n.as_str()).copied());
-                    field_pointee.push(pointee);
-                    field_agg.push(None);
-                }
-                // A by-value nested-aggregate field (`VecMap { iter: VecIter, .. }`): its MLIR type is
-                // the nested aggregate's `!llvm.struct` (recursively resolved), stored/loaded whole. The
-                // nested layout must itself be fully modelled (all scalar/pointer/nested fields), else the
-                // whole enclosing struct declines. (#242)
-                // A tensor field is its memref descriptor by value, one shape per rank.
-                FieldTy::Tensor(_, rank) => {
-                    field_tys.push(memref_descriptor_ty(*rank));
-                    field_pointee.push(None);
-                    field_agg.push(None);
-                }
-                FieldTy::Nominal(nested_gid) if registry.is_payload_free_enum(*nested_gid) => {
-                    field_tys.push("i32".to_string());
-                    field_pointee.push(None);
-                    field_agg.push(None);
-                }
-                FieldTy::Nominal(nested_gid) => {
-                    match agg_struct_ty_of(*nested_gid, registry, &mut Vec::new()) {
-                        Ok(nested_ty) => {
-                            field_tys.push(nested_ty);
-                            field_pointee.push(None);
-                            field_agg.push(Some(*nested_gid));
-                        }
-                        Err(_) => {
-                            modelled = false;
-                            break;
-                        }
-                    }
-                }
-            }
-            offsets.push(f.offset as u64);
-        }
-        if !modelled {
-            return None;
-        }
-        Some((
-            *gid,
-            AggLayout {
-                struct_ty: format!("!llvm.struct<({})>", field_tys.join(", ")),
-                offsets,
-                field_tys,
-                field_pointee,
-                field_agg,
-            },
-        ))
+        agg_layout_entry(registry, &name_to_gid, *gid, def)
     };
     if sched == crate::config::Schedule::Sequential {
         registry.layouts.iter().filter_map(layout_of).collect()
@@ -801,6 +806,11 @@ pub fn build_agg_map(registry: &ImmutableGlobalRegistry, sched: crate::config::S
 /// by-value nested-aggregate field expands to its nested struct type. `None` if the layout is a stub,
 /// field-less, or has any unmodelled field (a non-lowerable scalar, or a nested aggregate that itself
 /// fails). `visiting` guards against a cyclic layout (which would be infinite-size anyway). (#242)
+///
+/// # Errors
+///
+/// Declines when the layout is cyclic, is unknown, has no fields or alignment, or has a field
+/// with no MLIR type.
 pub(crate) fn agg_struct_ty_of(
     gid: TypeId,
     registry: &ImmutableGlobalRegistry,
@@ -870,11 +880,14 @@ pub type TensorMap = HashMap<TypeId, (ElementType, Vec<String>)>;
 /// reference none (scalar/control-flow-only functions).
 #[derive(Default)]
 pub struct EmitCtx {
+    /// The functions a `Call` instruction can name, by GID.
     pub callees: CalleeMap,
+    /// The layouts of the structs and enums the stream builds or reads, by GID.
     pub aggs: AggMap,
     /// Base struct/enum name → modelled layout GID, for resolving a monomorphized cross-module
     /// aggregate whose signature carries an unresolved base GID (`Struct("Vec", None)`). (#242)
     pub agg_names: HashMap<String, TypeId>,
+    /// The element type and shape of each tensor type the stream uses, by GID.
     pub tensors: TensorMap,
     /// Names of payload-free (C-like) enums — an enum-typed value/param/return is a bare `i32`
     /// discriminant, not an aggregate (#227). Mirrors `ImmutableGlobalRegistry::enum_variants`.
@@ -907,11 +920,17 @@ pub struct EmitCtx {
 /// built in `build_flat_module` from the per-compilation env and passed into `emit_module_mlir`.
 #[derive(Clone, Debug, Default)]
 pub struct SubspaceInfo {
+    /// The number a `vx.transfer` uses to name this space.
     pub dispatch_id: u64,
+    /// The name the space was declared with.
     pub name: String,
+    /// The name of the memory space this one is declared inside, if any.
     pub within: Option<String>,
+    /// The declared `granule` of the space.
     pub granule: Option<u64>,
+    /// The declared `capacity` of the space.
     pub capacity: Option<u64>,
+    /// What shares the space: "device", "sm", "cta" or "thread".
     pub scope: Option<String>,
     /// "explicit" or "cached". Decides whether the host may read this space, and
     /// so whether a kernel that fails to route may fall back to the host at all
@@ -953,14 +972,6 @@ const RUNTIME_HELPERS: [(&str, &str); 18] = [
     ("printMemrefU64", "(memref<*xi64>)"),
 ];
 
-/// Recover the declared memory sub-spaces from a compilation's env, in the shape
-/// [`emit_module_mlir`] wants.
-///
-/// The frozen registry carries no memory declarations, so the env is the only place a flat compile
-/// can get them; without this the `space`/`within`/`granule`/`capacity`/`scope` attributes an
-/// `Opcode::Transfer` should carry are silently dropped on the flat path. Shared by `vxc`'s
-/// `build_flat_module` and the parallel pipeline's codegen phase, so the two cannot disagree about
-/// what a `vx.transfer` is annotated with (#311).
 /// `, vx.local_devices = array<i32: ...>`, the pairs of `arch::local_device_aliases` that
 /// `vx-to-llvm` sends to the backend at startup, or nothing when there are none.
 pub(crate) fn local_devices_attr(pairs: &[(i32, i32)]) -> String {
@@ -975,7 +986,8 @@ pub(crate) fn local_devices_attr(pairs: &[(i32, i32)]) -> String {
 }
 
 /// The `arch::local_device_aliases` of the topologies declared in a compilation's env.
-pub fn local_devices_from_env(env: &crate::hir::GlobalAstEnv) -> Vec<(i32, i32)> {
+#[must_use]
+pub fn local_devices_from_env(env: &crate::hir::GlobalAstEnv<'_>) -> Vec<(i32, i32)> {
     crate::arch::local_device_aliases(env.topologies.values().map(|d| (&d.name, &d.descriptor)))
 }
 
@@ -983,7 +995,8 @@ pub fn local_devices_from_env(env: &crate::hir::GlobalAstEnv) -> Vec<(i32, i32)>
 /// user-declared topology that states an `arch:`. A topology that declines to declare one gets no
 /// entry, no `arch` attribute, and therefore no device compilation -- refusing to guess is the
 /// same policy `fleet/m4-uma.vx` documents for its own arch field.
-pub fn topo_archs_from_env(env: &crate::hir::GlobalAstEnv) -> Vec<(i64, String)> {
+#[must_use]
+pub fn topo_archs_from_env(env: &crate::hir::GlobalAstEnv<'_>) -> Vec<(i64, String)> {
     let mut out: Vec<(i64, String)> = env
         .topologies
         .values()
@@ -992,7 +1005,7 @@ pub fn topo_archs_from_env(env: &crate::hir::GlobalAstEnv) -> Vec<(i64, String)>
             let id = crate::arch::topology_dispatch_id(&crate::syntax::Topology::Custom(
                 decl.name.clone(),
             ));
-            Some((id as i64, arch.as_ref().to_string()))
+            Some((i64::from(id), arch.as_ref().to_string()))
         })
         .collect();
     // Sorted, because `env.topologies` is a HashMap and iteration order would otherwise decide
@@ -1002,16 +1015,30 @@ pub fn topo_archs_from_env(env: &crate::hir::GlobalAstEnv) -> Vec<(i64, String)>
     out
 }
 
-pub fn subspaces_from_env(env: &crate::hir::GlobalAstEnv) -> Vec<SubspaceInfo> {
+/// Recover the declared memory sub-spaces from a compilation's env, in the shape
+/// [`emit_module_mlir`] wants.
+///
+/// The frozen registry carries no memory declarations, so the env is the only place a flat compile
+/// can get them; without this the `space`/`within`/`granule`/`capacity`/`scope` attributes an
+/// `Opcode::Transfer` should carry are silently dropped on the flat path. Shared by `vxc`'s
+/// `build_flat_module` and the parallel pipeline's codegen phase, so the two cannot disagree about
+/// what a `vx.transfer` is annotated with (#311).
+#[must_use]
+pub fn subspaces_from_env(env: &crate::hir::GlobalAstEnv<'_>) -> Vec<SubspaceInfo> {
     let mut out: Vec<SubspaceInfo> = env
         .memories
         .values()
         .map(|decl| {
             let space = crate::syntax::MemorySpace::from_name(decl.name.as_ref());
             SubspaceInfo {
-                dispatch_id: crate::arch::memory_space_dispatch_id(&space) as u64,
+                dispatch_id: u64::from(
+                    crate::arch::memory_space_dispatch_id(&space).cast_unsigned(),
+                ),
                 name: space.name(),
-                within: decl.parent.as_ref().map(|p| p.name()),
+                within: decl
+                    .parent
+                    .as_ref()
+                    .map(super::super::syntax::types::MemorySpace::name),
                 granule: decl.granule.as_ref().map(|g| g.0),
                 capacity: decl.capacity.as_ref().map(|c| c.0),
                 scope: decl.scope.as_ref().map(|s| {
@@ -1045,6 +1072,7 @@ pub fn subspaces_from_env(env: &crate::hir::GlobalAstEnv) -> Vec<SubspaceInfo> {
 impl EmitCtx {
     /// Build the callee + struct-layout maps from the registry. The tensor map is *not* in the
     /// registry (tensor types are structural); populate it separately from the lowerer's side table.
+    #[must_use]
     pub fn from_registry(
         registry: &ImmutableGlobalRegistry,
         sched: crate::config::Schedule,
@@ -1116,6 +1144,11 @@ fn static_tile_bytes(elem: &ElementType, shape: &[String]) -> Option<u64> {
 /// tensor's memref, or a by-value aggregate's `!llvm.struct`. `None` for a void / unmodelled type.
 /// The single source of truth shared by the `func.func` header and a `FuncConst`'s `func.constant`
 /// signature, so a materialized function pointer's type matches its callee's header exactly. (#242)
+///
+/// # Errors
+///
+/// Declines when the type has no MLIR spelling: a void or unmodelled type, or a tensor or
+/// aggregate that was never recorded in `ctx`.
 fn ty_mlir(ty: &Type, ctx: &EmitCtx) -> Lowered<String> {
     let ty = peel_wrappers(ty); // Verified/Ref/Pinned spell as their runtime inner type
                                 // A borrowed tensor is spelled as the tensor. A memref is already a reference, and a call
@@ -1169,15 +1202,23 @@ fn ty_mlir(ty: &Type, ctx: &EmitCtx) -> Lowered<String> {
 /// module is never emitted, so the AST path stays the oracle for the whole program). Callees + struct
 /// layouts resolve through the frozen registry; `tensor_types` is the concatenation of each function's
 /// lowerer side table (`LocalWorkerState::local_tensor_types`). Wrap the result in `module { … }`.
-#[allow(clippy::too_many_arguments)]
+///
+/// # Errors
+///
+/// Returns the decline of the first function, in `funcs` order, that is outside the subset the
+/// flat emitter handles.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "callers are in other files; each argument is a separate table of the compilation"
+)]
 pub fn emit_module_mlir(
-    funcs: &[(&Function, &[HirInstruction], &[TypeId])],
+    funcs: &[FlatFn<'_>],
     registry: &ImmutableGlobalRegistry,
     tensor_types: &[(TypeId, ElementType, Vec<String>)],
     string_tables: &[&[String]],
     inline_tables: &[&[crate::hir::flatten::InlineBlock]],
-    agg_layouts: &[(TypeId, Vec<u64>, Vec<String>)],
-    alias_tables: &[&[(usize, usize, Vec<usize>)]],
+    agg_layouts: &[SynthLayout],
+    alias_tables: &[&[AliasStore]],
     subspaces: &[SubspaceInfo],
     topo_archs: &[(i64, String)],
     local_devices: &[(i32, i32)],
@@ -1185,6 +1226,227 @@ pub fn emit_module_mlir(
 ) -> Lowered<String> {
     let setup = std::time::Instant::now();
     let mut ctx = EmitCtx::from_registry(registry, sched);
+    extend_ctx(&mut ctx, tensor_types, agg_layouts, subspaces, topo_archs);
+    // Rebuild the callee map now that the synthesized enum-instance layouts are in `aggs`: a callee
+    // returning `Option<i32>` (a data enum) resolves its `ret_agg` only once its layout is present,
+    // which happens above — `EmitCtx::from_registry` built the callees before it (#242).
+    if !agg_layouts.is_empty() {
+        ctx.callees = build_callee_map(registry, &ctx.aggs, &ctx.agg_names, sched);
+    }
+    // The *insertion* stays serial and in `funcs` order: two functions can resolve to the same GID,
+    // and then which one wins is decided by insertion order. Collecting in completion order would
+    // make that a race.
+    for (gid, s) in module_func_sigs(funcs, registry, &ctx, sched) {
+        ctx.func_sigs.insert(gid, s);
+    }
+    crate::intern_mode::record(crate::intern_mode::CODEGEN_SETUP, setup.elapsed());
+    let emit_start = std::time::Instant::now();
+    let tables = ModuleTables {
+        strings: string_tables,
+        inlines: inline_tables,
+        aliases: alias_tables,
+    };
+    let bases = ModuleBases::new(funcs.len(), &tables);
+    let mut emitted = emit_functions(funcs, &ctx, &tables, &bases, sched);
+    crate::intern_mode::record(crate::intern_mode::CODEGEN_EMIT, emit_start.elapsed());
+
+    // Reassembly is serial by necessity -- the output is ordered -- so it is the one part of codegen
+    // that cannot be parallelised, and it is therefore the one part whose constant factor matters
+    // most. Sizing the buffer up front is not a micro-optimisation here: a `String::new()` growing
+    // to the several megabytes a real corpus emits reallocates ~20 times, and every reallocation
+    // memcpys everything appended so far, so the append loop costs on the order of twice the output
+    // size in pure copying. That cost lands entirely on the critical path and grows with the program
+    // being compiled, which is exactly the shape that flattens a scaling curve.
+    let out_len: usize = emitted
+        .iter()
+        .filter_map(|e| e.as_ref().ok().map(|(t, _, _)| t.len()))
+        .sum();
+    // The header is built first, from the calls and not from the assembled text. That is what
+    // makes one copy enough: the header is finished first, the final buffer is allocated at its
+    // exact size, and the bodies go straight into it. Assembling bodies first forced the old
+    // order -- body, then header, then concatenate -- which cost a full copy of a multi-megabyte
+    // module per concatenation.
+    let (globals, calls, helper_mask) =
+        gather_header_inputs(funcs, registry, &mut emitted, &tables, &bases.strs)?;
+    let decls = header_decls(funcs, &calls, helper_mask);
+    // One buffer, one copy of each body, exact capacity, wrapper included.
+    //
+    // The module text used to be copied three times before anything could parse it: bodies into
+    // `out`, then `globals + decls + out` into a result, then a `format!` at each call site to wrap
+    // it in `module { … }`. On a 1,000-module corpus that is a 51 MB buffer copied three times and
+    // freed twice, and the cost is not the memcpy -- it is faulting in 150 MB of fresh pages, on the
+    // critical path, at the end of an otherwise well-parallelised phase.
+    //
+    // Emitting the wrapper here rather than leaving it to callers is what removes the last of them:
+    // a caller that has to wrap the return value cannot avoid copying it.
+    // `vx.drops`: the program frees its tensors at its drops (see convert-vx-to-standard).
+    let open = format!(
+        "module attributes {{vx.drops{}}} {{\n",
+        local_devices_attr(local_devices)
+    );
+    let mut module = String::with_capacity(
+        open.len() + globals.len() + decls.len() + out_len + MODULE_CLOSE.len(),
+    );
+    module.push_str(&open);
+    module.push_str(&globals);
+    module.push_str(&decls);
+    for emission in emitted.iter().flatten() {
+        module.push_str(&emission.0);
+    }
+    module.push_str(MODULE_CLOSE);
+    free_emissions(emitted, calls, sched);
+    Ok(module)
+}
+
+/// Frees the per-function results once the module text is assembled.
+///
+/// The per-function texts were copied, not consumed, so their allocations are still live. Freeing
+/// them here rather than during assembly keeps tens of thousands of frees off the critical path,
+/// and every one of them is a *remote* free: built by a worker, released on this thread (#315).
+/// `calls` is one entry per emitted call site -- three heap allocations each, all built by
+/// workers -- so it is the same remote-free problem in miniature and gets the same treatment.
+fn free_emissions(
+    emitted: Vec<Lowered<FnEmission>>,
+    calls: Vec<CallRecord>,
+    sched: crate::config::Schedule,
+) {
+    if sched == crate::config::Schedule::Sequential {
+        drop(emitted);
+        drop(calls);
+    } else {
+        emitted.into_par_iter().for_each(drop);
+        calls.into_par_iter().for_each(drop);
+    }
+}
+
+/// The line that closes the `module { ... }` wrapper.
+const MODULE_CLOSE: &str = "}\n";
+
+/// One function to emit: its declaration, its flat instruction stream, and the type table that
+/// the stream's `type_idx` values index.
+pub type FlatFn<'a> = (&'a Function, &'a [HirInstruction], &'a [TypeId]);
+
+/// A struct layout the lowerer made for one generic instance: its GID, each field's byte offset,
+/// and each field's MLIR type.
+pub type SynthLayout = (TypeId, Vec<u64>, Vec<String>);
+
+/// One field store that carries alias information: its position in the instruction stream, the
+/// number of its own alias group, and the numbers of the groups it never overlaps.
+pub type AliasStore = (usize, usize, Vec<usize>);
+
+/// One call a function makes: the callee's name, the MLIR type of each argument, and the MLIR
+/// return type (empty when the callee returns nothing).
+pub type CallRecord = (String, Vec<String>, String);
+
+/// A function's MLIR signature: its parameter types and its return type.
+type FuncSig = (Vec<String>, String);
+
+/// What emitting one function produced: its text, the calls it makes, and the runtime helpers it
+/// uses, as a bitmask over the positions in `RUNTIME_HELPERS`.
+type FnEmission = (String, Vec<CallRecord>, u32);
+
+/// The per-function side tables of a module. Each is indexed by the function's position in the
+/// module, and a function past the end of a table has an empty one.
+struct ModuleTables<'a> {
+    /// Each function's string literals.
+    strings: &'a [&'a [String]],
+    /// Each function's inline `mlir!` blocks.
+    inlines: &'a [&'a [crate::hir::flatten::InlineBlock]],
+    /// Each function's field stores that carry alias information.
+    aliases: &'a [&'a [AliasStore]],
+}
+
+impl<'a> ModuleTables<'a> {
+    /// The string literals of the function at position `fi`.
+    fn strings_of(&self, fi: usize) -> &'a [String] {
+        self.strings.get(fi).copied().unwrap_or(&[])
+    }
+
+    /// The inline `mlir!` blocks of the function at position `fi`.
+    fn inlines_of(&self, fi: usize) -> &'a [crate::hir::flatten::InlineBlock] {
+        self.inlines.get(fi).copied().unwrap_or(&[])
+    }
+
+    /// The alias-carrying field stores of the function at position `fi`.
+    fn aliases_of(&self, fi: usize) -> &'a [AliasStore] {
+        self.aliases.get(fi).copied().unwrap_or(&[])
+    }
+}
+
+/// How many alias groups a function's stores name: the largest group number, plus one.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a group number counts the stores of one function, far below `u32::MAX`"
+)]
+fn alias_group_count(stores: &[AliasStore]) -> u32 {
+    stores
+        .iter()
+        .map(|(_, g, _)| *g as u32 + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Where each function's share of the module-wide numbering starts, by the function's position.
+///
+/// Two module-wide numbering schemes are threaded through the per-function emit:
+///
+///  - String literals. Each function's literals are numbered from a running module-wide base, so a
+///    `PrintStr`'s `@".str.<n>"` reference (emitted with the same `str_base`) resolves the global
+///    emitted for it.
+///  - Alias scopes (M2b-2). 0 is reserved for the shared alias domain; each function reserves a
+///    contiguous block of `distinct[]` ids for its groups, so scopes stay distinct across functions
+///    even after inlining. (#275, §5.4)
+///
+/// Both used to be running `&mut` counters carried through the loop, which forced the per-function
+/// emit -- the actual code generation -- to run one function at a time. Neither *needs* to be
+/// sequential: a function's literal count is the length of its string table and its alias-group
+/// count is `max(group) + 1` over its own alias table, both known before anything is emitted.
+/// Turning them into prefix sums makes the emit a `par_iter` and leaves the output byte-identical,
+/// because the numbering is a function of position, never of arrival order (#311).
+struct ModuleBases {
+    /// The number of each function's first string literal.
+    strs: Vec<usize>,
+    /// The first `distinct[]` id of each function's alias scopes.
+    distincts: Vec<u32>,
+    /// The number of each function's first inline block wrapper. An inline block's wrapper is
+    /// named from a module-wide base, so two functions' wrappers do not collide.
+    inlines: Vec<usize>,
+}
+
+impl ModuleBases {
+    /// Computes the bases for a module of `fn_count` functions from the sizes of their tables.
+    fn new(fn_count: usize, tables: &ModuleTables<'_>) -> Self {
+        let mut strs: Vec<usize> = Vec::with_capacity(fn_count);
+        let mut distincts: Vec<u32> = Vec::with_capacity(fn_count);
+        let mut inlines = Vec::with_capacity(fn_count);
+        let mut str_base = 0usize;
+        let mut distinct_ctr: u32 = 1;
+        let mut inline_base = 0usize;
+        for fi in 0..fn_count {
+            strs.push(str_base);
+            str_base += tables.strings_of(fi).len();
+            distincts.push(distinct_ctr);
+            distinct_ctr += alias_group_count(tables.aliases_of(fi));
+            inlines.push(inline_base);
+            inline_base += tables.inlines_of(fi).len();
+        }
+        Self {
+            strs,
+            distincts,
+            inlines,
+        }
+    }
+}
+
+/// Adds to `ctx` the facts that are not in the frozen registry: the declared sub-spaces and
+/// topology archs, the tensor types the lowerer recorded, and the layouts it synthesized.
+fn extend_ctx(
+    ctx: &mut EmitCtx,
+    tensor_types: &[(TypeId, ElementType, Vec<String>)],
+    agg_layouts: &[SynthLayout],
+    subspaces: &[SubspaceInfo],
+    topo_archs: &[(i64, String)],
+) {
     for s in subspaces {
         ctx.subspaces.insert(s.dispatch_id, s.clone());
     }
@@ -1210,86 +1472,57 @@ pub fn emit_module_mlir(
             field_agg: vec![None; field_tys.len()],
         });
     }
-    // Rebuild the callee map now that the synthesized enum-instance layouts are in `aggs`: a callee
-    // returning `Option<i32>` (a data enum) resolves its `ret_agg` only once its layout is present,
-    // which happens above — `EmitCtx::from_registry` built the callees before it (#242).
-    if !agg_layouts.is_empty() {
-        ctx.callees = build_callee_map(registry, &ctx.aggs, &ctx.agg_names, sched);
-    }
-    // Function GID → (param MLIR types, ret MLIR type), for a `FuncConst`'s `func.constant @name : sig`.
-    // Built from the module's own functions (each `Function` carries its params); the target must be a
-    // function whose whole signature is modelled (else the FuncConst declines at emit). (#242)
-    // This is the bulk of the prologue and it was the largest serial section in the whole compile
-    // (#314): `ty_mlir` over every slot of every function is ~11,000 calls on a 1,600-function
-    // corpus, and it sat ahead of the parallel emit doing work proportional to the whole program.
-    //
-    // It parallelises because it is a pure map -- `ty_mlir` reads `aggs`/`agg_names`/`enums`/
-    // `tensors` and never `func_sigs`, so no function's signature depends on another's. The
-    // *insertion* stays serial and in `funcs` order: two functions can resolve to the same GID, and
-    // then which one wins is decided by insertion order. Collecting in completion order would make
-    // that a race.
-    let compute_sig = |(func, _, _): &(&Function, &[HirInstruction], &[TypeId])| {
+}
+
+/// Function GID → (param MLIR types, ret MLIR type), for a `FuncConst`'s `func.constant @name : sig`.
+/// Built from the module's own functions (each `Function` carries its params); the target must be a
+/// function whose whole signature is modelled (else the `FuncConst` declines at emit). (#242)
+///
+/// This is the bulk of the prologue and it was the largest serial section in the whole compile
+/// (#314): `ty_mlir` over every slot of every function is ~11,000 calls on a 1,600-function
+/// corpus, and it sat ahead of the parallel emit doing work proportional to the whole program.
+///
+/// It parallelises because it is a pure map -- `ty_mlir` reads `aggs`/`agg_names`/`enums`/
+/// `tensors` and never `func_sigs`, so no function's signature depends on another's. The result is
+/// in `funcs` order.
+fn module_func_sigs(
+    funcs: &[FlatFn<'_>],
+    registry: &ImmutableGlobalRegistry,
+    ctx: &EmitCtx,
+    sched: crate::config::Schedule,
+) -> Vec<(TypeId, FuncSig)> {
+    let compute_sig = |(func, _, _): &FlatFn<'_>| {
         let sig = registry.fn_sigs.get(func.name.as_ref())?;
         let params: Option<Vec<String>> = func
             .params
             .iter()
-            .map(|(_, t)| ty_mlir(t, &ctx).ok())
+            .map(|(_, t)| ty_mlir(t, ctx).ok())
             .collect();
         let ret = match &func.return_type {
             Type::Scalar(ElementType::Generic(_)) => None,
-            t => Some(ty_mlir(t, &ctx).unwrap_or_else(|_| "()".to_string())),
+            t => Some(ty_mlir(t, ctx).unwrap_or_else(|_| "()".to_string())),
         };
         match (params, ret) {
             (Some(params), Some(ret)) => Some((sig.gid, (params, ret))),
             _ => None,
         }
     };
-    let sigs: Vec<(TypeId, (Vec<String>, String))> = if sched == crate::config::Schedule::Sequential
-    {
+    if sched == crate::config::Schedule::Sequential {
         funcs.iter().filter_map(compute_sig).collect()
     } else {
         funcs.par_iter().filter_map(compute_sig).collect()
-    };
-    for (gid, s) in sigs {
-        ctx.func_sigs.insert(gid, s);
     }
-    // Two module-wide numbering schemes are threaded through the per-function emit:
-    //
-    //  - String literals. Each function's literals are numbered from a running module-wide base, so a
-    //    `PrintStr`'s `@".str.<n>"` reference (emitted with the same `str_base`) resolves the global
-    //    emitted here.
-    //  - Alias scopes (M2b-2). 0 is reserved for the shared alias domain; each function reserves a
-    //    contiguous block of `distinct[]` ids for its groups, so scopes stay distinct across functions
-    //    even after inlining. (#275, §5.4)
-    //
-    // Both used to be running `&mut` counters carried through the loop, which forced the per-function
-    // emit -- the actual code generation -- to run one function at a time. Neither *needs* to be
-    // sequential: a function's literal count is `string_tables[fi].len()` and its alias-group count is
-    // `max(group) + 1` over its own alias table, both known before anything is emitted. Turning them
-    // into prefix sums makes the emit a `par_iter` and leaves the output byte-identical, because the
-    // numbering is a function of position, never of arrival order (#311).
-    crate::intern_mode::record(crate::intern_mode::CODEGEN_SETUP, setup.elapsed());
-    let emit_start = std::time::Instant::now();
-    let mut str_bases: Vec<usize> = Vec::with_capacity(funcs.len());
-    let mut distinct_bases: Vec<u32> = Vec::with_capacity(funcs.len());
-    {
-        let mut str_base = 0usize;
-        let mut distinct_ctr: u32 = 1;
-        for fi in 0..funcs.len() {
-            str_bases.push(str_base);
-            str_base += string_tables.get(fi).copied().unwrap_or(&[]).len();
-            distinct_bases.push(distinct_ctr);
-            distinct_ctr += alias_tables
-                .get(fi)
-                .copied()
-                .unwrap_or(&[])
-                .iter()
-                .map(|(_, g, _)| *g as u32 + 1)
-                .max()
-                .unwrap_or(0);
-        }
-    }
+}
 
+/// Emits every function of the module. The results are in `funcs` order, whatever order the
+/// work ran in.
+fn emit_functions(
+    funcs: &[FlatFn<'_>],
+    ctx: &EmitCtx,
+    tables: &ModuleTables<'_>,
+    bases: &ModuleBases,
+    sched: crate::config::Schedule,
+) -> Vec<Lowered<FnEmission>> {
     // Which runtime helpers each function calls, as a bitmask over `RUNTIME_HELPERS`.
     //
     // This used to be ten `out.contains(...)` scans over the *whole* concatenated module — on a
@@ -1301,75 +1534,56 @@ pub fn emit_module_mlir(
         .iter()
         .map(|(name, _)| format!("@{name}("))
         .collect();
-
-    type FnEmission = (String, Vec<(String, Vec<String>, String)>, u32);
-    // An inline block's wrapper is named from a module-wide base, so two functions' do not collide.
-    let inline_bases: Vec<usize> = {
-        let mut bases = Vec::with_capacity(funcs.len());
-        let mut base = 0usize;
-        for fi in 0..funcs.len() {
-            bases.push(base);
-            base += inline_tables.get(fi).copied().unwrap_or(&[]).len();
-        }
-        bases
+    let emit_one = |(fi, flat_fn): (usize, &FlatFn<'_>)| {
+        let mut calls = Vec::new();
+        let mut distinct_ctr = bases.distincts[fi];
+        let text = emit_function_mlir(
+            *flat_fn,
+            ctx,
+            &mut calls,
+            &FnTables {
+                str_base: bases.strs[fi],
+                strings: tables.strings_of(fi),
+                inline_base: bases.inlines[fi],
+                inline_blocks: tables.inlines_of(fi),
+                alias_stores: tables.aliases_of(fi),
+            },
+            &mut distinct_ctr,
+        )?;
+        let helpers = helper_pats.iter().enumerate().fold(0u32, |m, (i, pat)| {
+            if text.contains(pat.as_str()) {
+                m | (1 << i)
+            } else {
+                m
+            }
+        });
+        Ok((text, calls, helpers))
     };
-    let emit_one =
-        |(fi, (func, hir, types)): (usize, &(&Function, &[HirInstruction], &[TypeId]))| {
-            let mut calls = Vec::new();
-            let mut distinct_ctr = distinct_bases[fi];
-            let text = emit_function_mlir(
-                func,
-                hir,
-                types,
-                &ctx,
-                &mut calls,
-                str_bases[fi],
-                string_tables.get(fi).copied().unwrap_or(&[]),
-                inline_bases[fi],
-                inline_tables.get(fi).copied().unwrap_or(&[]),
-                alias_tables.get(fi).copied().unwrap_or(&[]),
-                &mut distinct_ctr,
-            )?;
-            let helpers = helper_pats.iter().enumerate().fold(0u32, |m, (i, pat)| {
-                if text.contains(pat.as_str()) {
-                    m | (1 << i)
-                } else {
-                    m
-                }
-            });
-            Ok((text, calls, helpers))
-        };
-    let mut emitted: Vec<Lowered<FnEmission>> = if sched == crate::config::Schedule::Sequential {
+    if sched == crate::config::Schedule::Sequential {
         funcs.iter().enumerate().map(emit_one).collect()
     } else {
         funcs.par_iter().enumerate().map(emit_one).collect()
-    };
-    crate::intern_mode::record(crate::intern_mode::CODEGEN_EMIT, emit_start.elapsed());
+    }
+}
 
-    // Reassembly is serial by necessity -- the output is ordered -- so it is the one part of codegen
-    // that cannot be parallelised, and it is therefore the one part whose constant factor matters
-    // most. Sizing the buffer up front is not a micro-optimisation here: a `String::new()` growing
-    // to the several megabytes a real corpus emits reallocates ~20 times, and every reallocation
-    // memcpys everything appended so far, so the append loop costs on the order of twice the output
-    // size in pure copying. That cost lands entirely on the critical path and grows with the program
-    // being compiled, which is exactly the shape that flattens a scaling curve.
-    let out_len: usize = emitted
-        .iter()
-        .filter_map(|e| e.as_ref().ok().map(|(t, _, _)| t.len()))
-        .sum();
+/// Gathers what the module header needs from the emitted functions: the text of the string and
+/// `const` table globals, every call the functions make, and the union of the runtime helpers
+/// they use. The function bodies are deliberately not copied here.
+///
+/// # Errors
+///
+/// Returns the decline of the first function, in `funcs` order, that could not be emitted. It
+/// is the first one rather than whichever thread noticed first, so `VX_FLAT_DBG` always names
+/// the same function.
+fn gather_header_inputs(
+    funcs: &[FlatFn<'_>],
+    registry: &ImmutableGlobalRegistry,
+    emitted: &mut [Lowered<FnEmission>],
+    tables: &ModuleTables<'_>,
+    str_bases: &[usize],
+) -> Lowered<(String, Vec<CallRecord>, u32)> {
     let mut globals = String::new();
-    let mut calls: Vec<(String, Vec<String>, String)> = Vec::new();
-    // First pass gathers only what the *header* needs -- the callee list, the runtime-helper union
-    // and the string globals. The bodies are deliberately not touched yet.
-    //
-    // The declarations depend on `calls`, not on the assembled text, so they can be built before a
-    // single byte of body is copied. That is what makes one copy enough: the header is finished
-    // first, the final buffer is allocated at its exact size, and the bodies go straight into it.
-    // Assembling bodies first forced the old order -- body, then header, then concatenate -- which
-    // cost a full copy of a multi-megabyte module per concatenation.
-    //
-    // A decline is reported for the *first* declining function rather than whichever thread noticed
-    // first, so `VX_FLAT_DBG` says the same thing it always did.
+    let mut calls: Vec<CallRecord> = Vec::new();
     let mut helper_mask = 0u32;
     for (fi, emission) in emitted.iter_mut().enumerate() {
         let (_, fn_calls, helpers) = match emission {
@@ -1388,8 +1602,8 @@ pub fn emit_module_mlir(
         helper_mask |= *helpers;
         // Only the strings the code takes the address of become globals: an assert message
         // or a spawn's topology name is written into the op itself.
-        let strs = string_tables.get(fi).copied().unwrap_or(&[]);
-        let text = emission.as_ref().map(|(t, _, _)| t.as_str()).unwrap_or("");
+        let strs = tables.strings_of(fi);
+        let text = emission.as_ref().map_or("", |(t, _, _)| t.as_str());
         for (li, s) in strs.iter().enumerate() {
             let n = str_bases[fi] + li;
             if text.contains(&format!("@\".str.{n}\"")) {
@@ -1398,15 +1612,21 @@ pub fn emit_module_mlir(
         }
     }
     for table in &registry.const_tables {
-        globals += &format!("  {}", table.global_op());
+        let _ = write!(globals, "  {}", table.global_op());
     }
+    Ok((globals, calls, helper_mask))
+}
+
+/// The `func.func private` declarations at the top of the module: one for each runtime helper in
+/// `helper_mask`, then one for each function that is called but not defined in this module.
+fn header_decls(funcs: &[FlatFn<'_>], calls: &[CallRecord], helper_mask: u32) -> String {
     // Prepend `private` declarations for any runtime print helpers the bodies call (the JIT links
     // their implementations; the AST path declares them the same way). Which ones were determined
     // per function during the parallel emit; this is the union.
     let mut decls = String::new();
     for (i, (name, sig)) in RUNTIME_HELPERS.iter().enumerate() {
         if helper_mask & (1 << i) != 0 {
-            decls += &format!("  func.func private @{name}{sig}\n");
+            let _ = writeln!(decls, "  func.func private @{name}{sig}");
         }
     }
     // Declare any *called-but-undefined* callee (an `extern`: no `func.func @name` body emitted in this
@@ -1419,7 +1639,7 @@ pub fn emit_module_mlir(
     // tens of thousands of `String` allocations to record facts about strings that are already in
     // memory and outlive the loop.
     let mut declared: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for (name, arg_types, ret) in &calls {
+    for (name, arg_types, ret) in calls {
         if defined.contains(name.as_str()) || !declared.insert(name.as_str()) {
             continue;
         }
@@ -1428,51 +1648,14 @@ pub fn emit_module_mlir(
         } else {
             format!(" -> {ret}")
         };
-        decls += &format!(
-            "  func.func private {}({}){ret_sig}\n",
+        let _ = writeln!(
+            decls,
+            "  func.func private {}({}){ret_sig}",
             sym_ref(name),
             arg_types.join(", ")
         );
     }
-    // One buffer, one copy of each body, exact capacity, wrapper included.
-    //
-    // The module text used to be copied three times before anything could parse it: bodies into
-    // `out`, then `globals + decls + out` into a result, then a `format!` at each call site to wrap
-    // it in `module { … }`. On a 1,000-module corpus that is a 51 MB buffer copied three times and
-    // freed twice, and the cost is not the memcpy -- it is faulting in 150 MB of fresh pages, on the
-    // critical path, at the end of an otherwise well-parallelised phase.
-    //
-    // Emitting the wrapper here rather than leaving it to callers is what removes the last of them:
-    // a caller that has to wrap the return value cannot avoid copying it.
-    // `vx.drops`: the program frees its tensors at its drops (see convert-vx-to-standard).
-    let open = format!(
-        "module attributes {{vx.drops{}}} {{\n",
-        local_devices_attr(local_devices)
-    );
-    const CLOSE: &str = "}\n";
-    let mut module =
-        String::with_capacity(open.len() + globals.len() + decls.len() + out_len + CLOSE.len());
-    module.push_str(&open);
-    module.push_str(&globals);
-    module.push_str(&decls);
-    for emission in emitted.iter().flatten() {
-        module.push_str(&emission.0);
-    }
-    module.push_str(CLOSE);
-    // The per-function texts were copied, not consumed, so their allocations are still live. Freeing
-    // them here rather than during assembly keeps tens of thousands of frees off the critical path,
-    // and every one of them is a *remote* free: built by a worker, released on this thread (#315).
-    // `calls` is one entry per emitted call site -- three heap allocations each, all built by
-    // workers -- so it is the same remote-free problem in miniature and gets the same treatment.
-    // `declared` borrows from it, so this has to come after the declaration loop.
-    if sched == crate::config::Schedule::Sequential {
-        drop(emitted);
-        drop(calls);
-    } else {
-        emitted.into_par_iter().for_each(drop);
-        calls.into_par_iter().for_each(drop);
-    }
-    Ok(module)
+    decls
 }
 
 /// Emit the module-level `llvm.mlir.global` for a string literal: an internal constant array holding
@@ -1490,7 +1673,7 @@ fn emit_string_global(n: usize, s: &str) -> String {
 
 /// A function symbol reference for emitted textual MLIR. A name that is a valid bare MLIR symbol
 /// (`[A-Za-z_$.][A-Za-z0-9_$.]*` — covers `main`, `add`, `printMemrefF32`, and monomorph names like
-/// `f32$sq`) is emitted bare (`@name`), matching the AST path's spelling so FileCheck stays stable.
+/// `f32$sq`) is emitted bare (`@name`), matching the AST path's spelling so `FileCheck` stays stable.
 /// A mangled method name carries `::` (`Vec::with_capacity$i32`), which is MLIR's
 /// nested-symbol-reference separator — a bare `@Vec::with_capacity` fails to parse — so such a name
 /// is quoted into a single flat symbol (`@"..."`, which links to the same underlying symbol). (#242)
@@ -1514,7 +1697,7 @@ fn mlir_escape_bytes(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
     for &b in bytes {
         if b == b'"' || b == b'\\' || !(0x20..=0x7e).contains(&b) {
-            out += &format!("\\{b:02X}");
+            let _ = write!(out, "\\{b:02X}");
         } else {
             out.push(b as char);
         }
@@ -1533,7 +1716,7 @@ fn memref_elem(memty: &str) -> Option<&str> {
 fn memref_lead_dims_and_elem(memty: &str) -> Option<(&str, &str)> {
     let inner = memty.strip_prefix("memref<")?;
     let inner = inner.split(',').next()?.trim_end_matches('>');
-    let elem_start = inner.rfind('x').map(|i| i + 1).unwrap_or(0);
+    let elem_start = inner.rfind('x').map_or(0, |i| i + 1);
     Some((&inner[..elem_start], &inner[elem_start..]))
 }
 
@@ -1598,7 +1781,15 @@ fn vector_align_attr(vecty: &str) -> &'static str {
 /// `to_vector`): an already-vector operand passes through, a rank-1 memref is `vector.load`ed, and a
 /// scalar is `vector.broadcast`ed to the slice width. Emits into `body`; returns the vector SSA name.
 /// `tag` disambiguates the emitted SSA names.
-#[allow(clippy::too_many_arguments)]
+///
+/// # Errors
+///
+/// Declines when the operand has no recorded name or type, or is neither a vector, a rank-1
+/// memref, nor a float scalar.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "callers are in other files; the tables are separate fields of the caller's state"
+)]
 fn coerce_vector(
     body: &mut String,
     tag: &str,
@@ -1630,45 +1821,7 @@ fn coerce_vector(
         .ok_or(crate::emitter_gap!())?
         .clone()
     {
-        let c0 = format!("%vc{tag}");
-        let v = format!("%vl{tag}");
-        body.push_str(&format!("  {c0} = arith.constant 0 : index\n"));
-        // Half-precision STORAGE widens on load (Vx#320): when the row's element is
-        // f16/bf16 and the op wants f32 lanes, load the narrow vector and `arith.extf`
-        // it wide. The narrow row still earns the alignment attribute on its own terms
-        // (64 halves are 128 bytes -- v8 packs).
-        let row_elem = m
-            .rsplit('x')
-            .next()
-            .ok_or(crate::emitter_gap!())?
-            .trim_end_matches('>');
-        let row_elem = row_elem
-            .split(',')
-            .next()
-            .ok_or(crate::emitter_gap!())?
-            .trim();
-        if (row_elem == "f16" || row_elem == "bf16") && vecty.ends_with("xf32>") {
-            let lanes = vecty
-                .strip_prefix("vector<")
-                .ok_or(crate::emitter_gap!())?
-                .split('x')
-                .next()
-                .ok_or(crate::emitter_gap!())?
-                .to_string();
-            let nvec = format!("vector<{lanes}x{row_elem}>");
-            let nal = vector_align_attr(&nvec);
-            let nv = format!("%vn{tag}");
-            body.push_str(&format!(
-                "  {nv} = vector.load {name}[{c0}]{nal} : {m}, {nvec}\n"
-            ));
-            body.push_str(&format!("  {v} = arith.extf {nv} : {nvec} to {vecty}\n"));
-            return Ok(v);
-        }
-        let al = vector_align_attr(vecty);
-        body.push_str(&format!(
-            "  {v} = vector.load {name}[{c0}]{al} : {m}, {vecty}\n"
-        ));
-        return Ok(v);
+        return load_row_as_vector(body, tag, &name, &m, vecty);
     }
     if let Some(se) = etypes
         .get(op_reg as usize)
@@ -1687,13 +1840,11 @@ fn coerce_vector(
                 });
             }
             let w = format!("%vw{tag}");
-            body.push_str(&format!("  {w} = arith.extf {name} : {se_mlir} to {et}\n"));
+            let _ = writeln!(body, "  {w} = arith.extf {name} : {se_mlir} to {et}");
             name = w;
         }
         let v = format!("%vb{tag}");
-        body.push_str(&format!(
-            "  {v} = vector.broadcast {name} : {et} to {vecty}\n"
-        ));
+        let _ = writeln!(body, "  {v} = vector.broadcast {name} : {et} to {vecty}");
         return Ok(v);
     }
     Err(Decline::TypeNotModelled {
@@ -1701,10 +1852,60 @@ fn coerce_vector(
     })
 }
 
+/// Emits a `vector.load` of the rank-1 memref `name`, whose type is `m`, as a `vecty` vector.
+/// Returns the vector's SSA name. `tag` disambiguates the emitted SSA names.
+///
+/// # Errors
+///
+/// Declines when `m` or `vecty` is not spelled the way a memref or a vector type is.
+fn load_row_as_vector(
+    body: &mut String,
+    tag: &str,
+    name: &str,
+    m: &str,
+    vecty: &str,
+) -> Lowered<String> {
+    let c0 = format!("%vc{tag}");
+    let v = format!("%vl{tag}");
+    let _ = writeln!(body, "  {c0} = arith.constant 0 : index");
+    // Half-precision STORAGE widens on load (Vx#320): when the row's element is
+    // f16/bf16 and the op wants f32 lanes, load the narrow vector and `arith.extf`
+    // it wide. The narrow row still earns the alignment attribute on its own terms
+    // (64 halves are 128 bytes -- v8 packs).
+    let row_elem = m
+        .rsplit('x')
+        .next()
+        .ok_or(crate::emitter_gap!())?
+        .trim_end_matches('>');
+    let row_elem = row_elem
+        .split(',')
+        .next()
+        .ok_or(crate::emitter_gap!())?
+        .trim();
+    if (row_elem == "f16" || row_elem == "bf16") && vecty.ends_with("xf32>") {
+        let lanes = vecty
+            .strip_prefix("vector<")
+            .ok_or(crate::emitter_gap!())?
+            .split('x')
+            .next()
+            .ok_or(crate::emitter_gap!())?
+            .to_string();
+        let nvec = format!("vector<{lanes}x{row_elem}>");
+        let nal = vector_align_attr(&nvec);
+        let nv = format!("%vn{tag}");
+        let _ = writeln!(body, "  {nv} = vector.load {name}[{c0}]{nal} : {m}, {nvec}");
+        let _ = writeln!(body, "  {v} = arith.extf {nv} : {nvec} to {vecty}");
+        return Ok(v);
+    }
+    let al = vector_align_attr(vecty);
+    let _ = writeln!(body, "  {v} = vector.load {name}[{c0}]{al} : {m}, {vecty}");
+    Ok(v)
+}
+
 /// Comma-join integers (for `sizes: [..]` / `strides: [..]` lists).
 fn join_i64(xs: &[i64]) -> String {
     xs.iter()
-        .map(|x| x.to_string())
+        .map(std::string::ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1723,17 +1924,15 @@ pub(crate) fn memref_descriptor_ty(rank: usize) -> String {
 
 fn tensor_memref_ty(elem: &ElementType, shape: &[String]) -> Option<String> {
     let et = mlir_scalar(elem)?;
-    let dims: String = shape
-        .iter()
-        .map(|d| {
-            let d = if d.parse::<i64>().is_ok() {
-                d.as_str()
-            } else {
-                "?"
-            };
-            format!("{d}x")
-        })
-        .collect();
+    let mut dims = String::new();
+    for d in shape {
+        let d = if d.parse::<i64>().is_ok() {
+            d.as_str()
+        } else {
+            "?"
+        };
+        let _ = write!(dims, "{d}x");
+    }
     Some(format!("memref<{dims}{et}>"))
 }
 
@@ -1876,7 +2075,7 @@ pub(crate) struct FnEmit<'a> {
     pub(crate) copy_after_fill: HashMap<usize, i32>,
 }
 
-impl<'a> FnEmit<'a> {
+impl FnEmit<'_> {
     /// The scalar element type a type-stream index names, if it names one.
     pub(crate) fn ty_at(&self, ti: u32) -> Option<ElementType> {
         elem_of_gid(*self.types.get(ti as usize)?)
@@ -1902,8 +2101,6 @@ impl<'a> FnEmit<'a> {
         self.etypes.get(r as usize)?.clone()
     }
 
-    /// Emit one instruction into `body`. An opcode outside the flat subset declines, and
-    /// the AST path stays the oracle for the whole function.
     /// Where a stack slot's allocation belongs.
     ///
     /// The function's entry block, so a slot inside a loop is taken once rather
@@ -1927,6 +2124,12 @@ impl<'a> FnEmit<'a> {
         }
     }
 
+    /// Emit one instruction into `body`. An opcode outside the flat subset declines, and
+    /// the AST path stays the oracle for the whole function.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the opcode, or the way the instruction uses it, is outside the flat subset.
     pub(crate) fn step(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         match ins.opcode {
             // Parameter materialization: the register *is* the block argument, no op emitted. A
@@ -2009,6 +2212,18 @@ impl<'a> FnEmit<'a> {
             // yield the pointer, tracked as an aggregate slot (its layout GID from `type_idx`), so a
             // chained field access or a method receiver addresses through it. (#242)
             Opcode::FieldAddr => self.op_field_addr(idx, ins),
+            _ => self.step_tensor_or_io(idx, ins),
+        }
+    }
+
+    /// Emit one instruction that works on a tensor, a raw pointer, a string or a `vx.spawn`
+    /// region, or that prints or aborts. This is the second half of `step`.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the opcode, or the way the instruction uses it, is outside the flat subset.
+    fn step_tensor_or_io(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
+        match ins.opcode {
             // Allocate a tensor buffer (`Tensor<T>([..])`): a static `memref` of the shape recovered
             // from the side table by GID. Its register is tracked in `mem_of` for later index/store.
             Opcode::TensorAlloc => self.op_tensor_alloc(idx, ins),
@@ -2101,7 +2316,7 @@ impl<'a> FnEmit<'a> {
             // element pointer), `operand2` the value, and the pointee element type comes from the
             // place. (#242)
             Opcode::PtrStore => self.op_ptr_store(idx, ins),
-            // Anything else (spawn, matmul, …) is outside this subset.
+            // Anything else is outside this subset.
             _ => Err(Decline::Unsupported {
                 what: "an opcode the emitter has no case for",
             }),
@@ -2114,23 +2329,16 @@ impl<'a> FnEmit<'a> {
 /// calls + all-scalar-field struct construction/field access; the AST path stays the oracle there).
 /// `ctx` resolves the callee/struct GIDs the stream references. The returned text is a bare
 /// `func.func` op; wrap it in a `module { … }` before parsing.
-#[allow(clippy::too_many_arguments)]
+///
+/// # Errors
+///
+/// Declines when the signature has a type with no MLIR spelling, or when an instruction is
+/// outside the subset the flat emitter handles.
 pub fn emit_function_mlir(
-    func: &Function,
-    hir: &[HirInstruction],
-    types: &[TypeId],
+    (func, hir, types): FlatFn<'_>,
     ctx: &EmitCtx,
-    calls: &mut Vec<(String, Vec<String>, String)>,
-    str_base: usize,
-    // This function's string side table, indexed by an instruction's `imm`. `PrintStr` and
-    // `StringConst` reach their bytes through a module-level global; `Abort` needs the text
-    // itself, because `cf.assert` carries its message as an inline attribute.
-    strings: &[String],
-    // This function's inline `mlir!` blocks, and the module-wide base their wrappers are
-    // numbered from.
-    inline_base: usize,
-    inline_blocks: &[crate::hir::flatten::InlineBlock],
-    alias_stores: &[(usize, usize, Vec<usize>)],
+    calls: &mut Vec<CallRecord>,
+    tables: &FnTables<'_>,
     distinct_ctr: &mut u32,
 ) -> Lowered<String> {
     // Signature (taken from the resolved AST signature; the *body* is flat-driven). A scalar param is
@@ -2144,100 +2352,19 @@ pub fn emit_function_mlir(
     // frees (#643). The declared parameters shift along by one to make room.
     let ret_slot = returns_through_slot(&func.return_type).map(|mt| ("%arg0".to_string(), mt));
     let arg_offset = u32::from(ret_slot.is_some());
-    let mut params = Vec::new();
-    if let Some((slot, memty)) = &ret_slot {
-        params.push(format!("{slot}: {memty}"));
-    }
-    for (i, (_, ty)) in func.params.iter().enumerate() {
-        // Signature-position MLIR type: scalar, payload-free enum `i32`, `!llvm.ptr` (pointer /
-        // fn-pointer), tensor memref, or by-value aggregate `!llvm.struct`; else the function declines.
-        let pty = ty_mlir(ty, ctx)?;
-        let n = i as u32 + arg_offset;
-        params.push(format!("%arg{n}: {pty}{}", param_alias_attrs(ty, ctx)));
-    }
-    // A `Pinned<i32, ..>` return is the scalar it wraps, as at a call site.
-    let ret_elem = match peel_wrappers(&func.return_type) {
-        Type::Scalar(e) if !matches!(e, ElementType::Generic(_)) => Some(e.clone()),
-        Type::Scalar(_) => {
-            return Err(Decline::TypeNotModelled {
-                what: "a generic scalar return type",
-            })
-        }
-        _ => None, // non-scalar: a struct return is handled below; anything else is void
-    };
-    // The MLIR return type: a scalar, a payload-free enum's `i32` (#227), an `!llvm.struct` (a
-    // by-value struct return, #215), or `None` for void. A struct return whose layout isn't modelled
-    // declines the whole function.
-    let ret_mlir: Option<String> = if ret_slot.is_some() {
-        None // the result is the caller's buffer, passed in as a parameter above
-    } else if let Some(e) = &ret_elem {
-        Some(mlir_scalar(e).ok_or(crate::emitter_gap!())?.to_string())
-    } else if let Some(et) = enum_scalar(&func.return_type, ctx) {
-        Some(et.to_string())
-    } else if is_ptr_ty(&func.return_type) {
-        Some("!llvm.ptr".to_string()) // a pointer-returning function (#235)
-    } else if let Some(gid) = ctx.agg_gid(&func.return_type) {
-        Some(
-            ctx.aggs
-                .get(&gid)
-                .ok_or(crate::emitter_gap!())?
-                .struct_ty
-                .clone(),
-        )
-    } else if let Type::Simd(elem, lanes) = peel_wrappers(&func.return_type) {
-        Some(mlir_vector(elem, *lanes).ok_or(Decline::TypeNotModelled {
-            what: "a vector element with no MLIR spelling",
-        })?)
-    } else if let Some(mt) = tensor_memref_of_type(&func.return_type) {
-        // A `?`-shaped tensor return, wrappers peeled (Vx#383). The statically shaped ones went
-        // through the slot above; this is the case where the caller cannot size a buffer, so the
-        // callee allocates one and hands back the descriptor.
-        Some(mt)
-    } else if crate::syntax::is_void_ty(&func.return_type) {
-        None
-    } else {
-        // Anything else -- a dynamically shaped tensor return, an unmodelled nominal -- has no
-        // spelling here. Treating it as void mis-signed the function: the body's Ret still carried the value,
-        // and MLIR rejected the pair ("op has 1 operands, but enclosing function returns 0").
-        return Err(Decline::TypeNotModelled {
-            what: "a function return type with no MLIR spelling",
-        });
-    };
-
-    // Alias-scope metadata for place-write field stores (M2b-2): map each tagged store's stream
-    // position to its own alias-scope `distinct[]` id and its disjoint-sibling ids. Groups are numbered
-    // from the module-global `distinct_ctr` (0 is the shared domain), so scopes stay distinct across
-    // functions. The `FieldStore` arm attaches `alias_scopes`/`noalias_scopes` from this. (#275, §5.4)
-    let alias_scope_of: HashMap<usize, (u32, Vec<u32>)> = {
-        let n_groups = alias_stores
-            .iter()
-            .map(|(_, g, _)| *g as u32 + 1)
-            .max()
-            .unwrap_or(0);
-        let base = *distinct_ctr;
-        *distinct_ctr += n_groups;
-        alias_stores
-            .iter()
-            .map(|(pos, own, sibs)| {
-                (
-                    *pos,
-                    (
-                        base + *own as u32,
-                        sibs.iter().map(|s| base + *s as u32).collect(),
-                    ),
-                )
-            })
-            .collect()
-    };
+    let params = signature_params(func, ctx, ret_slot.as_ref(), arg_offset)?;
+    let ret_elem = scalar_ret_elem(func)?;
+    let ret_mlir = ret_mlir_ty(func, ctx, ret_slot.is_some(), ret_elem.as_ref())?;
+    let alias_scope_of = alias_scopes(tables.alias_stores, distinct_ctr);
 
     let mut em = FnEmit {
         func,
         types,
         ctx,
-        str_base,
-        strings,
-        inline_base,
-        inline_blocks,
+        str_base: tables.str_base,
+        strings: tables.strings,
+        inline_base: tables.inline_base,
+        inline_blocks: tables.inline_blocks,
         wrappers: String::new(),
         ret_elem,
         nrvo_alloc: ret_slot.as_ref().and_then(|_| nrvo_candidate(hir)),
@@ -2281,6 +2408,157 @@ pub fn emit_function_mlir(
         em.step(idx, ins)?;
     }
 
+    Ok(finish_function(&mut em, &params, ret_mlir.as_deref()))
+}
+
+/// The side tables one function's emit reads, and where its share of the module-wide numbering
+/// starts.
+pub struct FnTables<'a> {
+    /// The number of this function's first string literal among the module's string globals.
+    pub str_base: usize,
+    /// This function's string side table, indexed by an instruction's `imm`. `PrintStr` and
+    /// `StringConst` reach their bytes through a module-level global; `Abort` needs the text
+    /// itself, because `cf.assert` carries its message as an inline attribute.
+    pub strings: &'a [String],
+    /// The module-wide number of this function's first inline `mlir!` block wrapper.
+    pub inline_base: usize,
+    /// This function's inline `mlir!` blocks.
+    pub inline_blocks: &'a [crate::hir::flatten::InlineBlock],
+    /// This function's field stores that carry alias information.
+    pub alias_stores: &'a [AliasStore],
+}
+
+/// The parameter list of the function's MLIR signature, each entry spelled `%argN: type`. The
+/// return slot, when there is one, comes first.
+///
+/// # Errors
+///
+/// Declines when a parameter's type has no MLIR spelling.
+fn signature_params(
+    func: &Function,
+    ctx: &EmitCtx,
+    ret_slot: Option<&(String, String)>,
+    arg_offset: u32,
+) -> Lowered<Vec<String>> {
+    let mut params = Vec::new();
+    if let Some((slot, memty)) = ret_slot {
+        params.push(format!("{slot}: {memty}"));
+    }
+    for (i, (_, ty)) in func.params.iter().enumerate() {
+        // Signature-position MLIR type: scalar, payload-free enum `i32`, `!llvm.ptr` (pointer /
+        // fn-pointer), tensor memref, or by-value aggregate `!llvm.struct`; else the function declines.
+        let pty = ty_mlir(ty, ctx)?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a function has far fewer than `u32::MAX` parameters"
+        )]
+        let n = i as u32 + arg_offset;
+        params.push(format!("%arg{n}: {pty}{}", param_alias_attrs(ty, ctx)));
+    }
+    Ok(params)
+}
+
+/// The element type of the function's return value when it is a scalar. A `Pinned<i32, ..>`
+/// return is the scalar it wraps, as at a call site. `None` for any other return type.
+///
+/// # Errors
+///
+/// Declines when the return type is a generic scalar that was never given a concrete type.
+fn scalar_ret_elem(func: &Function) -> Lowered<Option<ElementType>> {
+    match peel_wrappers(&func.return_type) {
+        Type::Scalar(e) if !matches!(e, ElementType::Generic(_)) => Ok(Some(e.clone())),
+        Type::Scalar(_) => Err(Decline::TypeNotModelled {
+            what: "a generic scalar return type",
+        }),
+        _ => Ok(None), // non-scalar: a struct return is handled by `ret_mlir_ty`; anything else is void
+    }
+}
+
+/// The MLIR return type: a scalar, a payload-free enum's `i32` (#227), an `!llvm.struct` (a
+/// by-value struct return, #215), or `None` for void. `has_ret_slot` says the result is written
+/// to the caller's buffer, which also makes the MLIR function return nothing.
+///
+/// # Errors
+///
+/// Declines when the return type has no MLIR spelling, such as a struct whose layout is not
+/// modelled.
+fn ret_mlir_ty(
+    func: &Function,
+    ctx: &EmitCtx,
+    has_ret_slot: bool,
+    ret_elem: Option<&ElementType>,
+) -> Lowered<Option<String>> {
+    Ok(if has_ret_slot {
+        None // the result is the caller's buffer, passed in as a parameter
+    } else if let Some(e) = ret_elem {
+        Some(mlir_scalar(e).ok_or(crate::emitter_gap!())?.to_string())
+    } else if let Some(et) = enum_scalar(&func.return_type, ctx) {
+        Some(et.to_string())
+    } else if is_ptr_ty(&func.return_type) {
+        Some("!llvm.ptr".to_string()) // a pointer-returning function (#235)
+    } else if let Some(gid) = ctx.agg_gid(&func.return_type) {
+        Some(
+            ctx.aggs
+                .get(&gid)
+                .ok_or(crate::emitter_gap!())?
+                .struct_ty
+                .clone(),
+        )
+    } else if let Type::Simd(elem, lanes) = peel_wrappers(&func.return_type) {
+        Some(mlir_vector(elem, *lanes).ok_or(Decline::TypeNotModelled {
+            what: "a vector element with no MLIR spelling",
+        })?)
+    } else if let Some(mt) = tensor_memref_of_type(&func.return_type) {
+        // A `?`-shaped tensor return, wrappers peeled (Vx#383). The statically shaped ones went
+        // through the slot; this is the case where the caller cannot size a buffer, so the
+        // callee allocates one and hands back the descriptor.
+        Some(mt)
+    } else if crate::syntax::is_void_ty(&func.return_type) {
+        None
+    } else {
+        // Anything else -- a dynamically shaped tensor return, an unmodelled nominal -- has no
+        // spelling here. Treating it as void mis-signed the function: the body's Ret still carried the value,
+        // and MLIR rejected the pair ("op has 1 operands, but enclosing function returns 0").
+        return Err(Decline::TypeNotModelled {
+            what: "a function return type with no MLIR spelling",
+        });
+    })
+}
+
+/// Alias-scope metadata for place-write field stores (M2b-2): map each tagged store's stream
+/// position to its own alias-scope `distinct[]` id and its disjoint-sibling ids. Groups are numbered
+/// from the module-global `distinct_ctr` (0 is the shared domain), which this advances past the
+/// function's groups, so scopes stay distinct across functions. The `FieldStore` arm attaches
+/// `alias_scopes`/`noalias_scopes` from this. (#275, §5.4)
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a group number counts the stores of one function, far below `u32::MAX`"
+)]
+fn alias_scopes(
+    alias_stores: &[AliasStore],
+    distinct_ctr: &mut u32,
+) -> HashMap<usize, (u32, Vec<u32>)> {
+    let n_groups = alias_group_count(alias_stores);
+    let base = *distinct_ctr;
+    *distinct_ctr += n_groups;
+    alias_stores
+        .iter()
+        .map(|(pos, own, sibs)| {
+            (
+                *pos,
+                (
+                    base + *own as u32,
+                    sibs.iter().map(|s| base + *s as u32).collect(),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Ends the function's last block if nothing has, and assembles the whole `func.func` text:
+/// the header, the entry block, the body, and the wrappers of its inline `mlir!` blocks.
+fn finish_function(em: &mut FnEmit<'_>, params: &[String], ret_mlir: Option<&str>) -> String {
+    let (func, ctx) = (em.func, em.ctx);
     // Every block must end in a terminator. A void function falls through to a bare `return`.
     // A value-returning function reaching here has an unreachable trailing block -- an `if` whose
     // branches all returned. It used to decline instead, because the block was *either* unreachable
@@ -2288,7 +2566,7 @@ pub fn emit_function_mlir(
     // settles it now: a body that can complete without returning is E3028, and the shape the
     // parser rewrites past it is E3002. Neither reaches codegen, so what is left is unreachable.
     if !em.terminated {
-        match &ret_mlir {
+        match ret_mlir {
             None => em.body += "  func.return\n",
             Some(_) => em.body += "  llvm.unreachable\n",
         }
@@ -2301,7 +2579,7 @@ pub fn emit_function_mlir(
         }
         _ => String::new(),
     };
-    let mut ret_sig = match &ret_mlir {
+    let mut ret_sig = match ret_mlir {
         Some(t) if !ret_attr.is_empty() => format!(" -> ({t}{ret_attr})"),
         Some(t) => format!(" -> {t}"),
         None => String::new(),
@@ -2320,14 +2598,20 @@ pub fn emit_function_mlir(
     out += &em.body;
     out += "}\n";
     out += &em.wrappers;
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use crate::hir::flatten::lower_function_to_hir;
     use crate::session::{GlobalSession, LocalWorkerState};
+    use melior::ir::operation::OperationLike;
     use std::sync::Arc;
 
     #[test]
@@ -2355,6 +2639,25 @@ mod tests {
         prog.functions.into_iter().next().expect("expected one fn")
     }
 
+    /// Check that `mlir` parses and verifies in a real MLIR context. `with_vx` also registers the
+    /// Vx dialect, which a module that uses `vx.transfer` needs.
+    fn verify_mlir(mlir: &str, with_vx: bool) {
+        let registry = melior::dialect::DialectRegistry::new();
+        melior::utility::register_all_dialects(&registry);
+        let context = melior::Context::new();
+        context.append_dialect_registry(&registry);
+        context.load_all_available_dialects();
+        if with_vx {
+            crate::codegen::register_vx_dialect(&context);
+        }
+        let module = melior::ir::Module::parse(&context, mlir)
+            .unwrap_or_else(|| panic!("emitted MLIR failed to parse:\n{mlir}"));
+        assert!(
+            module.as_operation().verify(),
+            "emitted MLIR failed to verify:\n{mlir}"
+        );
+    }
+
     /// Lower a function to flat HIR, emit MLIR, and check it parses + verifies in a real MLIR
     /// context — proving the flat stream produces valid MLIR end to end.
     fn emit_and_verify(src: &str) -> String {
@@ -2362,39 +2665,30 @@ mod tests {
         let mut w = LocalWorkerState::new(Arc::new(GlobalSession::new(1)));
         assert!(lower_function_to_hir(&f, &mut w).is_ok(), "function lowers");
         let mlir = emit_function_mlir(
-            &f,
-            &w.local_hir_stream,
-            &w.local_type_stream,
+            (
+                &f,
+                w.local_hir_stream.as_slice(),
+                w.local_type_stream.as_slice(),
+            ),
             &EmitCtx::default(),
             &mut Vec::new(),
-            0,
-            &w.local_string_table,
-            0,
-            &w.local_inline_blocks,
-            &w.local_place_alias_stores,
+            &FnTables {
+                str_base: 0,
+                strings: &w.local_string_table,
+                inline_base: 0,
+                inline_blocks: &w.local_inline_blocks,
+                alias_stores: &w.local_place_alias_stores,
+            },
             &mut 1,
         )
         .expect("emits flat MLIR");
-
-        use melior::ir::operation::OperationLike;
-        let registry = melior::dialect::DialectRegistry::new();
-        melior::utility::register_all_dialects(&registry);
-        let context = melior::Context::new();
-        context.append_dialect_registry(&registry);
-        context.load_all_available_dialects();
-        let module = melior::ir::Module::parse(&context, &mlir)
-            .unwrap_or_else(|| panic!("emitted MLIR failed to parse:\n{mlir}"));
-        assert!(
-            module.as_operation().verify(),
-            "emitted MLIR failed to verify:\n{mlir}"
-        );
+        verify_mlir(&mlir, false);
         mlir
     }
 
-    /// Lower a whole program to flat HIR and emit the module, then check it parses + verifies in a
-    /// real MLIR context — proving the module emitter (calls included) produces valid MLIR end to
-    /// end. Mirrors the pipeline's registry build so callees resolve through `fn_sigs`.
-    fn emit_module_and_verify(src: &str) -> String {
+    /// Parse a whole program, build its registry the way the pipeline does so callees resolve
+    /// through `fn_sigs`, and type-check it. Returns the checked module and its session.
+    fn checked_module(src: &str) -> (Vec<crate::syntax::Program>, Arc<GlobalSession>) {
         let mut lexer = crate::lexer::Lexer::new(src);
         let tokens = lexer.tokenize();
         let mut parser = crate::parser::Parser::new(&tokens, src);
@@ -2407,7 +2701,7 @@ mod tests {
         let session = Arc::new(GlobalSession::with_registry(1, registry));
 
         // Type-check so the type checker annotates each `StructInit` with its struct GID (a scratch
-        // worker; the annotation lands on the AST, which the per-function lowering below then reads).
+        // worker; the annotation lands on the AST, which the per-function lowering then reads).
         let env_mods = mods.clone();
         let env = crate::hir::GlobalAstEnv::build(&env_mods);
         {
@@ -2417,14 +2711,21 @@ mod tests {
                 checker.check_function(f);
             }
         }
+        (mods, session)
+    }
 
+    /// Lower a whole program to flat HIR and emit the module, then check it parses + verifies in a
+    /// real MLIR context — proving the module emitter (calls included) produces valid MLIR end to
+    /// end.
+    fn emit_module_and_verify(src: &str) -> String {
+        let (mods, session) = checked_module(src);
         let mut lowered = Vec::new();
         for f in &mods[0].functions {
             let mut w = LocalWorkerState::new(session.clone());
             assert!(lower_function_to_hir(f, &mut w).is_ok(), "function lowers");
             lowered.push(w);
         }
-        let funcs: Vec<(&Function, &[HirInstruction], &[TypeId])> = mods[0]
+        let funcs: Vec<FlatFn<'_>> = mods[0]
             .functions
             .iter()
             .zip(&lowered)
@@ -2452,7 +2753,7 @@ mod tests {
             .iter()
             .flat_map(|w| w.local_agg_layouts.iter().cloned())
             .collect();
-        let alias_tables: Vec<&[(usize, usize, Vec<usize>)]> = lowered
+        let alias_tables: Vec<&[AliasStore]> = lowered
             .iter()
             .map(|w| w.local_place_alias_stores.as_slice())
             .collect();
@@ -2470,20 +2771,7 @@ mod tests {
             crate::config::Schedule::Parallel,
         )
         .expect("emits flat module");
-
-        use melior::ir::operation::OperationLike;
-        let dialects = melior::dialect::DialectRegistry::new();
-        melior::utility::register_all_dialects(&dialects);
-        let context = melior::Context::new();
-        context.append_dialect_registry(&dialects);
-        context.load_all_available_dialects();
-        crate::codegen::register_vx_dialect(&context); // for `vx.transfer`
-        let module = melior::ir::Module::parse(&context, &mlir)
-            .unwrap_or_else(|| panic!("emitted MLIR failed to parse:\n{mlir}"));
-        assert!(
-            module.as_operation().verify(),
-            "emitted MLIR failed to verify:\n{mlir}"
-        );
+        verify_mlir(&mlir, true); // the Vx dialect is for `vx.transfer`
         mlir
     }
 

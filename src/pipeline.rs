@@ -18,7 +18,11 @@ use crate::hir::{GlobalAstEnv, TypeChecker};
 use crate::lexer::Lexer;
 use crate::metadata::VxMetadata;
 #[cfg(debug_assertions)]
-use crate::parallel_architecture_verifier::verify_arch::*;
+use crate::parallel_architecture_verifier::verify_arch::{
+    verify_phase_1_parse, verify_phase_2_registry, verify_phase_3_isolation,
+    verify_phase_4_deduplication, verify_phase_5_epoch_advance, verify_phase_6_simd_patch,
+    verify_phase_7_routing, verify_phase_8_serialization,
+};
 use crate::parser::MacroExpander;
 use crate::parser::Parser;
 use crate::session::{GlobalSession, LocalWorkerState};
@@ -28,16 +32,22 @@ use rayon::prelude::*;
 /// The central orchestrator for the parallel compiler frontend.
 use crate::syntax;
 
+/// Why a compile through the pipeline stopped.
 #[derive(Debug)]
 pub enum PipelineError {
+    /// A source file could not be read, or two files share one module name.
     IO(String),
+    /// A file did not parse, or a macro in it did not expand.
     Parse(String),
+    /// The program's types are wrong as a whole, for example a struct that contains itself.
     Semantic(String),
     /// Checking found `count` errors, which it has printed. `in_declarations` says the check of
     /// the whole program's declarations found them, before any body was checked. The driver
     /// ends a failed compile with the same line whether it ran in parallel or not.
     Failed {
+        /// How many errors were printed.
         count: usize,
+        /// True when the errors are in declarations, found before any function body was checked.
         in_declarations: bool,
     },
 }
@@ -45,9 +55,9 @@ pub enum PipelineError {
 impl std::fmt::Display for PipelineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PipelineError::IO(msg) => write!(f, "IO Error: {}", msg),
-            PipelineError::Parse(msg) => write!(f, "Parse Error: {}", msg),
-            PipelineError::Semantic(msg) => write!(f, "Semantic Error: {}", msg),
+            PipelineError::IO(msg) => write!(f, "IO Error: {msg}"),
+            PipelineError::Parse(msg) => write!(f, "Parse Error: {msg}"),
+            PipelineError::Semantic(msg) => write!(f, "Semantic Error: {msg}"),
             PipelineError::Failed { count, .. } => {
                 write!(f, "Semantic check failed: {count} error(s) emitted")
             }
@@ -121,6 +131,11 @@ type MergedArenas = (
     Vec<(usize, usize)>,
 );
 
+/// Parses the files and runs the whole frontend on them.
+///
+/// # Errors
+///
+/// Fails when a file cannot be read or parsed, or when any later frontend step reports an error.
 fn run_frontend(
     file_paths: &[String],
     sched: Schedule,
@@ -130,7 +145,7 @@ fn run_frontend(
     // than inferring it from a plateau.
     let modules = crate::intern_mode::timed("parse", || parse_phase(file_paths, sched))?;
     // Every file here was named by the caller, so every file's diagnostics are its concern.
-    let frontend = run_frontend_on(modules, sched, intern_mode, Reported::EveryModule)?;
+    let frontend = run_frontend_on(modules, sched, intern_mode, &Reported::EveryModule)?;
     // Nothing declines on this path, so there is no second compile to print them again.
     report_warnings(&frontend.warnings);
     Ok(frontend)
@@ -139,11 +154,16 @@ fn run_frontend(
 /// The frontend from macro expansion on, for modules a caller has already parsed. The file-path
 /// entry above parses exactly the files it is given; `vxc -j` loads modules through
 /// `ModuleLoader`, which follows imports. Both then run this.
+///
+/// # Errors
+///
+/// Fails when a macro does not expand, when a struct contains itself by value, or when the check
+/// of the declarations or of the function bodies finds an error.
 fn run_frontend_on(
     mut modules: Vec<VxModule>,
     sched: Schedule,
     intern_mode: crate::intern_mode::InternMode,
-    reported: Reported,
+    reported: &Reported,
 ) -> Result<Frontend, PipelineError> {
     use crate::intern_mode::timed;
     timed("macro_expand", || {
@@ -180,9 +200,15 @@ fn run_frontend_on(
     // 265 ms compile -- 6%, entirely on the critical path, for a `map`.
     let env_modules: Vec<VxModule> = timed("sig_clone", || {
         if sched.is_seq() {
-            modules.iter().map(|m| m.clone_signature()).collect()
+            modules
+                .iter()
+                .map(super::syntax::decl::Program::clone_signature)
+                .collect()
         } else {
-            modules.par_iter().map(|m| m.clone_signature()).collect()
+            modules
+                .par_iter()
+                .map(super::syntax::decl::Program::clone_signature)
+                .collect()
         }
     });
     let mut env = timed("env_build", || GlobalAstEnv::build(&env_modules));
@@ -201,19 +227,13 @@ fn run_frontend_on(
     let mut warnings = timed("decl_check", || declaration_check_phase(&session, &env))?;
     // Found before the checks rename calls to generic instances, and reported after them only if
     // they found no error, as in the driver.
-    let mut unused_functions = crate::diagnostic::DiagnosticsVec::new();
-    for m in modules.iter().filter(|m| match &reported {
-        Reported::EveryModule => true,
-        Reported::OnlyEntry(name) => m.module_path == *name,
-    }) {
-        crate::hir::check::unused_functions::warn_functions_nothing_calls(m, &mut unused_functions);
-    }
+    let unused_functions = unused_function_warnings(&modules, reported);
 
     let Checked {
         mut checks,
         warnings: body_warnings,
     } = timed("type_check", || {
-        type_check_phase(&mut modules, &session, &env, sched, &reported)
+        type_check_phase(&mut modules, &session, &env, sched, reported)
     })?;
     warnings.extend(body_warnings);
     warnings.extend(unused_functions.inner);
@@ -222,7 +242,7 @@ fn run_frontend_on(
 
     let mut type_streams = timed("stream_extract", || extract_type_streams(&mut checks));
     timed("simd_patch", || {
-        simd_patch_phase(&mut type_streams, &slow_mappings, &gen_mappings, sched)
+        simd_patch_phase(&mut type_streams, &slow_mappings, &gen_mappings, sched);
     });
 
     Ok(Frontend {
@@ -238,6 +258,26 @@ fn run_frontend_on(
     })
 }
 
+/// The warnings for functions that nothing calls, in the modules whose diagnostics are reported.
+fn unused_function_warnings(
+    modules: &[VxModule],
+    reported: &Reported,
+) -> crate::diagnostic::DiagnosticsVec {
+    let mut unused_functions = crate::diagnostic::DiagnosticsVec::new();
+    for m in modules.iter().filter(|m| match reported {
+        Reported::EveryModule => true,
+        Reported::OnlyEntry(name) => m.module_path == *name,
+    }) {
+        crate::hir::check::unused_functions::warn_functions_nothing_calls(m, &mut unused_functions);
+    }
+    unused_functions
+}
+
+/// Compiles the files in parallel and writes their metadata, without producing MLIR.
+///
+/// # Errors
+///
+/// Fails when a file cannot be read or parsed, or when the program has an error.
 pub fn compile_pipeline(file_paths: &[String]) -> Result<(), PipelineError> {
     let Frontend {
         mut modules,
@@ -262,6 +302,10 @@ pub fn compile_pipeline(file_paths: &[String]) -> Result<(), PipelineError> {
     });
 
     #[cfg(debug_assertions)]
+    #[allow(
+        clippy::used_underscore_binding,
+        reason = "only a debug build reads the session, so a release build needs the underscore"
+    )]
     verify_phase_4_deduplication(
         &_epoch_2_session.generics_arena,
         &_epoch_2_session.generics_offsets,
@@ -298,6 +342,10 @@ pub fn compile_pipeline(file_paths: &[String]) -> Result<(), PipelineError> {
 /// `emit_function_type_gids`), interned and remapped local->global. Exposed for determinism
 /// testing: because GIDs are content hashes (module + symbol), not scheduling-dependent counters,
 /// the same files must produce the same GID stream regardless of `rayon`'s scheduling.
+///
+/// # Errors
+///
+/// Fails when a file cannot be read or parsed, or when the program has an error.
 pub fn compile_pipeline_type_stream(
     file_paths: &[String],
 ) -> Result<Vec<crate::gid::TypeId>, PipelineError> {
@@ -305,6 +353,10 @@ pub fn compile_pipeline_type_stream(
 }
 
 /// [`compile_pipeline_type_stream`] with the schedule chosen at run time.
+///
+/// # Errors
+///
+/// Fails when a file cannot be read or parsed, or when the program has an error.
 pub fn compile_pipeline_type_stream_with(
     file_paths: &[String],
     sched: Schedule,
@@ -316,6 +368,10 @@ pub fn compile_pipeline_type_stream_with(
 ///
 /// A parameter rather than a process-global (Vx#381): the strategy is a per-compilation fact, and
 /// a harness that compares two of them must be able to run both without one leaking into the other.
+///
+/// # Errors
+///
+/// Fails when a file cannot be read or parsed, or when the program has an error.
 pub fn compile_pipeline_type_stream_in(
     file_paths: &[String],
     sched: Schedule,
@@ -334,6 +390,10 @@ pub fn compile_pipeline_type_stream_in(
 /// program outside it has no MLIR on this path. `vxc` answers a decline by falling back to the AST
 /// walk; a measurement harness should answer it by reporting that the corpus was not compiled,
 /// rather than by timing a pipeline that quietly emitted nothing.
+///
+/// # Errors
+///
+/// Fails when a file cannot be read or parsed, or when the program has an error.
 pub fn compile_pipeline_mlir(file_paths: &[String]) -> Result<Option<String>, PipelineError> {
     compile_pipeline_mlir_with(file_paths, Schedule::Parallel)
 }
@@ -343,6 +403,10 @@ pub fn compile_pipeline_mlir(file_paths: &[String]) -> Result<Option<String>, Pi
 /// The sequential baseline is a *flag*, not a build. Measuring "parallel versus not" by editing the
 /// source between runs means the two numbers come from two binaries, and every unrelated change in
 /// between silently joins the comparison. One binary, one corpus, one flag.
+///
+/// # Errors
+///
+/// Fails when a file cannot be read or parsed, or when the program has an error.
 pub fn compile_pipeline_mlir_with(
     file_paths: &[String],
     sched: Schedule,
@@ -352,6 +416,10 @@ pub fn compile_pipeline_mlir_with(
 
 /// [`compile_pipeline_mlir_with`] with the interning strategy chosen too. See
 /// [`compile_pipeline_type_stream_in`] for why it is a parameter.
+///
+/// # Errors
+///
+/// Fails when a file cannot be read or parsed, or when the program has an error.
 pub fn compile_pipeline_mlir_in(
     file_paths: &[String],
     sched: Schedule,
@@ -364,6 +432,14 @@ pub fn compile_pipeline_mlir_in(
 /// [`compile_pipeline_mlir_in`] for modules a caller has already parsed and not yet expanded:
 /// what `vxc -j` hands over once its loader has followed the imports. The parse is the caller's
 /// to time under the `parse` phase; everything after it is timed here.
+///
+/// # Errors
+///
+/// Fails when a macro does not expand or when the program has an error.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "callers are in other files; they hand over a `Reported` they no longer need"
+)]
 pub fn compile_modules_mlir_in(
     modules: Vec<VxModule>,
     sched: Schedule,
@@ -380,17 +456,19 @@ pub fn compile_modules_mlir_in(
         warnings,
         type_streams,
         merged_arenas,
-    } = run_frontend_on(modules, sched, intern_mode, reported)?;
+    } = run_frontend_on(modules, sched, intern_mode, &reported)?;
     let text = crate::intern_mode::timed("codegen", || {
         codegen_mlir_phase(
             &modules,
             &mut checks,
-            &subspaces,
-            &topo_archs,
-            &local_devices,
-            &session,
+            &CodegenInputs {
+                subspaces: &subspaces,
+                topo_archs: &topo_archs,
+                local_devices: &local_devices,
+                global_session: &session,
+                sched,
+            },
             merged_arenas,
-            sched,
         )
     });
     // Only now, once codegen has answered, are the warnings this frontend found printed. A
@@ -453,10 +531,14 @@ pub fn compile_modules_mlir_in(
 fn module_path_of(path: &str) -> String {
     std::path::Path::new(path)
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
+        .map_or_else(|| path.to_string(), |s| s.to_string_lossy().into_owned())
 }
 
+/// Reads and parses every file, giving each module the name of its file stem.
+///
+/// # Errors
+///
+/// Fails when two files share a file stem, or when a file cannot be read or does not parse.
 fn parse_phase(file_paths: &[String], sched: Schedule) -> Result<Vec<VxModule>, PipelineError> {
     // Distinct files, one module name: `compute_module_hash` would give both the same word 0, so
     // every symbol in one would shadow or collide with the same-named symbol in the other. Refuse
@@ -478,7 +560,7 @@ fn parse_phase(file_paths: &[String], sched: Schedule) -> Result<Vec<VxModule>, 
     let parse_one = |path: &String| -> Result<VxModule, PipelineError> {
         chatter!("Parsing file: {}", path);
         let source = std::fs::read_to_string(path)
-            .map_err(|e| PipelineError::IO(format!("Failed to read {}: {}", path, e)))?;
+            .map_err(|e| PipelineError::IO(format!("Failed to read {path}: {e}")))?;
         let mut lexer = Lexer::new(&source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, &source);
@@ -503,6 +585,11 @@ fn parse_phase(file_paths: &[String], sched: Schedule) -> Result<Vec<VxModule>, 
     Ok(parsed_modules)
 }
 
+/// Expands the macros and the trait default methods in every module.
+///
+/// # Errors
+///
+/// Fails with the expander's message when a macro call in a module does not expand.
 fn macro_expansion_phase(
     parsed_modules: &mut [VxModule],
     sched: Schedule,
@@ -699,22 +786,7 @@ fn nominal_gid(ty: &syntax::Type) -> Option<crate::gid::TypeId> {
             0,
         )),
         Type::Function(args, ret, _) | Type::Closure(args, ret) => {
-            let mut ids: Vec<crate::gid::TypeId> =
-                args.iter().map(nominal_gid).collect::<Option<_>>()?;
-            ids.push(nominal_gid(ret)?);
-            let mut id = crate::gid::TypeId::new(
-                0,
-                crate::hash::DefPath::Named(if matches!(ty, Type::Function(..)) {
-                    "$fnty"
-                } else {
-                    "$closurety"
-                })
-                .compute_symbol_hash(),
-                0,
-                0,
-            );
-            id.words[2] = crate::gid::ESCAPE_HATCH_MASK | crate::gid::generic_digest(&ids);
-            Some(id)
+            callable_type_gid(matches!(ty, Type::Function(..)), args, ret)
         }
         Type::Matrix => Some(crate::gid::TypeId::new(
             0,
@@ -727,6 +799,26 @@ fn nominal_gid(ty: &syntax::Type) -> Option<crate::gid::TypeId> {
         // silently interning it with the argument missing.
         Type::Module(..) | Type::Unknown => None,
     }
+}
+
+/// The GID of a function type (`is_function`) or a closure type: a fixed tag plus a digest of the
+/// argument and return GIDs. `None` when one of those types has no GID.
+fn callable_type_gid(
+    is_function: bool,
+    args: &[syntax::Type],
+    ret: &syntax::Type,
+) -> Option<crate::gid::TypeId> {
+    let mut ids: Vec<crate::gid::TypeId> = args.iter().map(nominal_gid).collect::<Option<_>>()?;
+    ids.push(nominal_gid(ret)?);
+    let mut id = crate::gid::TypeId::new(
+        0,
+        crate::hash::DefPath::Named(if is_function { "$fnty" } else { "$closurety" })
+            .compute_symbol_hash(),
+        0,
+        0,
+    );
+    id.words[2] = crate::gid::ESCAPE_HATCH_MASK | crate::gid::generic_digest(&ids);
+    Some(id)
 }
 
 /// A span-free structural rendering of a const-generic argument, for identity only.
@@ -804,6 +896,10 @@ fn mint_generic_in_mode(
 // resulting `ImmutableGlobalRegistry` is frozen into the `GlobalSession` and shared read-only.
 
 /// Build and validate the frozen registry from post-`resolve_names` modules.
+///
+/// # Errors
+///
+/// Fails when a struct or enum contains itself by value, so it has no finite size.
 pub fn build_frozen_registry(
     modules: &[VxModule],
 ) -> Result<crate::registry::ImmutableGlobalRegistry, PipelineError> {
@@ -816,12 +912,33 @@ pub fn build_frozen_registry(
 /// The pipeline resolves names immediately before freezing the registry, and both steps need the
 /// same map; computing it twice put a second full pass over every module's declarations on the
 /// serial spine for no benefit. Callers outside the pipeline keep the one-argument form above.
+///
+/// # Errors
+///
+/// Fails when a struct or enum contains itself by value, so it has no finite size.
 pub fn build_frozen_registry_with(
     modules: &[VxModule],
     symbol_map: &crate::syntax::SymbolMap,
 ) -> Result<crate::registry::ImmutableGlobalRegistry, PipelineError> {
-    use crate::registry::TypeDefinition;
+    let defs = type_definitions(modules, symbol_map);
 
+    let mut registry = crate::registry::ImmutableGlobalRegistry::build_and_validate(defs)
+        .map_err(PipelineError::Semantic)?;
+
+    register_enum_variants(&mut registry, modules);
+    register_const_tables(&mut registry, modules);
+    register_struct_and_enum_decls(&mut registry, modules, symbol_map);
+    register_fn_sigs(&mut registry, modules);
+    register_methods(&mut registry, modules);
+
+    Ok(registry)
+}
+
+/// A layout computer that knows every struct and enum the symbol map names.
+fn layout_computer<'a>(
+    modules: &'a [VxModule],
+    symbol_map: &crate::syntax::SymbolMap,
+) -> crate::layout::LayoutComputer<'a> {
     // Index every nominal decl by its GID so nested by-value fields resolve
     // cross-module during layout computation (#199). Name resolution ran in the
     // prior phase, so field `Type::Struct(_, Some(gid))` GIDs are populated.
@@ -842,7 +959,18 @@ pub fn build_frozen_registry_with(
             }
         }
     }
-    let mut layout = crate::layout::LayoutComputer::new(gid_structs, gid_enums);
+    crate::layout::LayoutComputer::new(gid_structs, gid_enums)
+}
+
+/// One `TypeDefinition` for every struct and enum the symbol map names: its GID, its layout and
+/// the types it holds by value.
+fn type_definitions(
+    modules: &[VxModule],
+    symbol_map: &crate::syntax::SymbolMap,
+) -> Vec<crate::registry::TypeDefinition> {
+    use crate::registry::TypeDefinition;
+
+    let mut layout = layout_computer(modules, symbol_map);
 
     let mut defs: Vec<TypeDefinition> = Vec::new();
     for module in modules {
@@ -853,7 +981,7 @@ pub fn build_frozen_registry_with(
             let Some(&id) = mod_syms.get(&s.name) else {
                 continue;
             };
-            let deps = s
+            let by_value_dependencies = s
                 .fields
                 .iter()
                 .filter_map(|(_, ty)| by_value_nominal_gid(ty))
@@ -862,45 +990,46 @@ pub fn build_frozen_registry_with(
             // the earlier 0/0 stub; the cycle case is reported by build_and_validate.
             let (size_bytes, align_bytes, fields) = layout
                 .layout_of(id)
-                .map(|l| (l.size, l.align, l.fields))
-                .unwrap_or((0, 0, Vec::new()));
+                .map_or((0, 0, Vec::new()), |l| (l.size, l.align, l.fields));
             defs.push(TypeDefinition {
                 id,
                 name: s.name.to_string(),
                 size_bytes,
                 align_bytes,
                 fields,
-                by_value_dependencies: deps,
+                by_value_dependencies,
             });
         }
         for e in &module.enums {
             let Some(&id) = mod_syms.get(&e.name) else {
                 continue;
             };
-            let deps = e
+            let by_value_dependencies = e
                 .variants
                 .iter()
                 .flat_map(|(_, payload)| payload.iter().flatten())
                 .filter_map(by_value_nominal_gid)
                 .collect();
-            let (size_bytes, align_bytes) = layout
-                .layout_of(id)
-                .map(|l| (l.size, l.align))
-                .unwrap_or((0, 0));
+            let (size_bytes, align_bytes) =
+                layout.layout_of(id).map_or((0, 0), |l| (l.size, l.align));
             defs.push(TypeDefinition {
                 id,
                 name: e.name.to_string(),
                 size_bytes,
                 align_bytes,
                 fields: Vec::new(),
-                by_value_dependencies: deps,
+                by_value_dependencies,
             });
         }
     }
+    defs
+}
 
-    let mut registry = crate::registry::ImmutableGlobalRegistry::build_and_validate(defs)
-        .map_err(PipelineError::Semantic)?;
-
+/// Records the variant names of every enum whose variants carry no data.
+fn register_enum_variants(
+    registry: &mut crate::registry::ImmutableGlobalRegistry,
+    modules: &[VxModule],
+) {
     // Variant ordinals for payload-free (C-like) enums, so the flat lowerer resolves `Color::Green`
     // to its discriminant (`1`) and lowers a `match` over it (#227). A data-carrying (tagged-union)
     // enum is skipped -- constructing/matching it stays on the AST path.
@@ -909,7 +1038,7 @@ pub fn build_frozen_registry_with(
             let payload_free = e
                 .variants
                 .iter()
-                .all(|(_, payload)| payload.as_ref().is_none_or(|p| p.is_empty()));
+                .all(|(_, payload)| payload.as_ref().is_none_or(std::vec::Vec::is_empty));
             if payload_free {
                 let variants = e.variants.iter().map(|(name, _)| name.clone()).collect();
                 registry
@@ -919,7 +1048,13 @@ pub fn build_frozen_registry_with(
             }
         }
     }
+}
 
+/// Records every `const` table, sorted by name.
+fn register_const_tables(
+    registry: &mut crate::registry::ImmutableGlobalRegistry,
+    modules: &[VxModule],
+) {
     // `const` tables, which both code generators turn into read-only globals. One the checker
     // refused never reaches here.
     for module in modules {
@@ -932,7 +1067,14 @@ pub fn build_frozen_registry_with(
     registry
         .const_tables
         .sort_by(|a, b| a.name.as_ref().cmp(b.name.as_ref()));
+}
 
+/// Records the field types of every struct and the variant payload types of every enum.
+fn register_struct_and_enum_decls(
+    registry: &mut crate::registry::ImmutableGlobalRegistry,
+    modules: &[VxModule],
+    symbol_map: &crate::syntax::SymbolMap,
+) {
     // Base struct field types, keyed by the struct's GID (#291), so the flat path can substitute a
     // monomorphized instance's type arguments into a generic field type and recover a pointer
     // field's pointee (`Vec<i32>`'s `data : *mut T` -> `*mut i32`) — the field AST types the frozen
@@ -969,7 +1111,10 @@ pub fn build_frozen_registry_with(
             );
         }
     }
+}
 
+/// Records the signature of every function and every `extern` declaration, by name.
+fn register_fn_sigs(registry: &mut crate::registry::ImmutableGlobalRegistry, modules: &[VxModule]) {
     // Function signatures for call resolution in the flat HIR (#198): name -> (GID, return
     // type), GID minted with the resolver's formula. A name defined in more than one module with
     // distinct GIDs is ambiguous for the name-keyed map, so it is dropped rather than resolved wrong.
@@ -1031,7 +1176,10 @@ pub fn build_frozen_registry_with(
     for name in ambiguous_fns {
         registry.fn_sigs.remove(&name);
     }
+}
 
+/// Records the signature of every method in an `impl` block, by receiver type and method name.
+fn register_methods(registry: &mut crate::registry::ImmutableGlobalRegistry, modules: &[VxModule]) {
     // Method signatures keyed by (receiver GID, method name), minted from `impl` blocks (#218). This
     // is the GID-keyed method table that lets the frontend resolve `x.exp()` without walking borrowed
     // AST `ImplBlock`s in `GlobalAstEnv`. The method's GID is minted from its mangled name
@@ -1086,14 +1234,13 @@ pub fn build_frozen_registry_with(
     for key in ambiguous_methods {
         registry.methods.remove(&key);
     }
-
-    Ok(registry)
 }
 
 /// The one formula for a function's registry signature, shared by the freeze point (a module's
 /// declared functions, under the module's hash) and the epoch-2 barrier (the monomorphs the check
 /// phase produced, under module 0). One formula, so the GID a lowered call stores and the GID the
 /// emitter's callee map computes for the same function cannot disagree.
+#[must_use]
 pub fn fn_sig_of(module_hash: u64, f: &syntax::Function) -> crate::registry::FnSig {
     crate::registry::FnSig {
         gid: crate::gid::TypeId::new(
@@ -1159,17 +1306,25 @@ fn method_receiver_gid(ty: &crate::syntax::Type) -> Option<crate::gid::TypeId> {
 /// signatures) plus the flat-HIR bodies of the non-generic free functions that lower completely and
 /// portably. This is the artifact producer -- a downstream compile deserializes it and resolves + links
 /// the module with no AST.
+///
+/// # Errors
+///
+/// Fails when a struct or enum contains itself by value, so it has no finite size.
 pub fn emit_module_interface(modules: &[VxModule]) -> Result<Vec<u8>, PipelineError> {
     emit_module_interface_reporting(modules).map(|(bytes, _)| bytes)
 }
 
 /// [`emit_module_interface`] plus the codec's per-table encoded/skipped accounting, so
 /// `--emit-interface` can report an incomplete artifact at produce time (#292).
+///
+/// # Errors
+///
+/// Fails when a struct or enum contains itself by value, so it has no finite size.
 pub fn emit_module_interface_reporting(
     modules: &[VxModule],
 ) -> Result<(Vec<u8>, crate::metadata::InterfaceEmitReport), PipelineError> {
     let mut registry = build_frozen_registry(modules)?;
-    harvest_bodies(&mut registry, modules)?;
+    harvest_bodies(&mut registry, modules);
     Ok(crate::metadata::serialize_registry_interface_reporting(
         &registry,
     ))
@@ -1179,10 +1334,7 @@ pub fn emit_module_interface_reporting(
 /// keyed by the function's GID (from `fn_sigs`). A function that declines to lower, or whose type stream
 /// still holds a per-compilation deferred GID, is skipped -- fail-closed, so the artifact carries only
 /// linkable bodies. (Methods await flat method-call lowering, #217.)
-fn harvest_bodies(
-    registry: &mut crate::registry::ImmutableGlobalRegistry,
-    modules: &[VxModule],
-) -> Result<(), PipelineError> {
+fn harvest_bodies(registry: &mut crate::registry::ImmutableGlobalRegistry, modules: &[VxModule]) {
     // The lowering session reads the same tables the bodies are attached to.
     let session = std::sync::Arc::new(GlobalSession::with_registry(1, registry.clone()));
     for module in modules {
@@ -1200,7 +1352,7 @@ fn harvest_bodies(
             if worker
                 .local_type_stream
                 .iter()
-                .any(|t| t.is_local_deferred())
+                .any(super::gid::TypeId::is_local_deferred)
             {
                 continue;
             }
@@ -1216,7 +1368,6 @@ fn harvest_bodies(
             );
         }
     }
-    Ok(())
 }
 
 /// The GID of a type held *by value* (a nominal struct/enum, seen through location wrappers that
@@ -1244,7 +1395,7 @@ fn check_one_function(
     func: &mut syntax::Function,
     module_idx: usize,
     global_session: &std::sync::Arc<GlobalSession>,
-    global_env: &GlobalAstEnv,
+    global_env: &GlobalAstEnv<'_>,
     lowering_edge: Option<(syntax::MemorySpace, syntax::MemorySpace, String)>,
 ) -> FunctionCheck {
     let function = func.name.to_string();
@@ -1292,9 +1443,13 @@ fn check_one_function(
 /// are the one part of the frontend this path used to skip entirely: a corpus whose declared
 /// spaces collided onto shared dispatch ids compiled here without a diagnostic while the driver
 /// refused it.
+///
+/// # Errors
+///
+/// Fails with the number of errors when the declarations have any; the errors are already printed.
 fn declaration_check_phase(
     global_session: &std::sync::Arc<GlobalSession>,
-    global_env: &GlobalAstEnv,
+    global_env: &GlobalAstEnv<'_>,
 ) -> Result<Vec<crate::diagnostic::Diagnostic>, PipelineError> {
     let mut worker = LocalWorkerState::new(global_session.clone());
     let mut checker = TypeChecker::new(global_env, &mut worker);
@@ -1394,17 +1549,15 @@ fn imported_errors_to_report(
     errors
 }
 
-/// Per-function checks. The whole-program declaration checks run once in
-/// [`declaration_check_phase`] before this.
-fn type_check_phase(
-    parsed_modules: &mut Vec<VxModule>,
-    global_session: &std::sync::Arc<GlobalSession>,
-    global_env: &GlobalAstEnv,
-    sched: Schedule,
-    reported: &Reported,
-) -> Result<Checked, PipelineError> {
-    // Resolved before the checks run, while the modules can still be read by name.
-    let reported_module: Option<usize> = match reported {
+/// The position of the one module whose diagnostics are reported, or `None` when every module's
+/// diagnostics are.
+///
+/// # Panics
+///
+/// Panics when `reported` names an entry module that is not in `parsed_modules`. The caller that
+/// names an entry module always passes that module too.
+fn reported_module_index(parsed_modules: &[VxModule], reported: &Reported) -> Option<usize> {
+    match reported {
         Reported::EveryModule => None,
         Reported::OnlyEntry(name) => {
             let found = parsed_modules.iter().position(|m| m.module_path == *name);
@@ -1414,59 +1567,127 @@ fn type_check_phase(
             );
             found
         }
-    };
+    }
+}
+
+/// Checks one module one function at a time: its free functions, then its impl methods, then its
+/// transfer lowerings.
+fn check_module_seq(
+    module_idx: usize,
+    module: &mut VxModule,
+    global_session: &std::sync::Arc<GlobalSession>,
+    global_env: &GlobalAstEnv<'_>,
+) -> Vec<FunctionCheck> {
+    let mut results: Vec<FunctionCheck> = module
+        .functions
+        .iter_mut()
+        .map(|f| check_one_function(f, module_idx, global_session, global_env, None))
+        .collect();
+    // A copied default is checked as the instance a call creates, as in the driver.
+    let impl_results: Vec<FunctionCheck> = module
+        .impls
+        .iter_mut()
+        .flat_map(|i| {
+            let copied = &i.copied_defaults;
+            i.methods
+                .iter_mut()
+                .filter(move |f| !copied.contains(&f.name))
+        })
+        .map(|f| check_one_function(f, module_idx, global_session, global_env, None))
+        .collect();
+    results.extend(impl_results);
+    // Transfer lowerings, same walk (#353). Third traversal rather than folded
+    // into the impls one so the order stays module -> functions -> impls -> lowerings
+    // in both branches.
+    let lowering_results: Vec<FunctionCheck> = module
+        .transfer_impls
+        .iter_mut()
+        .flat_map(|t| {
+            let edge = (
+                t.from.clone(),
+                t.to.clone(),
+                t.topology.display_name().clone(),
+            );
+            t.methods.iter_mut().map(move |f| {
+                check_one_function(
+                    f,
+                    module_idx,
+                    global_session,
+                    global_env,
+                    Some(edge.clone()),
+                )
+            })
+        })
+        .collect();
+    results.extend(lowering_results);
+    results
+}
+
+/// [`check_module_seq`] with the functions of the module checked in parallel.
+fn check_module_par(
+    module_idx: usize,
+    module: &mut VxModule,
+    global_session: &std::sync::Arc<GlobalSession>,
+    global_env: &GlobalAstEnv<'_>,
+) -> Vec<FunctionCheck> {
+    let mut results: Vec<FunctionCheck> = module
+        .functions
+        .par_iter_mut()
+        .map(|f| check_one_function(f, module_idx, global_session, global_env, None))
+        .collect();
+    let impl_results: Vec<FunctionCheck> = module
+        .impls
+        .par_iter_mut()
+        .flat_map(|i| {
+            let copied = &i.copied_defaults;
+            i.methods
+                .par_iter_mut()
+                .filter(move |f| !copied.contains(&f.name))
+                .map(|f| check_one_function(f, module_idx, global_session, global_env, None))
+        })
+        .collect();
+    results.extend(impl_results);
+    let lowering_results: Vec<FunctionCheck> = module
+        .transfer_impls
+        .par_iter_mut()
+        .flat_map(|t| {
+            let edge = (
+                t.from.clone(),
+                t.to.clone(),
+                t.topology.display_name().clone(),
+            );
+            t.methods.par_iter_mut().map(move |f| {
+                check_one_function(
+                    f,
+                    module_idx,
+                    global_session,
+                    global_env,
+                    Some(edge.clone()),
+                )
+            })
+        })
+        .collect();
+    results.extend(lowering_results);
+    results
+}
+
+/// Checks every function of every module, in module order.
+fn check_all_functions(
+    parsed_modules: &mut [VxModule],
+    global_session: &std::sync::Arc<GlobalSession>,
+    global_env: &GlobalAstEnv<'_>,
+    sched: Schedule,
+) -> Vec<FunctionCheck> {
     // The two branches are the same walk in the same order — a module's free functions, then its
     // impl methods, modules outermost — differing only in `iter_mut` versus `par_iter_mut`. They are
     // written out rather than abstracted because rayon's iterators share no trait with std's, and an
     // abstraction that papered over that would hide exactly the thing being measured.
-    let check_results: Vec<FunctionCheck> = if sched.is_seq() {
+    if sched.is_seq() {
         parsed_modules
             .iter_mut()
             .enumerate()
             .flat_map(|(module_idx, module)| {
-                let mut results: Vec<FunctionCheck> = module
-                    .functions
-                    .iter_mut()
-                    .map(|f| check_one_function(f, module_idx, global_session, global_env, None))
-                    .collect();
-                // A copied default is checked as the instance a call creates, as in the driver.
-                let impl_results: Vec<FunctionCheck> = module
-                    .impls
-                    .iter_mut()
-                    .flat_map(|i| {
-                        let copied = &i.copied_defaults;
-                        i.methods
-                            .iter_mut()
-                            .filter(move |f| !copied.contains(&f.name))
-                    })
-                    .map(|f| check_one_function(f, module_idx, global_session, global_env, None))
-                    .collect();
-                results.extend(impl_results);
-                // Transfer lowerings, same walk (#353). Third traversal rather than folded
-                // into the impls one so the order stays module -> functions -> impls -> lowerings
-                // in both branches.
-                let lowering_results: Vec<FunctionCheck> = module
-                    .transfer_impls
-                    .iter_mut()
-                    .flat_map(|t| {
-                        let edge = (
-                            t.from.clone(),
-                            t.to.clone(),
-                            t.topology.display_name().to_string(),
-                        );
-                        t.methods.iter_mut().map(move |f| {
-                            check_one_function(
-                                f,
-                                module_idx,
-                                global_session,
-                                global_env,
-                                Some(edge.clone()),
-                            )
-                        })
-                    })
-                    .collect();
-                results.extend(lowering_results);
-                results
+                check_module_seq(module_idx, module, global_session, global_env)
             })
             .collect()
     } else {
@@ -1474,55 +1695,58 @@ fn type_check_phase(
             .par_iter_mut()
             .enumerate()
             .flat_map(|(module_idx, module)| {
-                let mut results: Vec<FunctionCheck> = module
-                    .functions
-                    .par_iter_mut()
-                    .map(|f| check_one_function(f, module_idx, global_session, global_env, None))
-                    .collect();
-                let impl_results: Vec<FunctionCheck> = module
-                    .impls
-                    .par_iter_mut()
-                    .flat_map(|i| {
-                        let copied = &i.copied_defaults;
-                        i.methods
-                            .par_iter_mut()
-                            .filter(move |f| !copied.contains(&f.name))
-                            .map(|f| {
-                                check_one_function(f, module_idx, global_session, global_env, None)
-                            })
-                    })
-                    .collect();
-                results.extend(impl_results);
-                let lowering_results: Vec<FunctionCheck> = module
-                    .transfer_impls
-                    .par_iter_mut()
-                    .flat_map(|t| {
-                        let edge = (
-                            t.from.clone(),
-                            t.to.clone(),
-                            t.topology.display_name().to_string(),
-                        );
-                        t.methods.par_iter_mut().map(move |f| {
-                            check_one_function(
-                                f,
-                                module_idx,
-                                global_session,
-                                global_env,
-                                Some(edge.clone()),
-                            )
-                        })
-                    })
-                    .collect();
-                results.extend(lowering_results);
-                results
+                check_module_par(module_idx, module, global_session, global_env)
             })
             .collect()
-    };
+    }
+}
+
+/// The cross-call capacity fold over every check's summaries. Adds the warnings it finds to
+/// `warnings`, prints the errors it finds, and returns how many errors there were.
+fn fold_capacity(
+    check_results: &[FunctionCheck],
+    global_env: &GlobalAstEnv<'_>,
+    warnings: &mut Vec<crate::diagnostic::Diagnostic>,
+) -> usize {
+    let summaries: Vec<crate::hir::check::capacity_fold::FnCapacitySummary> = check_results
+        .iter()
+        .flat_map(|c| c.capacity_summaries.iter().cloned())
+        .collect();
+    let mut fold_diags = crate::diagnostic::DiagnosticsVec::new();
+    crate::hir::check::capacity_fold::fold_cross_call_capacity(
+        &summaries,
+        global_env,
+        &mut fold_diags,
+    );
+    let fold: Vec<&crate::diagnostic::Diagnostic> = fold_diags.iter().collect();
+    warnings.extend(
+        fold.iter()
+            .filter(|d| d.level == DiagnosticLevel::Warning)
+            .map(|d| (*d).clone()),
+    );
+    report_errors(&fold)
+}
+
+/// Per-function checks. The whole-program declaration checks run once in
+/// [`declaration_check_phase`] before this.
+///
+/// # Errors
+///
+/// Fails with the number of errors when the checks find any; the errors are already printed.
+fn type_check_phase(
+    parsed_modules: &mut [VxModule],
+    global_session: &std::sync::Arc<GlobalSession>,
+    global_env: &GlobalAstEnv<'_>,
+    sched: Schedule,
+    reported: &Reported,
+) -> Result<Checked, PipelineError> {
+    // Resolved before the checks run, while the modules can still be read by name.
+    let reported_module = reported_module_index(parsed_modules, reported);
+    let mut check_results = check_all_functions(parsed_modules, global_session, global_env, sched);
 
     // Errors in an imported module's functions are reported only for the functions the program
     // uses; see `imported_errors`. The whole-program fold below is separate -- it is about this
     // program's call graph, so it always reports.
-    let mut check_results = check_results;
     let imported_errors = match reported_module {
         None => Vec::new(),
         Some(entry) => imported_errors_to_report(parsed_modules, &mut check_results, entry),
@@ -1546,25 +1770,7 @@ fn type_check_phase(
     // The cross-call capacity fold: the one whole-program step, after the parallel phase and
     // reading only what it exported. Same core as the sequential driver, so the two frontends
     // cannot drift on what they refuse.
-    {
-        let summaries: Vec<crate::hir::check::capacity_fold::FnCapacitySummary> = check_results
-            .iter()
-            .flat_map(|c| c.capacity_summaries.iter().cloned())
-            .collect();
-        let mut fold_diags = crate::diagnostic::DiagnosticsVec::new();
-        crate::hir::check::capacity_fold::fold_cross_call_capacity(
-            &summaries,
-            global_env,
-            &mut fold_diags,
-        );
-        let fold: Vec<&crate::diagnostic::Diagnostic> = fold_diags.iter().collect();
-        warnings.extend(
-            fold.iter()
-                .filter(|d| d.level == DiagnosticLevel::Warning)
-                .map(|d| (*d).clone()),
-        );
-        total_errors += report_errors(&fold);
-    }
+    total_errors += fold_capacity(&check_results, global_env, &mut warnings);
 
     let total_monomorphized: usize = check_results.iter().map(|c| c.monomorphs.len()).sum();
 
@@ -1693,12 +1899,20 @@ fn extract_type_streams(
         .collect()
 }
 
+/// Rewrites every worker-local arena index in the type streams to its global index.
+///
+/// # Panics
+///
+/// Panics when a local arena index does not fit in `usize`. Every index was made from the length
+/// of a `Vec`, so this does not happen.
 fn simd_patch_phase(
     all_type_streams: &mut [(usize, Vec<crate::gid::TypeId>)],
     slow_path_thread_mappings: &[Vec<u64>],
     generics_thread_mappings: &[Vec<u64>],
     sched: Schedule,
 ) {
+    use crate::gid::{Word2, Word2Scope};
+
     // The pass runs in every mode, and the *classification* decides what work exists. An earlier
     // version of this file early-returned for `locked`, which also skipped patching the slow-path
     // (lifetime) arena -- those GIDs are still minted worker-local in every mode, so skipping the
@@ -1709,7 +1923,6 @@ fn simd_patch_phase(
     // generic GID for the loop to rewrite, while `deferred` does. The scan itself is shared work
     // that every mode needs for the slow path.
     chatter!("Executing Phase 6: SIMD Patch Pass over Flat Type Streams");
-    use crate::gid::{Word2, Word2Scope};
 
     let patch = |(thread_idx, stream): &mut (usize, Vec<crate::gid::TypeId>)| {
         {
@@ -1728,9 +1941,11 @@ fn simd_patch_phase(
                         scope: Word2Scope::Local,
                     } = gid.classify_word2()
                     {
+                        let index = usize::try_from(index)
+                            .expect("a local arena index was made from a `usize` length");
                         let global_index = match arena {
-                            crate::gid::Word2Arena::Generics => mapping_generics[index as usize],
-                            crate::gid::Word2Arena::SlowMeta => mapping_slow[index as usize],
+                            crate::gid::Word2Arena::Generics => mapping_generics[index],
+                            crate::gid::Word2Arena::SlowMeta => mapping_slow[index],
                         };
                         gid.set_arena_index(global_index, arena, Word2Scope::Global);
                     }
@@ -1912,20 +2127,16 @@ fn lower_bodies_phase<'a>(
 ///
 /// Epoch 2 lives and dies here: the session holding it and the workers that lowered against it are
 /// released before this returns.
-#[allow(clippy::too_many_arguments)]
 fn codegen_mlir_phase(
     parsed_modules: &[VxModule],
     check_results: &mut [FunctionCheck],
-    subspaces: &[crate::codegen::flat::SubspaceInfo],
-    topo_archs: &[(i64, String)],
-    local_devices: &[(i32, i32)],
-    global_session: &std::sync::Arc<GlobalSession>,
+    inputs: &CodegenInputs<'_>,
     merged_arenas: MergedArenas,
-    sched: Schedule,
 ) -> Option<String> {
+    let sched = inputs.sched;
     let (module_buckets, _struct_buckets) = route_monomorphs(parsed_modules, check_results, sched);
     let monos: Vec<syntax::Function> = module_buckets.into_iter().flatten().collect();
-    let session2 = epoch_2_session(global_session, merged_arenas, &monos);
+    let session2 = epoch_2_session(inputs.global_session, merged_arenas, &monos);
     let LoweredBodies {
         funcs: to_emit,
         workers,
@@ -1945,15 +2156,53 @@ fn codegen_mlir_phase(
         }
     }
 
+    let text = emit_lowered_bodies(&to_emit, &workers, &session2.registry, inputs)?;
+    chatter!(
+        "Emitted MLIR for {} functions ({} monomorphized, {} shadowed by an earlier definition)",
+        to_emit.len(),
+        monos.len(),
+        shadowed
+    );
+    Some(text)
+}
+
+/// What codegen reads besides the modules and their checks.
+struct CodegenInputs<'a> {
+    /// The declared memory sub-spaces.
+    subspaces: &'a [crate::codegen::flat::SubspaceInfo],
+    /// The declared architectures, which `vx.spawn` is stamped with.
+    topo_archs: &'a [(i64, String)],
+    /// The local device aliases, for the `vx.local_devices` module attribute.
+    local_devices: &'a [(i32, i32)],
+    /// The session the checks ran against.
+    global_session: &'a std::sync::Arc<GlobalSession>,
+    /// Whether the work runs in parallel or one item at a time.
+    sched: Schedule,
+}
+
+/// One function to emit: its declaration, its flat HIR and its type table.
+type EmitEntry<'a> = (
+    &'a syntax::Function,
+    &'a [crate::bytecode::HirInstruction],
+    &'a [crate::gid::TypeId],
+);
+
+/// One entry of a worker's `local_place_alias_stores` table.
+type PlaceAliasStore = (usize, usize, Vec<usize>);
+
+/// Emits the MLIR for the lowered bodies. `workers` is index-aligned with `to_emit`. `None` when
+/// the emitter declines.
+fn emit_lowered_bodies(
+    to_emit: &[&syntax::Function],
+    workers: &[(LocalWorkerState, crate::decline::Lowered<()>)],
+    registry: &crate::registry::ImmutableGlobalRegistry,
+    inputs: &CodegenInputs<'_>,
+) -> Option<String> {
     // Each entry's type table is its own lowering worker's stream: the lowerer's GIDs are content
     // hashes, so nothing in them waits on the barrier's patch.
-    let funcs: Vec<(
-        &syntax::Function,
-        &[crate::bytecode::HirInstruction],
-        &[crate::gid::TypeId],
-    )> = to_emit
+    let funcs: Vec<EmitEntry<'_>> = to_emit
         .iter()
-        .zip(&workers)
+        .zip(workers)
         .map(|(f, (w, _))| {
             (
                 *f,
@@ -1972,7 +2221,7 @@ fn codegen_mlir_phase(
         .iter()
         .map(|(w, _)| w.local_inline_blocks.as_slice())
         .collect();
-    let alias_tables: Vec<&[(usize, usize, Vec<usize>)]> = workers
+    let alias_tables: Vec<&[PlaceAliasStore]> = workers
         .iter()
         .map(|(w, _)| w.local_place_alias_stores.as_slice())
         .collect();
@@ -1986,29 +2235,32 @@ fn codegen_mlir_phase(
         .flat_map(|(w, _)| w.local_agg_layouts.iter().cloned())
         .collect();
 
-    let text = crate::codegen::flat::emit_module_mlir(
+    crate::codegen::flat::emit_module_mlir(
         &funcs,
-        &session2.registry,
+        registry,
         &tensor_types,
         &string_tables,
         &inline_tables,
         &agg_layouts,
         &alias_tables,
-        subspaces,
-        topo_archs,
-        local_devices,
-        sched,
+        inputs.subspaces,
+        inputs.topo_archs,
+        inputs.local_devices,
+        inputs.sched,
     )
-    .ok()?;
-    chatter!(
-        "Emitted MLIR for {} functions ({} monomorphized, {} shadowed by an earlier definition)",
-        funcs.len(),
-        monos.len(),
-        shadowed
-    );
-    Some(text)
+    .ok()
 }
 
+/// Adds the generated functions and structs to their modules and saves the table of every type
+/// the program uses to a temporary metadata file.
+///
+/// # Errors
+///
+/// Fails when the metadata file cannot be written.
+///
+/// # Panics
+///
+/// In a debug build, panics when the metadata file that was just written cannot be read back.
 fn codegen_and_metadata_phase(
     parsed_modules: &mut [VxModule],
     check_results: &mut [FunctionCheck],
@@ -2045,7 +2297,7 @@ fn codegen_and_metadata_phase(
     let test_path = temp_dir.join(format!("output_{}.vxm", std::process::id()));
 
     VxMetadata::save_to_file(&master_type_dictionary, &test_path)
-        .map_err(|e| PipelineError::IO(format!("Failed to save metadata: {}", e)))?;
+        .map_err(|e| PipelineError::IO(format!("Failed to save metadata: {e}")))?;
 
     chatter!(
         "Saved {} unique TypeIds to {:?}",
@@ -2063,6 +2315,11 @@ fn codegen_and_metadata_phase(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod gid_stream_tests {
     use super::*;
     use crate::gid::{TypeId, LOCAL_DEFERRED_BIT};
@@ -2077,6 +2334,8 @@ mod gid_stream_tests {
     #[test]
     fn deferred_and_content_agree_under_canonical_renumbering() {
         use crate::intern_mode::{canonicalise_stream, InternMode};
+        /// The patched type stream, the global generics arena and its offsets.
+        type Minted = (Vec<TypeId>, Vec<TypeId>, Vec<(usize, usize)>);
 
         // Two distinct instantiations, the second repeated: exercises a fresh mint and a repeat,
         // and gives the canonical ranks something to disagree about if they can.
@@ -2084,7 +2343,7 @@ mod gid_stream_tests {
         let arg_b = vec![TypeId::new(0, 0x2222, 0, 0)];
         let base = TypeId::new(0xAAAA, 0xBBBB, 0, 0);
 
-        let run = |mode: InternMode| -> (Vec<TypeId>, Vec<TypeId>, Vec<(usize, usize)>) {
+        let run = |mode: InternMode| -> Minted {
             let session = Arc::new(GlobalSession::new(1));
             let mut worker = LocalWorkerState::new(session.clone());
             for args in [&arg_a, &arg_b, &arg_a] {
@@ -2129,7 +2388,7 @@ mod gid_stream_tests {
             let offsets = offsets.to_vec();
             move |i: u64| {
                 offsets
-                    .get(i as usize)
+                    .get(usize::try_from(i).expect("an offset index fits in usize"))
                     .map(|&(start, len)| arena[start..start + len].to_vec())
             }
         };
@@ -2189,7 +2448,7 @@ mod gid_stream_tests {
         let m = parse_and_resolve("crate::m", "struct List { next: List }");
         match build_frozen_registry(std::slice::from_ref(&m)) {
             Err(PipelineError::Semantic(msg)) => {
-                assert!(msg.contains("Infinite-sized recursive layout"), "{msg}")
+                assert!(msg.contains("Infinite-sized recursive layout"), "{msg}");
             }
             other => panic!("expected a Semantic cycle error, got {other:?}"),
         }
@@ -2382,9 +2641,34 @@ mod gid_stream_tests {
             .collect();
         assert!(
             hard_errors.is_empty(),
-            "type check reported errors: {:?}",
-            hard_errors
+            "type check reported errors: {hard_errors:?}"
         );
+    }
+
+    /// Checks the `main` of `consumer` against a session that holds `reg`, and returns how many
+    /// errors the check reports. The check sees the signatures in `consumer` but no function
+    /// bodies.
+    fn count_errors_in_main(
+        consumer: &VxModule,
+        reg: crate::registry::ImmutableGlobalRegistry,
+    ) -> usize {
+        let session = Arc::new(GlobalSession::with_registry(1, reg));
+        let env_mods = vec![consumer.clone_signature()];
+        let env = GlobalAstEnv::build(&env_mods);
+        let mut worker = LocalWorkerState::new(session);
+        let mut checker = TypeChecker::new(&env, &mut worker);
+        let mut main_fn = consumer
+            .functions
+            .iter()
+            .find(|f| f.name.as_ref() == "main")
+            .unwrap()
+            .clone();
+        checker.check_function(&mut main_fn);
+        checker
+            .errors
+            .iter()
+            .filter(|d| d.level == DiagnosticLevel::Error)
+            .count()
     }
 
     /// Cross-module return provenance (#265 step 7): the borrow checker refines a reborrow through an
@@ -2443,23 +2727,7 @@ mod gid_stream_tests {
         // and we deliberately do not annotate provenances — modeling a summary that lives only in the
         // interface.
         let run = |reg: crate::registry::ImmutableGlobalRegistry| -> usize {
-            let session = Arc::new(GlobalSession::with_registry(1, reg));
-            let env_mods = vec![consumer.clone_signature()];
-            let env = GlobalAstEnv::build(&env_mods);
-            let mut worker = LocalWorkerState::new(session);
-            let mut checker = TypeChecker::new(&env, &mut worker);
-            let mut main_fn = consumer
-                .functions
-                .iter()
-                .find(|f| f.name.as_ref() == "main")
-                .unwrap()
-                .clone();
-            checker.check_function(&mut main_fn);
-            checker
-                .errors
-                .iter()
-                .filter(|d| d.level == DiagnosticLevel::Error)
-                .count()
+            count_errors_in_main(&consumer, reg)
         };
 
         // With the interface merged, `r` aliases only `y` (slot 1): mutating `y` conflicts, mutating
@@ -2527,23 +2795,7 @@ mod gid_stream_tests {
             reg.merge_from(
                 deserialize_registry_interface(&serialize_registry_interface(&lib_reg)).unwrap(),
             );
-            let session = Arc::new(GlobalSession::with_registry(1, reg));
-            let env_mods = vec![consumer.clone_signature()];
-            let env = GlobalAstEnv::build(&env_mods);
-            let mut worker = LocalWorkerState::new(session);
-            let mut checker = TypeChecker::new(&env, &mut worker);
-            let mut main_fn = consumer
-                .functions
-                .iter()
-                .find(|f| f.name.as_ref() == "main")
-                .unwrap()
-                .clone();
-            checker.check_function(&mut main_fn);
-            checker
-                .errors
-                .iter()
-                .filter(|d| d.level == DiagnosticLevel::Error)
-                .count()
+            count_errors_in_main(&consumer, reg)
         };
 
         // `r` derives from `b` (= `y`): reborrowing `x` is fine, reborrowing `y` conflicts — all with
@@ -2640,8 +2892,8 @@ mod gid_stream_tests {
         );
     }
 
-    /// Cross-module *by-value* recursion is still an infinite-sized layout: A::Node holds B::Other
-    /// by value and B::Other holds A::Node by value. The Phase-2 freeze must detect the cycle across
+    /// Cross-module *by-value* recursion is still an infinite-sized layout: `A::Node` holds `B::Other`
+    /// by value and `B::Other` holds `A::Node` by value. The Phase-2 freeze must detect the cycle across
     /// the module boundary — the cross-module GIDs from #194 make both edges resolvable, so
     /// `toposort` sees the loop.
     #[test]
@@ -2653,7 +2905,7 @@ mod gid_stream_tests {
         name_resolution_phase(&mut modules, Schedule::Parallel);
         match build_frozen_registry(&modules) {
             Err(PipelineError::Semantic(msg)) => {
-                assert!(msg.contains("Infinite-sized recursive layout"), "{msg}")
+                assert!(msg.contains("Infinite-sized recursive layout"), "{msg}");
             }
             other => panic!("expected a cross-module cycle error, got {other:?}"),
         }
@@ -2686,7 +2938,7 @@ mod gid_stream_tests {
         name_resolution_phase(&mut modules, Schedule::Parallel);
         let registry = build_frozen_registry(&modules).expect("registry");
         let session = Arc::new(GlobalSession::with_registry(1, registry));
-        let env_mods: Vec<VxModule> = modules.iter().map(|m| m.clone_signature()).collect();
+        let env_mods: Vec<VxModule> = modules.iter().map(VxModule::clone_signature).collect();
         let env = GlobalAstEnv::build(&env_mods);
 
         let mut results = type_check_phase(
@@ -2713,7 +2965,7 @@ mod gid_stream_tests {
     }
 
     /// Transfer-lowering bodies flow through BOTH schedules of `type_check_phase` (#353).
-    /// The driver path has a FileCheck test asserting the E3002 itself; this is the only coverage
+    /// The driver path has a `FileCheck` test asserting the E3002 itself; this is the only coverage
     /// the pipeline branches have, because no vxc flag reaches them. The phase fails fast on a
     /// semantic error rather than returning diagnostics, so the assertion is Err-vs-Ok -- with a
     /// control (same module, lowering removed) so the failure is attributable to the lowering
@@ -2733,7 +2985,8 @@ fn main() -> i32 { return 0; }
                 name_resolution_phase(&mut modules, Schedule::Parallel);
                 let registry = build_frozen_registry(&modules).expect("registry");
                 let session = Arc::new(GlobalSession::with_registry(1, registry));
-                let env_mods: Vec<VxModule> = modules.iter().map(|m| m.clone_signature()).collect();
+                let env_mods: Vec<VxModule> =
+                    modules.iter().map(VxModule::clone_signature).collect();
                 let env = GlobalAstEnv::build(&env_mods);
                 let result =
                     type_check_phase(&mut modules, &session, &env, sched, &Reported::EveryModule);
@@ -2778,7 +3031,7 @@ fn main() -> i32 { return 0; }
         name_resolution_phase(&mut modules, Schedule::Parallel);
         match build_frozen_registry(&modules) {
             Err(PipelineError::Semantic(msg)) => {
-                assert!(msg.contains("Infinite-sized recursive layout"), "{msg}")
+                assert!(msg.contains("Infinite-sized recursive layout"), "{msg}");
             }
             other => panic!("expected an enum cycle error, got {other:?}"),
         }
@@ -3116,6 +3369,57 @@ fn main() -> i32 { return 0; }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// One module of the memory-algebra corpus: a memory space, a topology that holds it, and a
+    /// function that makes a tensor, transfers it to that space and writes to it in a `spawn`.
+    fn memalg_module(top: &str, mem: &str, edge_cost: &str, entry: &str) -> String {
+        format!(
+            "Memory CPU_DRAM {{}}\n\
+             Memory {mem} {{ within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s }}\n\
+             Topology {top} {{\n\
+             \x20 arch: nvptx64,\n\
+             \x20 memory: Memory::{mem},\n\
+             \x20 visible: [Memory::CPU_DRAM, Memory::{mem}],\n\
+             \x20 transfer Memory::CPU_DRAM -> Memory::{mem} : {edge_cost}\n\
+             }}\n\
+             fn {entry}() -> i32 {{\n\
+             \x20 let mut a = Tensor<f32>([ 2, 2 ]);\n\
+             \x20 a[0][0] = 1.0;\n\
+             \x20 let mut ad = transfer(a, Memory::{mem});\n\
+             \x20 spawn on(Topology::{top}) {{\n\
+             \x20   ad[0][0] = 2.0;\n\
+             \x20 }}\n\
+             \x20 return 0;\n\
+             }}\n"
+        )
+    }
+
+    /// The module of the memory-algebra corpus that has an `impl Transfer`. It lives in its own
+    /// module: the third traversal in `type_check_phase` walks lowerings separately from
+    /// functions and impl methods, and this is what puts anything in it.
+    const MEMALG_LOWERING_MODULE: &str = "Memory CPU_DRAM {}\n\
+         Memory GPU_HBM { within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s }\n\
+         Memory SMEM {\n\
+           within: Memory::GPU_HBM, capacity: 228 KiB, bandwidth: 128 B/cyc,\n\
+           granule: 1 KiB, managed: explicit, scope: sm\n\
+         }\n\
+         Topology Acc {\n\
+           arch: nvptx64,\n\
+           memory: Memory::GPU_HBM,\n\
+           visible: [Memory::GPU_HBM, Memory::SMEM],\n\
+           transfer Memory::CPU_DRAM -> Memory::GPU_HBM : 63 GB/s,\n\
+           transfer Memory::GPU_HBM -> Memory::SMEM\n\
+         }\n\
+         impl Transfer<Memory::GPU_HBM, Memory::SMEM> for Topology::Acc {\n\
+           fn move_tile(src: &Tensor<f32, [2, 2]>, dst: &mut Tensor<f32, [2, 2]>) -> i32 {\n\
+             for i in 0..raw::extent(src) {\n\
+               raw::store(dst, i, raw::load(src, i));\n\
+             }\n\
+             raw::barrier();\n\
+             return 0;\n\
+           }\n\
+         }\n\
+         fn drive() -> i32 { return 0; }\n";
+
     /// The memory-algebra constructs are deterministic across thread counts too.
     ///
     /// Every other determinism test in this file compiles plain arithmetic. So does the corpus
@@ -3129,10 +3433,10 @@ fn main() -> i32 { return 0; }
     /// a transfer resolves a route against it, and a lowering is selected by (edge, machine).
     ///
     /// The topologies are named apart on purpose. Declarations are per-COMPILATION, not per-module
-    /// (docs/parallel_compiler_architecture.md 2.7), so three modules spelling `Topology Dev`
+    /// (`docs/parallel_compiler_architecture.md` 2.7), so three modules spelling `Topology Dev`
     /// differently in one compile is a collision by design and not a race -- the first draft did
     /// exactly that and the transfer resolved against whichever `Dev` won. Cross-compilation
-    /// isolation is a separate guarantee, and architecture_test.rs already pins it.
+    /// isolation is a separate guarantee, and `architecture_test.rs` already pins it.
     #[test]
     fn memalg_constructs_are_deterministic_across_thread_counts() {
         use std::io::Write;
@@ -3141,59 +3445,19 @@ fn main() -> i32 { return 0; }
         std::fs::create_dir_all(&dir).unwrap();
 
         // A placement, a transfer and a spawn, per module, with the topology name shared and the
-        // memory different. `impl Transfer` lives in its own module: the third traversal in
-        // `type_check_phase` walks lowerings separately from functions and impl methods, and this
-        // is what puts anything in it.
-        let module = |top: &str, mem: &str, edge_cost: &str, entry: &str| {
-            format!(
-                "Memory CPU_DRAM {{}}\n\
-                 Memory {mem} {{ within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s }}\n\
-                 Topology {top} {{\n\
-                 \x20 arch: nvptx64,\n\
-                 \x20 memory: Memory::{mem},\n\
-                 \x20 visible: [Memory::CPU_DRAM, Memory::{mem}],\n\
-                 \x20 transfer Memory::CPU_DRAM -> Memory::{mem} : {edge_cost}\n\
-                 }}\n\
-                 fn {entry}() -> i32 {{\n\
-                 \x20 let mut a = Tensor<f32>([ 2, 2 ]);\n\
-                 \x20 a[0][0] = 1.0;\n\
-                 \x20 let mut ad = transfer(a, Memory::{mem});\n\
-                 \x20 spawn on(Topology::{top}) {{\n\
-                 \x20   ad[0][0] = 2.0;\n\
-                 \x20 }}\n\
-                 \x20 return 0;\n\
-                 }}\n"
-            )
-        };
-        let with_lowering = "Memory CPU_DRAM {}\n\
-             Memory GPU_HBM { within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s }\n\
-             Memory SMEM {\n\
-               within: Memory::GPU_HBM, capacity: 228 KiB, bandwidth: 128 B/cyc,\n\
-               granule: 1 KiB, managed: explicit, scope: sm\n\
-             }\n\
-             Topology Acc {\n\
-               arch: nvptx64,\n\
-               memory: Memory::GPU_HBM,\n\
-               visible: [Memory::GPU_HBM, Memory::SMEM],\n\
-               transfer Memory::CPU_DRAM -> Memory::GPU_HBM : 63 GB/s,\n\
-               transfer Memory::GPU_HBM -> Memory::SMEM\n\
-             }\n\
-             impl Transfer<Memory::GPU_HBM, Memory::SMEM> for Topology::Acc {\n\
-               fn move_tile(src: &Tensor<f32, [2, 2]>, dst: &mut Tensor<f32, [2, 2]>) -> i32 {\n\
-                 for i in 0..raw::extent(src) {\n\
-                   raw::store(dst, i, raw::load(src, i));\n\
-                 }\n\
-                 raw::barrier();\n\
-                 return 0;\n\
-               }\n\
-             }\n\
-             fn drive() -> i32 { return 0; }\n";
+        // memory different.
 
         let srcs = [
-            ("m0.vx", module("DevA", "GPU_HBM", "63 GB/s", "main")),
-            ("m1.vx", module("DevB", "NPU_HBM", "40 GB/s", "run_b")),
-            ("m2.vx", module("DevC", "Local_SRAM", "128 GB/s", "run_c")),
-            ("m3.vx", with_lowering.to_string()),
+            ("m0.vx", memalg_module("DevA", "GPU_HBM", "63 GB/s", "main")),
+            (
+                "m1.vx",
+                memalg_module("DevB", "NPU_HBM", "40 GB/s", "run_b"),
+            ),
+            (
+                "m2.vx",
+                memalg_module("DevC", "Local_SRAM", "128 GB/s", "run_c"),
+            ),
+            ("m3.vx", MEMALG_LOWERING_MODULE.to_string()),
         ];
         let mut paths = Vec::new();
         for (name, src) in &srcs {
@@ -3350,7 +3614,8 @@ fn main() -> i32 { return 0; }
                 name_resolution_phase(&mut modules, Schedule::Parallel);
                 let registry = build_frozen_registry(&modules).expect("registry");
                 let session = Arc::new(GlobalSession::with_registry(1, registry));
-                let env_mods: Vec<VxModule> = modules.iter().map(|m| m.clone_signature()).collect();
+                let env_mods: Vec<VxModule> =
+                    modules.iter().map(VxModule::clone_signature).collect();
                 let env = GlobalAstEnv::build(&env_mods);
                 let mut results = type_check_phase(
                     &mut modules,

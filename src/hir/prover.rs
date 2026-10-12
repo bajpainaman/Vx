@@ -10,17 +10,27 @@
 //
 //===----------------------------------------------------------------------===//
 
-use crate::syntax::*;
+use crate::syntax::{
+    BinaryOp, Expr, LogicalOp, NumberExpr, RelationalOp, RelationalOpExpr, Span, Topology, UnaryOp,
+    UnaryOpExpr,
+};
+use std::fmt::Write as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+/// A set of integer facts that `z3` is asked to check together.
 pub struct SmtProver {
     assertions: Vec<String>,
     declarations: std::collections::HashSet<String>,
 }
 
 impl SmtProver {
-    #[allow(clippy::new_without_default)]
+    /// A prover with no facts yet.
+    #[allow(
+        clippy::new_without_default,
+        reason = "a prover is always made on purpose, with `new`"
+    )]
+    #[must_use]
     pub fn new() -> Self {
         Self {
             assertions: Vec::new(),
@@ -28,17 +38,23 @@ impl SmtProver {
         }
     }
 
+    /// Asks `z3` whether all the facts added so far can be true at the same time.
+    ///
+    /// # Errors
+    /// When `z3` is not installed, cannot be started or written to, or prints neither `sat` nor
+    /// `unsat`.
     pub fn prove(&self) -> Result<bool, String> {
         let mut script = String::new();
         // Setup QF_LIA (Quantifier-Free Linear Integer Arithmetic)
         script.push_str("(set-logic QF_LIA)\n");
 
         for decl in &self.declarations {
-            script.push_str(&format!("(declare-const {} Int)\n", decl));
+            writeln!(script, "(declare-const {decl} Int)")
+                .expect("writing to a String cannot fail");
         }
 
         for assertion in &self.assertions {
-            script.push_str(&format!("(assert {})\n", assertion));
+            writeln!(script, "(assert {assertion})").expect("writing to a String cannot fail");
         }
 
         script.push_str("(check-sat)\n");
@@ -60,7 +76,7 @@ impl SmtProver {
                 // `VX_ALLOW_UNVERIFIED`, a warning that says so every time.
                 return Err(crate::hir::solver::missing_message(&e.to_string()));
             }
-            Err(e) => return Err(format!("Failed to spawn z3: {}", e)),
+            Err(e) => return Err(format!("Failed to spawn z3: {e}")),
         };
 
         if let Some(mut stdin) = child.stdin.take() {
@@ -79,47 +95,46 @@ impl SmtProver {
         } else if has_unsat {
             Ok(false)
         } else {
-            Err(format!("Unexpected z3 output: {}", result_str))
+            Err(format!("Unexpected z3 output: {result_str}"))
         }
     }
 
+    /// Adds `expr` as a fact that must hold.
+    ///
+    /// # Errors
+    /// When `expr` contains something the prover cannot model. The error names it.
     pub fn add_constraint(&mut self, expr: &Expr) -> Result<(), String> {
         let smt_expr = self.lower_expr(expr)?;
         self.assertions.push(smt_expr);
         Ok(())
     }
 
+    /// Records `name` as an integer constant the script must declare, and gives it back.
+    fn declared(&mut self, name: String) -> String {
+        self.declarations.insert(name.clone());
+        name
+    }
+
+    /// `expr` as SMT-LIB text, declaring every name it reads as an integer constant.
+    ///
+    /// # Errors
+    /// When `expr` contains something the prover cannot model. The error names it.
     fn lower_expr(&mut self, expr: &Expr) -> Result<String, String> {
         match expr {
             Expr::Number(n) => Ok(n.value.to_string()),
-            Expr::Identifier(id) => {
-                let name = id.name.replace(".", "_");
-                self.declarations.insert(name.clone());
-                Ok(name)
-            }
+            Expr::Identifier(id) => Ok(self.declared(id.name.replace('.', "_"))),
             Expr::BinaryOp(b) => {
                 let lhs = self.lower_expr(&b.lhs)?;
                 let rhs = self.lower_expr(&b.rhs)?;
-                let op = match b.op {
-                    BinaryOp::Add => "+",
-                    BinaryOp::Sub => "-",
-                    BinaryOp::Mul => "*",
-                    _ => return Err(format!("the `{:?}` operator", b.op)),
-                };
-                Ok(format!("({} {} {})", op, lhs, rhs))
+                let op =
+                    smt_arithmetic_op(&b.op).ok_or_else(|| format!("the `{:?}` operator", b.op))?;
+                Ok(format!("({op} {lhs} {rhs})"))
             }
             Expr::RelationalOp(r) => {
                 let lhs = self.lower_expr(&r.lhs)?;
                 let rhs = self.lower_expr(&r.rhs)?;
-                let op = match r.op {
-                    RelationalOp::Eq => "=",
-                    RelationalOp::NotEq => "distinct",
-                    RelationalOp::Lt => "<",
-                    RelationalOp::Le => "<=",
-                    RelationalOp::Gt => ">",
-                    RelationalOp::Ge => ">=",
-                };
-                Ok(format!("({} {} {})", op, lhs, rhs))
+                let op = smt_relational_op(&r.op);
+                Ok(format!("({op} {lhs} {rhs})"))
             }
             Expr::LogicalOp(l) => {
                 let lhs = self.lower_expr(&l.lhs)?;
@@ -128,69 +143,86 @@ impl SmtProver {
                     LogicalOp::And => "and",
                     LogicalOp::Or => "or",
                 };
-                Ok(format!("({} {} {})", op, lhs, rhs))
+                Ok(format!("({op} {lhs} {rhs})"))
             }
             Expr::UnaryOp(u) => {
                 let inner = self.lower_expr(&u.expr)?;
                 match u.op {
-                    UnaryOp::Not => Ok(format!("(not {})", inner)),
-                    UnaryOp::Neg => Ok(format!("(- {})", inner)),
+                    UnaryOp::Not => Ok(format!("(not {inner})")),
+                    UnaryOp::Neg => Ok(format!("(- {inner})")),
                 }
             }
             Expr::MemberAccess(m) => {
                 let base = self.lower_expr(&m.base)?;
-                let field = m.member.replace(".", "_");
-                let name = format!("{}_{}", base, field);
-                self.declarations.insert(name.clone());
-                Ok(name)
+                let field = m.member.replace('.', "_");
+                Ok(self.declared(format!("{base}_{field}")))
             }
             Expr::IndexAccess(i) => {
                 let base = self.lower_expr(&i.base)?;
                 let index = self.lower_expr(&i.index)?;
                 // For now, treat array indexing as a flattened variable (e.g. a_0).
                 // Full theory of arrays would require (select a 0).
-                let name = format!("{}_{}", base, index);
-                self.declarations.insert(name.clone());
-                Ok(name)
+                Ok(self.declared(format!("{base}_{index}")))
             }
-            Expr::Topology(t) => {
-                let name = match &t.top {
-                    Topology::CPU => "Topology_Host".to_string(),
-                    Topology::NPU(e) => {
-                        if let Expr::Number(n) = &**e {
-                            format!("Topology_NPU_{}", n.value)
-                        } else {
-                            "Topology_NPU".to_string()
-                        }
-                    }
-                    Topology::AccCore(e) => {
-                        if let Expr::Number(n) = &**e {
-                            format!("Topology_AccCore_{}", n.value)
-                        } else {
-                            "Topology_AccCore".to_string()
-                        }
-                    }
-                    Topology::AMX => "Topology_AMX".to_string(),
-                    Topology::ANE => "Topology_ANE".to_string(),
-                    Topology::GPU(e) => {
-                        if let Expr::Number(n) = &**e {
-                            format!("Topology_GPU_{}", n.value)
-                        } else {
-                            "Topology_GPU".to_string()
-                        }
-                    }
-                    _ => "Topology_Complex".to_string(),
-                };
-                self.declarations.insert(name.clone());
-                Ok(name)
-            }
+            Expr::Topology(t) => Ok(self.declared(topology_constant_name(&t.top))),
             Expr::EnumVariant(e) => {
-                let name = format!("{}_{}", e.enum_name, e.variant_name);
-                self.declarations.insert(name.clone());
-                Ok(name)
+                Ok(self.declared(format!("{}_{}", e.enum_name, e.variant_name)))
             }
             _ => Err(format!("a `{}` expression", kind_name(expr))),
         }
+    }
+}
+
+/// The SMT-LIB spelling of `+`, `-` or `*`, or `None` for an operator the prover does not model.
+fn smt_arithmetic_op(op: &BinaryOp) -> Option<&'static str> {
+    match op {
+        BinaryOp::Add => Some("+"),
+        BinaryOp::Sub => Some("-"),
+        BinaryOp::Mul => Some("*"),
+        _ => None,
+    }
+}
+
+/// The SMT-LIB spelling of a comparison operator.
+fn smt_relational_op(op: &RelationalOp) -> &'static str {
+    match op {
+        RelationalOp::Eq => "=",
+        RelationalOp::NotEq => "distinct",
+        RelationalOp::Lt => "<",
+        RelationalOp::Le => "<=",
+        RelationalOp::Gt => ">",
+        RelationalOp::Ge => ">=",
+    }
+}
+
+/// The name of the integer constant that stands for the topology `top` in the SMT script.
+fn topology_constant_name(top: &Topology) -> String {
+    match top {
+        Topology::CPU => "Topology_Host".to_string(),
+        Topology::NPU(e) => {
+            if let Expr::Number(n) = &**e {
+                format!("Topology_NPU_{}", n.value)
+            } else {
+                "Topology_NPU".to_string()
+            }
+        }
+        Topology::AccCore(e) => {
+            if let Expr::Number(n) = &**e {
+                format!("Topology_AccCore_{}", n.value)
+            } else {
+                "Topology_AccCore".to_string()
+            }
+        }
+        Topology::AMX => "Topology_AMX".to_string(),
+        Topology::ANE => "Topology_ANE".to_string(),
+        Topology::GPU(e) => {
+            if let Expr::Number(n) = &**e {
+                format!("Topology_GPU_{}", n.value)
+            } else {
+                "Topology_GPU".to_string()
+            }
+        }
+        _ => "Topology_Complex".to_string(),
     }
 }
 
@@ -218,9 +250,10 @@ pub fn is_modelled(e: &Expr) -> bool {
 /// `e` with each name in `names` replaced by its expression: a callee's `requires` with the call's
 /// arguments in place of the parameters. Only the kinds of expression `is_modelled` accepts are
 /// walked; anything else is left as it is.
-pub fn substitute_names(
+#[must_use]
+pub fn substitute_names<S: std::hash::BuildHasher>(
     e: &Expr,
-    names: &std::collections::HashMap<crate::symbol::Symbol, Expr>,
+    names: &std::collections::HashMap<crate::symbol::Symbol, Expr, S>,
 ) -> Expr {
     let sub = |x: &Expr| Box::new(substitute_names(x, names));
     match e {
@@ -264,6 +297,7 @@ pub fn substitute_names(
 }
 
 /// `e` as Vx source, for the kinds of expression `is_modelled` accepts, or `None` for any other.
+#[must_use]
 pub fn to_source(e: &Expr) -> Option<String> {
     Some(match e {
         Expr::Number(n) => n.value.to_string(),
@@ -316,6 +350,7 @@ fn kind_name(e: &Expr) -> String {
 }
 
 /// `!e`.
+#[must_use]
 pub fn negate(e: &Expr) -> Expr {
     Expr::UnaryOp(UnaryOpExpr {
         op: UnaryOp::Not,
@@ -325,6 +360,7 @@ pub fn negate(e: &Expr) -> Expr {
 }
 
 /// A fact that is never true, `0 == 1`: what is known where control cannot reach.
+#[must_use]
 pub fn unreachable_fact() -> Expr {
     let number = |v: &str| {
         Box::new(Expr::Number(NumberExpr::new(

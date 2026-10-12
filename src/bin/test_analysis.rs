@@ -17,8 +17,8 @@ fn main() {
     host.apply_change(uri.to_string(), text);
     let analysis = host.snapshot();
     let hover = analysis.hover(uri, 14, 48);
-    println!("Hover result 48: {:?}", hover);
+    println!("Hover result 48: {hover:?}");
 
     let def = analysis.goto_definition(uri, 14, 48);
-    println!("Definition 48: {:?}", def);
+    println!("Definition 48: {def:?}");
 }

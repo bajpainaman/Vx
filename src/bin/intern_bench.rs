@@ -74,7 +74,7 @@ fn phase_report(samples: Vec<Vec<(&'static str, Duration)>>) -> Vec<(&'static st
 fn scaling_rows(cells: &[&Vec<(&'static str, f64)>]) -> Vec<&'static str> {
     let mut rows: Vec<&'static str> = Vec::new();
     for cell in cells {
-        for (name, _) in cell.iter() {
+        for (name, _) in *cell {
             if !rows.contains(name) {
                 rows.push(name);
             }
@@ -132,8 +132,7 @@ fn run_in(
             Some(
                 vxc::pipeline::compile_pipeline_mlir_in(paths, sched, mode)
                     .expect("pipeline")
-                    .map(|t| t.len())
-                    .unwrap_or(0),
+                    .map_or(0, |t| t.len()),
             )
         } else {
             let _ = vxc::pipeline::compile_pipeline_type_stream_in(paths, sched, mode)
@@ -253,9 +252,7 @@ fn main() {
         ladder.extend(threads.iter().copied());
     }
 
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let over = threads.iter().filter(|&&t| t > cores).count();
     if over > 0 {
         eprintln!(
@@ -519,7 +516,7 @@ fn main() {
                     let Some(base_ph) = phase_medians.get(&(label, base_key)) else {
                         continue;
                     };
-                    eprintln!("\n  per-phase scaling [{label}], baseline = {}:", base_tag);
+                    eprintln!("\n  per-phase scaling [{label}], baseline = {base_tag}:");
                     eprint!("  {:<16}", "phase");
                     for &t in &ladder {
                         eprint!(
@@ -551,22 +548,19 @@ fn main() {
                         let base_ms = base_ph
                             .iter()
                             .find(|(n, _)| n == name)
-                            .map(|(_, v)| *v)
-                            .unwrap_or(0.0);
+                            .map_or(0.0, |(_, v)| *v);
                         eprint!("  {name:<16}");
                         for &t in &ladder {
                             let v = phase_medians
                                 .get(&(label, t))
                                 .and_then(|p| p.iter().find(|(n, _)| n == name))
-                                .map(|(_, v)| *v)
-                                .unwrap_or(f64::NAN);
+                                .map_or(f64::NAN, |(_, v)| *v);
                             eprint!("{v:>9.1}");
                         }
                         let at_max = phase_medians
                             .get(&(label, max_t))
                             .and_then(|p| p.iter().find(|(n, _)| n == name))
-                            .map(|(_, v)| *v)
-                            .unwrap_or(f64::NAN);
+                            .map_or(f64::NAN, |(_, v)| *v);
                         eprintln!(
                             "{:>9.2}{:>9.1}%",
                             base_ms / at_max,
@@ -579,14 +573,11 @@ fn main() {
                     }
                     eprint!("  {:<16}", "unaccounted");
                     for &t in &ladder {
-                        let named = phase_medians.get(&(label, t)).map(top).unwrap_or(f64::NAN);
+                        let named = phase_medians.get(&(label, t)).map_or(f64::NAN, top);
                         eprint!("{:>9.1}", at(label, t) - named);
                     }
                     let named_base: f64 = base_total;
-                    let named_max: f64 = phase_medians
-                        .get(&(label, max_t))
-                        .map(top)
-                        .unwrap_or(f64::NAN);
+                    let named_max: f64 = phase_medians.get(&(label, max_t)).map_or(f64::NAN, top);
                     eprintln!(
                         "{:>9.2}{:>9.1}%",
                         (at(label, base_key) - named_base) / (at(label, max_t) - named_max),

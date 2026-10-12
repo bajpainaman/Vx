@@ -85,7 +85,7 @@ fn normalize(s: &str) -> String {
         out.push_str(&rest[..pos]);
         out.push_str("0x<ptr>");
         let after = &rest[pos + 2..];
-        let hexlen = after.chars().take_while(|c| c.is_ascii_hexdigit()).count();
+        let hexlen = after.chars().take_while(char::is_ascii_hexdigit).count();
         rest = &after[hexlen..];
     }
     out.push_str(rest);
@@ -118,7 +118,7 @@ fn ast_llvm(src: &str) -> String {
         checker
             .errors
             .iter()
-            .map(|d| d.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n")
     );
@@ -3020,7 +3020,7 @@ fn flat_lowers_nested_logical_ops() {
 /// Flat-only exit-code assertion, for a construct the AST oracle can't JIT (so there is no parity
 /// to assert). The AST codegen emits a value array literal as `tensor.from_elements` + `tensor.extract`
 /// that *fails MLIR verification* at lowering — so array programs never JIT through `--legacy-codegen`
-/// (they only pass the emit-mlir FileCheck tests). The flat path lowers them correctly (a memref
+/// (they only pass the emit-mlir `FileCheck` tests). The flat path lowers them correctly (a memref
 /// buffer + element stores + `TensorIndex` loads), so it is the reference here: we assert the flat
 /// exit code directly rather than compare to a broken oracle (#239).
 fn assert_flat_exit(src: &str, expected: i32) {
@@ -3618,7 +3618,7 @@ fn flat_matches_ast_tensor_returning_callee() {
 }
 
 /// Vx#398 family 1: `v[0]` on a `Vec` reached the AST index lowering as a struct base and
-/// emitted `memref.load` on it -- the whole macro_vec set failed to compile on the default
+/// emitted `memref.load` on it -- the whole `macro_vec` set failed to compile on the default
 /// path. The checker now rewrites container index reads to the container's own `get`, one
 /// construct for both backends; the program's own asserts check the values.
 #[test]

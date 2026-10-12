@@ -11,7 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::TypeChecker;
 
 /// How much standing the topology a transfer lowering names has in this compilation. The three
 /// cases need different diagnostics, because only one of them is fixable by editing an edge
@@ -27,6 +27,31 @@ enum TopologyStanding {
     Unknown,
 }
 
+/// The names the parser always resolves to a built-in topology.
+const BUILTIN_TOPOLOGY_NAMES: &[&str] = &[
+    "CPU",
+    "Current",
+    "NPU",
+    "AccCore",
+    "AMX",
+    "ANE",
+    "GPU",
+    "CpuAvx512",
+    "CPU_AVX512",
+    "CpuNeon",
+    "CPU_Neon",
+];
+
+/// How many lowerings each (source space, target space, topology name) has.
+type LoweringCounts = std::collections::HashMap<
+    (
+        crate::syntax::MemorySpace,
+        crate::syntax::MemorySpace,
+        String,
+    ),
+    usize,
+>;
+
 impl TypeChecker<'_> {
     /// Check the coherence obligations of every user-defined topology registered for this
     /// compilation, emitting diagnostics for incoherent declarations.
@@ -39,25 +64,21 @@ impl TypeChecker<'_> {
     pub fn check_topology_coherence(&mut self, declared: &[crate::arch::TopologyDecl]) {
         // Identity checks first (E6016): a topology whose declaration cannot take effect fails
         // here, before any coherence rule reads the declaration as though it were in force.
-        //
-        // Shadowing: the parser resolves built-in names unconditionally (`Topology::GPU` is the
-        // built-in GPU whatever the program declares), so a declaration under such a name
-        // registers as Custom("GPU") and is unreachable from every use site. Found by review on
-        // Vx#352: `Topology GPU { arch: applegpu }` still produced an NVPTX image via the band,
-        // the machine file's word silently discarded.
-        const BUILTIN_TOPOLOGY_NAMES: &[&str] = &[
-            "CPU",
-            "Current",
-            "NPU",
-            "AccCore",
-            "AMX",
-            "ANE",
-            "GPU",
-            "CpuAvx512",
-            "CPU_AVX512",
-            "CpuNeon",
-            "CPU_Neon",
-        ];
+        self.check_builtin_names_not_shadowed(declared);
+        self.check_dispatch_ids_distinct(declared);
+        for decl in declared {
+            self.check_descriptor_coherence(decl);
+            self.check_one_cost_source_per_edge(decl);
+            self.check_relaxed_edges_keep_visibility(decl);
+        }
+    }
+
+    /// Report each declared topology whose name is also the name of a built-in topology.
+    ///
+    /// Shadowing: the parser resolves built-in names unconditionally (`Topology::GPU` is the
+    /// built-in GPU whatever the program declares), so a declaration under such a name
+    /// registers as Custom("GPU") and is unreachable from every use site.
+    fn check_builtin_names_not_shadowed(&mut self, declared: &[crate::arch::TopologyDecl]) {
         for decl in declared {
             if BUILTIN_TOPOLOGY_NAMES.contains(&decl.name.as_ref()) {
                 self.errors.error_with_code(
@@ -72,160 +93,173 @@ impl TypeChecker<'_> {
                 );
             }
         }
-        // Dispatch-id collision: the id is a hash of the name, so two names can share one id.
-        // Everything keyed by the id -- spawn dispatch,
-        // seam identity, and now the declared-arch table -- then depends on hash-iteration order
-        // for which declaration wins; measured as the same program getting a device image on some
-        // runs and not others. Refused, because a coin-flip identity is not an identity.
-        {
-            let mut by_id: std::collections::HashMap<i32, &crate::symbol::Symbol> =
-                std::collections::HashMap::new();
-            let mut sorted: Vec<&crate::arch::TopologyDecl> = declared.iter().collect();
-            sorted.sort_by(|a, b| a.name.as_ref().cmp(b.name.as_ref()));
-            for decl in sorted {
-                let id = crate::arch::topology_dispatch_id(&crate::syntax::Topology::Custom(
-                    decl.name.clone(),
-                ));
-                if let Some(prev) = by_id.insert(id, &decl.name) {
-                    if prev != &decl.name {
-                        self.errors.error_with_code(
-                            crate::diagnostic::DiagnosticCode::E6016,
-                            format!(
-                                "topologies '{}' and '{}' collide on dispatch id {} (custom ids \
-                                 are derived from the name by hashing); which declaration is in \
-                                 force would be hash order -- rename one",
-                                prev, decl.name, id
-                            ),
-                            None,
-                        );
-                    }
+    }
+
+    /// Report two declared topologies whose names hash to the same dispatch id.
+    ///
+    /// Dispatch-id collision: the id is a hash of the name, so two names can share one id.
+    /// Everything keyed by the id -- spawn dispatch, seam identity, and the declared-arch
+    /// table -- then depends on hash-iteration order for which declaration wins; measured as
+    /// the same program getting a device image on some runs and not others. Refused, because a
+    /// coin-flip identity is not an identity.
+    fn check_dispatch_ids_distinct(&mut self, declared: &[crate::arch::TopologyDecl]) {
+        let mut by_id: std::collections::HashMap<i32, &crate::symbol::Symbol> =
+            std::collections::HashMap::new();
+        let mut sorted: Vec<&crate::arch::TopologyDecl> = declared.iter().collect();
+        sorted.sort_by(|a, b| a.name.as_ref().cmp(b.name.as_ref()));
+        for decl in sorted {
+            let id = crate::arch::topology_dispatch_id(&crate::syntax::Topology::Custom(
+                decl.name.clone(),
+            ));
+            if let Some(prev) = by_id.insert(id, &decl.name) {
+                if prev != &decl.name {
+                    self.errors.error_with_code(
+                        crate::diagnostic::DiagnosticCode::E6016,
+                        format!(
+                            "topologies '{}' and '{}' collide on dispatch id {} (custom ids \
+                             are derived from the name by hashing); which declaration is in \
+                             force would be hash order -- rename one",
+                            prev, decl.name, id
+                        ),
+                        None,
+                    );
                 }
             }
         }
-        for decl in declared {
-            let name = &decl.name;
-            for issue in
-                crate::arch::descriptor_coherence(&decl.descriptor, self.transfer_cost_graph)
-            {
-                match issue {
-                    crate::arch::CoherenceIssue::DefaultNotVisible => {
-                        self.errors.error_with_code(
-                            crate::diagnostic::DiagnosticCode::E6005,
-                            format!(
-                                "topology '{name}' is incoherent: it cannot see its own default \
-                                 memory space (not in its visibility set)"
-                            ),
-                            None,
-                        );
-                    }
-                    crate::arch::CoherenceIssue::MemoryUnreachableFromHost => {
-                        self.errors.warn(
-                            crate::diagnostic::DiagnosticCode::W1026,
-                            format!(
-                                "topology '{name}': its memory is unreachable from the host; \
-                                 declare a `transfer` edge so data can reach it"
-                            ),
-                            None,
-                        );
-                    }
+    }
+
+    /// Report a topology that cannot see its own default memory space, or whose memory the
+    /// host cannot reach.
+    fn check_descriptor_coherence(&mut self, decl: &crate::arch::TopologyDecl) {
+        let name = &decl.name;
+        for issue in crate::arch::descriptor_coherence(&decl.descriptor, self.transfer_cost_graph) {
+            match issue {
+                crate::arch::CoherenceIssue::DefaultNotVisible => {
+                    self.errors.error_with_code(
+                        crate::diagnostic::DiagnosticCode::E6005,
+                        format!(
+                            "topology '{name}' is incoherent: it cannot see its own default \
+                             memory space (not in its visibility set)"
+                        ),
+                        None,
+                    );
+                }
+                crate::arch::CoherenceIssue::MemoryUnreachableFromHost => {
+                    self.errors.warn(
+                        crate::diagnostic::DiagnosticCode::W1026,
+                        format!(
+                            "topology '{name}': its memory is unreachable from the host; \
+                             declare a `transfer` edge so data can reach it"
+                        ),
+                        None,
+                    );
                 }
             }
+        }
+    }
 
-            // S2: exactly one cost source per edge. An edge that declares a cost
-            // while its endpoints already supply a derivable one has two, and the compiler used
-            // both -- routing by the declared number and reporting the derived one. Rejected at
-            // declaration time rather than resolved by a precedence rule, because a precedence
-            // rule silently discards a figure someone wrote down on purpose.
-            //
-            // Probed with one byte: derivability is a property of the containment tree and the
-            // presence of `bandwidth:`, not of the transfer size.
-            {
-                let hierarchy =
-                    crate::hir::memory::MemoryHierarchy::build(self.env.memories.values().copied());
-                for edge in &decl.descriptor.transfers {
-                    if edge.cost == crate::arch::EdgeCost::Derived {
-                        continue;
-                    }
-                    if hierarchy
-                        .derived_transfer_cost(&edge.from, &edge.to, 1)
-                        .is_some()
-                    {
-                        self.errors.error_with_code(
-                            crate::diagnostic::DiagnosticCode::E6013,
-                            format!(
-                                "topology '{name}': transfer Memory::{} -> Memory::{} declares a \
-                                 cost, but one is already derivable from the `bandwidth:` of the \
-                                 spaces it connects -- an edge gets exactly one cost source. Drop \
-                                 the `: …` to use the bandwidth-derived cost, or remove the \
-                                 `bandwidth:` from a space if the declared figure is the one you \
-                                 mean.",
-                                edge.from.name(),
-                                edge.to.name()
-                            ),
-                            None,
-                        );
-                    }
-                }
+    /// Report a transfer edge that declares a cost when one can already be derived.
+    ///
+    /// S2: exactly one cost source per edge. An edge that declares a cost while its endpoints
+    /// already supply a derivable one has two, and the compiler used both -- routing by the
+    /// declared number and reporting the derived one. Rejected at declaration time rather than
+    /// resolved by a precedence rule, because a precedence rule silently discards a figure
+    /// someone wrote down on purpose.
+    ///
+    /// Probed with one byte: derivability is a property of the containment tree and the
+    /// presence of `bandwidth:`, not of the transfer size.
+    fn check_one_cost_source_per_edge(&mut self, decl: &crate::arch::TopologyDecl) {
+        let name = &decl.name;
+        let hierarchy =
+            crate::hir::memory::MemoryHierarchy::build(self.env.memories.values().copied());
+        for edge in &decl.descriptor.transfers {
+            if edge.cost == crate::arch::EdgeCost::Derived {
+                continue;
             }
+            if hierarchy
+                .derived_transfer_cost(&edge.from, &edge.to, 1)
+                .is_some()
+            {
+                self.errors.error_with_code(
+                    crate::diagnostic::DiagnosticCode::E6013,
+                    format!(
+                        "topology '{name}': transfer Memory::{} -> Memory::{} declares a \
+                         cost, but one is already derivable from the `bandwidth:` of the \
+                         spaces it connects -- an edge gets exactly one cost source. Drop \
+                         the `: …` to use the bandwidth-derived cost, or remove the \
+                         `bandwidth:` from a space if the declared figure is the one you \
+                         mean.",
+                        edge.from.name(),
+                        edge.to.name()
+                    ),
+                    None,
+                );
+            }
+        }
+    }
 
-            // Consistency obligation, discharged via the seam engine: a relaxed edge that
-            // carries a payload does not preserve the buffer's visibility.
-            for edge in &decl.descriptor.transfers {
-                if edge.sync {
-                    continue;
-                }
-                use crate::hir::seam::{AbsState, Cell, Transfer, Verdict};
-                let reached = AbsState {
-                    cells: vec![("payload".into(), Cell::constant(1))],
-                };
-                let transfer = Transfer::Relaxed {
-                    published: vec!["payload".into()],
-                };
-                if self.seam.solver.is_none() {
-                    self.seam.solver = Some(crate::hir::seam::Solver::new());
-                }
-                let solver = self.seam.solver.as_mut().unwrap();
-                // `if let Ok(Reject)` used to be the whole of this: an Err -- including "no
-                // solver available" -- fell through the pattern and the edge was silently
-                // treated as if it had been proved coherent (Vx#374). An obligation that could
-                // not be discharged is reported as such.
-                match solver.check_seam_buffers(&reached, &transfer, &["payload".to_string()]) {
-                    Ok(Verdict::Reject { .. }) => {
-                        self.errors.warn(
-                            crate::diagnostic::DiagnosticCode::W1027,
-                            format!(
-                                "topology '{name}': declared relaxed transfer {} -> {} does \
-                                 not preserve visibility; a consumer may read stale data",
-                                edge.from.name(),
-                                edge.to.name()
-                            ),
-                            None,
-                        );
-                    }
-                    Ok(Verdict::Accept) => {}
-                    Err(e) => {
-                        // An obligation that could not be discharged fails the build, unless the
-                        // user has explicitly accepted unverified compilation -- in which case it
-                        // is still said out loud, every time. The two must not look alike.
-                        // Spaces by name: `{:?}` renders a declared one as
-                        // `Custom("SMEM")`, which names the compiler's representation
-                        // rather than anything the program wrote.
-                        let msg = format!(
-                            "topology '{name}': the visibility of relaxed transfer {} -> {} \
-                             was NOT verified: {e}",
+    /// Report a relaxed transfer edge after which a reader may see stale data, or whose check
+    /// could not be run.
+    ///
+    /// Consistency obligation, discharged via the seam engine: a relaxed edge that carries a
+    /// payload does not preserve the buffer's visibility.
+    fn check_relaxed_edges_keep_visibility(&mut self, decl: &crate::arch::TopologyDecl) {
+        use crate::hir::seam::{AbsState, Cell, Transfer, Verdict};
+        let name = &decl.name;
+        for edge in &decl.descriptor.transfers {
+            if edge.sync {
+                continue;
+            }
+            let reached = AbsState {
+                cells: vec![("payload".into(), Cell::constant(1))],
+            };
+            let transfer = Transfer::Relaxed {
+                published: vec!["payload".into()],
+            };
+            let solver = self
+                .seam
+                .solver
+                .get_or_insert_with(crate::hir::seam::Solver::new);
+            // `if let Ok(Reject)` used to be the whole of this: an Err -- including "no
+            // solver available" -- fell through the pattern and the edge was silently
+            // treated as if it had been proved coherent. An obligation that could
+            // not be discharged is reported as such.
+            match solver.check_seam_buffers(&reached, &transfer, &["payload".to_string()]) {
+                Ok(Verdict::Reject { .. }) => {
+                    self.errors.warn(
+                        crate::diagnostic::DiagnosticCode::W1027,
+                        format!(
+                            "topology '{name}': declared relaxed transfer {} -> {} does \
+                             not preserve visibility; a consumer may read stale data",
                             edge.from.name(),
                             edge.to.name()
+                        ),
+                        None,
+                    );
+                }
+                Ok(Verdict::Accept) => {}
+                Err(e) => {
+                    // An obligation that could not be discharged fails the build, unless the
+                    // user has explicitly accepted unverified compilation -- in which case it
+                    // is still said out loud, every time. The two must not look alike.
+                    // Spaces by name: `{:?}` renders a declared one as
+                    // `Custom("SMEM")`, which names the compiler's representation
+                    // rather than anything the program wrote.
+                    let msg = format!(
+                        "topology '{name}': the visibility of relaxed transfer {} -> {} \
+                         was NOT verified: {e}",
+                        edge.from.name(),
+                        edge.to.name()
+                    );
+                    if crate::hir::solver::unverified_allowed() {
+                        self.errors
+                            .warn(crate::diagnostic::DiagnosticCode::W1031, msg, None);
+                    } else {
+                        self.errors.error_with_code(
+                            crate::diagnostic::DiagnosticCode::E6024,
+                            msg,
+                            None,
                         );
-                        if crate::hir::solver::unverified_allowed() {
-                            self.errors
-                                .warn(crate::diagnostic::DiagnosticCode::W1031, msg, None);
-                        } else {
-                            self.errors.error_with_code(
-                                crate::diagnostic::DiagnosticCode::E6024,
-                                msg,
-                                None,
-                            );
-                        }
                     }
                 }
             }
@@ -250,8 +284,16 @@ impl TypeChecker<'_> {
     pub fn check_transfer_impls(&mut self) {
         // Read the topology facts first. Emitting a diagnostic needs `&mut self`, and the
         // descriptor lookup borrows `self`, so the two cannot be interleaved.
-        let topo_facts: Vec<(TopologyStanding, bool)> = self
-            .env
+        let topo_facts = self.transfer_impl_topology_facts();
+        self.check_transfer_impl_topologies(&topo_facts);
+        self.check_transfer_impl_functions();
+        self.check_one_lowering_per_edge();
+    }
+
+    /// For each transfer lowering, in order: the standing of the topology it names, and
+    /// whether that topology declares the edge the lowering implements.
+    fn transfer_impl_topology_facts(&self) -> Vec<(TopologyStanding, bool)> {
+        self.env
             .transfer_impls
             .iter()
             .map(|t| {
@@ -285,7 +327,12 @@ impl TypeChecker<'_> {
                     None => (TopologyStanding::Unknown, false),
                 }
             })
-            .collect();
+            .collect()
+    }
+
+    /// Report each transfer lowering whose topology is unknown, is built in, or does not
+    /// declare the edge. `topo_facts` comes from `transfer_impl_topology_facts`.
+    fn check_transfer_impl_topologies(&mut self, topo_facts: &[(TopologyStanding, bool)]) {
         for (i, t) in self.env.transfer_impls.clone().iter().enumerate() {
             let (standing, edge_declared) = topo_facts[i];
             let header = format!(
@@ -328,19 +375,15 @@ impl TypeChecker<'_> {
                 );
             }
         }
-        let mut seen: std::collections::HashMap<
-            (
-                crate::syntax::MemorySpace,
-                crate::syntax::MemorySpace,
-                String,
-            ),
-            usize,
-        > = std::collections::HashMap::new();
+    }
+
+    /// Report each transfer lowering that has a generic function, or no function at all.
+    fn check_transfer_impl_functions(&mut self) {
         for t in &self.env.transfer_impls {
             // A generic fn inside a lowering can never be checked: generic bodies are checked at
             // instantiation, and a lowering fn is not callable, so it is never instantiated -- its
             // body would escape the checker forever. That silently reopens, for generics only, the
-            // exact parses-clean-while-broken gap #353 closes, so it is refused outright: a
+            // gap where a lowering parses cleanly while broken, so it is refused outright: a
             // lowering is instantiated per EDGE, not per type, and a type parameter has no meaning
             // there.
             for f in &t.methods {
@@ -375,11 +418,18 @@ impl TypeChecker<'_> {
                     None,
                 );
             }
+        }
+    }
+
+    /// Report each edge that one topology implements more than once.
+    fn check_one_lowering_per_edge(&mut self) {
+        let mut seen = LoweringCounts::new();
+        for t in &self.env.transfer_impls {
             *seen
                 .entry((
                     t.from.clone(),
                     t.to.clone(),
-                    t.topology.display_name().to_string(),
+                    t.topology.display_name().clone(),
                 ))
                 .or_insert(0) += 1;
         }

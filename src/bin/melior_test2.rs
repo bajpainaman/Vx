@@ -21,6 +21,6 @@ fn main() -> Result<()> {
     melior::utility::register_all_llvm_translations(&context);
     let f = melior::ir::Type::parse(&context, "!llvm.func<i32 (!llvm.ptr, ...)>")
         .context("Failed to parse function type")?;
-    println!("func type: {:?}", f);
+    println!("func type: {f:?}");
     Ok(())
 }

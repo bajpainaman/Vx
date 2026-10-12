@@ -13,7 +13,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::{decl, Type, TypeChecker};
 use std::collections::HashMap;
 
 /// Every `P::A` written in `ty`.
@@ -27,19 +27,32 @@ pub(crate) fn projections_in(ty: &Type, out: &mut Vec<crate::symbol::Symbol>) {
         | Type::Pinned(t, _) => projections_in(t, out),
         Type::GenericInstance(base, args) => {
             projections_in(base, out);
-            args.iter().for_each(|a| projections_in(a, out));
+            for a in args {
+                projections_in(a, out);
+            }
         }
         Type::Function(params, ret, _) | Type::Closure(params, ret) => {
-            params.iter().for_each(|p| projections_in(p, out));
+            for p in params {
+                projections_in(p, out);
+            }
             projections_in(ret, out);
         }
         _ => {}
     }
 }
 
-impl<'a> TypeChecker<'a> {
+impl TypeChecker<'_> {
     /// Bind the projections of an instantiation of `callee`, whose signature is `params` and
     /// `ret`, and report the ones that disagree or that nothing binds. False when one did.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a projection name has no `::` in it. `projections_in` only collects names
+    /// that do.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "callers are in other files; each argument is a separate part of the call being checked"
+    )]
     pub(crate) fn resolve_projections_for(
         &mut self,
         callee: &str,
@@ -59,7 +72,9 @@ impl<'a> TypeChecker<'a> {
             return false;
         }
         let mut written = Vec::new();
-        params.iter().for_each(|p| projections_in(p, &mut written));
+        for p in params {
+            projections_in(p, &mut written);
+        }
         projections_in(ret, &mut written);
         for name in written {
             if mapping.contains_key(&name) {
@@ -169,6 +184,11 @@ impl<'a> TypeChecker<'a> {
     /// Add an entry for `P::A` to `mapping` for every parameter `P` it binds and every associated
     /// type `A` an impl for `P`'s type binds. An entry already there, bound by unification from an
     /// argument, has to agree; the disagreement is the error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when an entry already in `mapping` disagrees with what an impl binds,
+    /// or when two traits bind the same associated type name differently.
     pub(crate) fn bind_projections(
         &mut self,
         mapping: &mut HashMap<crate::symbol::Symbol, Type>,
@@ -199,6 +219,10 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// What each impl that applies to `ty` binds its associated types to, in terms of `ty`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when two traits bind the same associated type name to different types.
     fn associated_types_of(
         &mut self,
         ty: &Type,

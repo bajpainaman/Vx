@@ -40,7 +40,7 @@ fn every_differential_pair_reaches_its_claimed_verdict() {
     let pairs_dir = root.join("utils/differential/pairs");
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(&pairs_dir)
         .expect("utils/differential/pairs is missing")
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.path())
         .filter(|p| p.is_dir())
         .collect();

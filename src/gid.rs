@@ -14,8 +14,10 @@
 //===----------------------------------------------------------------------===//
 use bytemuck::{Pod, Zeroable};
 
-// Architectural Masks
+/// Bit 63 of word 2. When it is set, word 2 holds an arena index or a digest. When it is clear,
+/// word 2 holds the lifetime bits of up to four parameters.
 pub const ESCAPE_HATCH_MASK: u64 = 1 << 63;
+/// The low 63 bits of word 2: the arena index or the digest, without the escape-hatch bit.
 pub const INDEX_MASK: u64 = !ESCAPE_HATCH_MASK;
 
 // Bitmask Constants for Word 3
@@ -25,7 +27,10 @@ const VISIBILITY_MASK: u64 = 0xF000_0000_0000_0000;
 // bit keeps the *4th* param's slot from touching word-2 bit 63 (`ESCAPE_HATCH_MASK`), so a fast-path
 // lifetime bitfield can never be misread as an arena index (#193). Variance only needs 2 bits
 // (invariant/covariant/contravariant), so 3 is ample.
+
+/// The largest lifetime region a parameter slot of word 2 can hold: 12 bits.
 pub const FAST_PARAM_REGION_MAX: u16 = 0x0FFF;
+/// The bits of a variance value that a parameter slot keeps: 3 bits.
 pub const FAST_PARAM_VARIANCE_MASK: u16 = 0x0007;
 
 // Slot 0 is the *return* slot, and it reserves the top 3 bits of its region field for the return
@@ -38,18 +43,31 @@ pub const FAST_PARAM_VARIANCE_MASK: u16 = 0x0007;
 //   5, 6    = reserved
 // A signature that does not fit the inline budget (>4 reference params, return nesting >511) encodes
 // `7` and degrades to the conservative rule — graceful and local, never unsound.
+
+/// How far the return-provenance code is shifted inside slot 0.
 pub const FAST_RETURN_PROV_SHIFT: u16 = 9;
+/// The three bits of slot 0 that hold the return-provenance code.
 pub const FAST_RETURN_PROV_MASK: u16 = 0x0E00;
 
 // Specific High-Frequency Attribute Flags
+
+/// Word-3 flag: the function is marked `inline`.
 pub const ATTR_INLINE: u64 = 1 << 52;
+/// Word-3 flag: the function is marked to be inlined at every call.
 pub const ATTR_INLINE_ALWAYS: u64 = 1 << 53;
+/// Word-3 flag: the function is marked `cold`, which means it is rarely called.
 pub const ATTR_COLD: u64 = 1 << 54;
+/// Word-3 flag: the result of the function must be used.
 pub const ATTR_MUST_USE: u64 = 1 << 55;
 
+/// Word-3 flag: the type is plain data, so a copy of its bytes is a copy of the value.
 pub const TYPE_IS_POD: u64 = 1 << 44;
+/// Word-3 flag: the arena index in word 2 is local to one worker and is not yet a global index.
 pub const LOCAL_DEFERRED_BIT: u64 = 1 << 43;
+/// Word-3 flag: the compiler made this identifier for a copy of a generic item with its type
+/// arguments filled in.
 pub const SYNTHETIC_MONO_FLAG: u64 = 1 << 42;
+/// Word-3 flag: the type is a generic type with type arguments, and word 2 says which ones.
 pub const IS_GENERIC_INST_FLAG: u64 = 1 << 41;
 
 /// EVAL-ONLY (#295/#296, never merged): word 2 holds a *content digest* of the instantiation's
@@ -85,6 +103,7 @@ pub const GENERIC_DIGEST_FLAG: u64 = 1 << 40;
 /// `Pair<i32>` and `Box<i32>` share a digest and remain distinct GIDs.
 ///
 /// Order-sensitive, so `Pair<f32,f64>` and `Pair<f64,f32>` differ.
+#[must_use]
 pub fn generic_digest(args: &[TypeId]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for a in args {
@@ -100,27 +119,39 @@ pub fn generic_digest(args: &[TypeId]) -> u64 {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Pod, Zeroable, Debug)]
 #[repr(C)]
 pub struct TypeId {
+    /// The four 64-bit words: the module hash, the symbol hash, the generic or lifetime word,
+    /// and the flags.
     pub words: [u64; 4],
 }
 
 impl TypeId {
+    /// Builds an identifier from its four words.
+    #[must_use]
     pub fn new(module_hash: u64, symbol_hash: u64, generic_hash: u64, flags: u64) -> Self {
         Self {
             words: [module_hash, symbol_hash, generic_hash, flags],
         }
     }
 
+    /// Word 0: the hash of the path of the module that declares the item.
+    #[must_use]
     pub fn module_id(&self) -> u64 {
         self.words[0]
     }
+    /// Word 1: the hash of the name of the item.
+    #[must_use]
     pub fn symbol_id(&self) -> u64 {
         self.words[1]
     }
+    /// Word 2 as stored. [`Self::classify_word2`] says what it means.
+    #[must_use]
     pub fn generic_hash(&self) -> u64 {
         self.words[2]
     }
 
-    #[inline(always)]
+    /// Whether the arena index in word 2 is still local to one worker.
+    #[inline]
+    #[must_use]
     pub fn is_local_deferred(&self) -> bool {
         (self.words[3] & LOCAL_DEFERRED_BIT) != 0
     }
@@ -140,7 +171,9 @@ pub enum Word2Arena {
 /// Whether a word-2 arena index is worker-local (pre-Phase-6 patch) or global (post-patch).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Word2Scope {
+    /// The index is valid only in the arena of the worker that made it.
     Local,
+    /// The index is valid in the arena that all workers share.
     Global,
 }
 
@@ -153,8 +186,11 @@ pub enum Word2 {
     FastLifetime(u64),
     /// Escape-hatch bit set: word 2 is an arena index; `arena`/`scope` come from the word-3 flags.
     Index {
+        /// The 63-bit index into the arena.
         index: u64,
+        /// The arena the index points into.
         arena: Word2Arena,
+        /// Whether the index is local to one worker or global.
         scope: Word2Scope,
     },
     /// EVAL-ONLY (#295/#296): word 2 is a content digest of a generic instantiation's argument
@@ -168,6 +204,7 @@ impl TypeId {
     /// arena index"; the word-3 flags `IS_GENERIC_INST_FLAG` / `LOCAL_DEFERRED_BIT` disambiguate
     /// which arena and which scope.
     #[inline]
+    #[must_use]
     pub fn classify_word2(&self) -> Word2 {
         if self.words[2] & ESCAPE_HATCH_MASK == 0 {
             return Word2::FastLifetime(self.words[2]);
@@ -233,14 +270,19 @@ impl TypeId {
     }
 }
 
-// Mock structure for complex, unbounded parameter layouts (Slow Path)
+/// The lifetime data of a signature that does not fit in word 2, such as a function with more
+/// than four parameters. It is a stand-in for now and holds plain lists.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UnboundedFunctionMetadata {
+    /// The type arguments of the signature.
     pub type_arguments: Vec<TypeId>,
+    /// The lifetime region of each parameter.
     pub lifetime_regions: Vec<u32>,
-    pub trait_vtables: Vec<u64>, // Architectural Fix: Stores resolved trait implementation IDs
+    /// The identifiers of the trait implementations the signature uses.
+    pub trait_vtables: Vec<u64>,
 }
 
+/// Where the lifetime data of a type is: inside word 2, or in an arena entry.
 #[derive(Debug)]
 pub enum LifetimeSignature<'a> {
     /// 99% Common Case: Raw bitmask payload contained entirely within CPU registers.
@@ -251,7 +293,8 @@ pub enum LifetimeSignature<'a> {
 
 impl TypeId {
     /// Inspects the status of the escape hatch to determine parameter layout strategy
-    #[inline(always)]
+    #[inline]
+    #[must_use]
     pub fn lifetime_context<'sess>(
         &self,
         arena: &'sess [UnboundedFunctionMetadata],
@@ -269,7 +312,8 @@ impl TypeId {
     }
 
     /// Helper to extract a specific parameter's 16-bit payload on the fast path
-    #[inline(always)]
+    #[inline]
+    #[must_use]
     pub fn extract_fast_param(&self, param_index: usize) -> u16 {
         debug_assert!(
             param_index < 4,
@@ -280,8 +324,12 @@ impl TypeId {
     }
 
     /// Sets a 12-bit lifetime region and 4-bit variance into a specific parameter index.
-    /// If the region exceeds 4095, it returns an error to indicate the caller MUST flip the escape hatch and use the Slow Path.
-    #[inline(always)]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `region_id` is larger than 4095. The caller must then set the
+    /// escape-hatch bit and store the lifetime data in the arena.
+    #[inline]
     pub fn try_set_fast_param(
         &mut self,
         param_index: usize,
@@ -295,18 +343,19 @@ impl TypeId {
         if region_id > FAST_PARAM_REGION_MAX {
             return Err("Lifetime region overflowed 12 bits. Must use Slow Path.");
         }
-        let payload = ((variance_flags as u16 & FAST_PARAM_VARIANCE_MASK) << 12)
+        let payload = ((u16::from(variance_flags) & FAST_PARAM_VARIANCE_MASK) << 12)
             | (region_id & FAST_PARAM_REGION_MAX);
         let shift = param_index * 16;
         let mask = !(0xFFFF_u64 << shift);
-        self.words[2] = (self.words[2] & mask) | ((payload as u64) << shift);
+        self.words[2] = (self.words[2] & mask) | (u64::from(payload) << shift);
         Ok(())
     }
 
     /// Read slot 0's 3-bit return-provenance code (#265). See [`FAST_RETURN_PROV_MASK`] for the
     /// encoding. A `TypeId` that never had a code set reads `0` (no provenance), so this is safe to
     /// call on any type — a plain reference lowered into slot 0 carries region+variance only.
-    #[inline(always)]
+    #[inline]
+    #[must_use]
     pub fn extract_return_provenance(&self) -> u8 {
         ((self.extract_fast_param(0) & FAST_RETURN_PROV_MASK) >> FAST_RETURN_PROV_SHIFT) as u8
     }
@@ -316,25 +365,35 @@ impl TypeId {
     /// return region must already be clamped to that width (`borrow::region_for_depth_slot0`) before a
     /// code is set — otherwise the region would overlap and corrupt the code. Only the low 3 bits of
     /// `prov` are used.
-    #[inline(always)]
+    #[inline]
     pub fn set_return_provenance(&mut self, prov: u8) {
         let slot = self.extract_fast_param(0);
         let packed = (slot & !FAST_RETURN_PROV_MASK)
-            | (((prov as u16) << FAST_RETURN_PROV_SHIFT) & FAST_RETURN_PROV_MASK);
-        self.words[2] = (self.words[2] & !0xFFFF) | (packed as u64);
+            | ((u16::from(prov) << FAST_RETURN_PROV_SHIFT) & FAST_RETURN_PROV_MASK);
+        self.words[2] = (self.words[2] & !0xFFFF) | u64::from(packed);
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+/// Who may use an item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
+    /// Only the module that declares the item.
     Private,
+    /// Any module of the same crate.
     CratePublic,
+    /// Any crate.
     FullyPublic,
 }
 
 impl TypeId {
     /// Extracts the visibility enum directly from the register byte stream
-    #[inline(always)]
+    ///
+    /// # Panics
+    ///
+    /// In a debug build, panics if the visibility bits hold a value that names no visibility.
+    /// A release build reads such a value as private.
+    #[inline]
+    #[must_use]
     pub fn visibility(&self) -> Visibility {
         let vis_bits = (self.words[3] & VISIBILITY_MASK) >> 60;
         match vis_bits {
@@ -343,7 +402,7 @@ impl TypeId {
             2 => Visibility::FullyPublic,
             _ => {
                 #[cfg(debug_assertions)]
-                panic!("Invalid visibility bits: {:b}", vis_bits);
+                panic!("Invalid visibility bits: {vis_bits:b}");
                 #[cfg(not(debug_assertions))]
                 Visibility::Private
             }
@@ -351,26 +410,28 @@ impl TypeId {
     }
 
     /// High-performance check for backends to see if they can bypass destructor code paths
-    #[inline(always)]
+    #[inline]
+    #[must_use]
     pub fn is_trivially_copyable(&self) -> bool {
         // Evaluate POD bit status with zero memory dereferencing
         (self.words[3] & TYPE_IS_POD) != 0
     }
 
     /// Instant verification to assist inline optimizations
-    #[inline(always)]
+    #[inline]
+    #[must_use]
     pub fn should_inline(&self) -> bool {
         (self.words[3] & (ATTR_INLINE | ATTR_INLINE_ALWAYS)) != 0
     }
 
     /// Mutation helper used during the parsing/declaration phase to bake flags in
-    #[inline(always)]
+    #[inline]
     pub fn with_flags(&mut self, flags_mask: u64) {
         self.words[3] |= flags_mask;
     }
 
     /// Mutation helper used to set visibility
-    #[inline(always)]
+    #[inline]
     pub fn with_visibility(&mut self, vis: Visibility) {
         // Clear existing visibility bits
         self.words[3] &= !VISIBILITY_MASK;
@@ -385,6 +446,10 @@ impl TypeId {
 
 /// Serializes an entire dictionary of `TypeId` structures into a zero-copy byte stream.
 /// This enables lightning-fast saving of incremental compilation metadata.
+///
+/// # Errors
+///
+/// Returns the error from `output` when a write fails.
 pub fn serialize_metadata_symbols<W: std::io::Write>(
     unique_types: &[TypeId],
     output: &mut W,
@@ -400,9 +465,16 @@ pub fn serialize_metadata_symbols<W: std::io::Write>(
 
 /// Instantly maps a byte array back into a slice of `TypeId`s without allocating
 /// new memory or chasing pointers.
+///
+/// # Panics
+///
+/// Panics if `bytes` is shorter than the 8-byte count plus the entries the count promises, or
+/// if the entries are not aligned as a `TypeId` needs.
+#[must_use]
 pub fn deserialize_metadata_symbols(bytes: &[u8]) -> (&[TypeId], &[u8]) {
     let (len_bytes, remaining) = bytes.split_at(8);
-    let len = u64::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+    let len = u64::from_le_bytes(len_bytes.try_into().unwrap());
+    let len = usize::try_from(len).expect("the entry count fits in the address space");
 
     let byte_len = len * std::mem::size_of::<TypeId>();
     let (dict_bytes, rest) = remaining.split_at(byte_len);
@@ -413,6 +485,11 @@ pub fn deserialize_metadata_symbols(bytes: &[u8]) -> (&[TypeId], &[u8]) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 

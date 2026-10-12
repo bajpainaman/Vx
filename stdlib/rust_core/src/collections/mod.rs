@@ -11,9 +11,18 @@
 // data structures to the Vx runtime environment.
 //
 //===----------------------------------------------------------------------===//
+
+//! The collection types of the Vx standard library, exported through the C ABI.
+
+/// Hash maps with integer keys and values.
 pub mod hash_map;
+/// Hash sets of integers.
 pub mod hash_set;
+/// Optional values of the number types.
 pub mod option;
+/// Results whose success and error values are numbers.
 pub mod result;
+/// Growable UTF-8 strings.
 pub mod string;
+/// Growable arrays, and the byte allocator behind the Vx `Vec<T>`.
 pub mod vec;

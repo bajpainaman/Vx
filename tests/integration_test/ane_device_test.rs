@@ -53,8 +53,7 @@ fn usable_python(root: &PathBuf) -> Option<String> {
             .current_dir(root)
             .args(["-c", "import coremltools, coremltools.libmilstoragepython"])
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
     })
 }
 
@@ -104,13 +103,13 @@ fn coreml_places_these_graphs_where_we_measured() {
 /// The dispatcher must not claim hardware it has not asked about.
 ///
 /// `--- EXECUTING ON APPLE NEURAL ENGINE ---` printed whenever the dispatcher
-/// took the CoreML route, which says nothing about what CoreML then did with the
+/// took the `CoreML` route, which says nothing about what `CoreML` then did with the
 /// work. For the primitives shipped at the time it did the work on the CPU, so
 /// the one line in the system that appeared to attest Neural Engine execution
 /// was asserting hardware nobody had checked -- and a paper or a README citing
 /// it would have been citing that.
 ///
-/// The line is now derived from `MLComputePlan`, so it reports the device CoreML
+/// The line is now derived from `MLComputePlan`, so it reports the device `CoreML`
 /// picked rather than the route the dispatcher took. This pins both halves: the
 /// measured line appears, and the unmeasured claim does not come back.
 // The binary under test comes from CARGO_BIN_EXE_vxc, which cargo points at the

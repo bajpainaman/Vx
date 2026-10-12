@@ -10,7 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::*;
+use super::{
+    Dim, ElementType, Expr, MemorySpace, ParseResult, Parser, Placement, RangeExpr, TokenType,
+    Topology, Type,
+};
 
 /// What to say when a `Tensor` is spelled without its shape. Each replacement is one of the
 /// meanings the dims-less spelling used to carry (Vx#399).
@@ -25,6 +28,7 @@ const DIMS_REQUIRED: &str = "Tensor needs its shape: write `Tensor<f32, [2, 3]>`
 /// Parse a type from its source spelling. Expression-position generic arguments are
 /// re-serialized into the call name (`Option<*mut i8>`), so reading them back needs the real
 /// type parser rather than a table of scalar names (Vx#415).
+#[must_use]
 pub fn parse_type_text(text: &str) -> Option<Type> {
     let mut lexer = crate::lexer::Lexer::new(text);
     let tokens = lexer.tokenize();
@@ -33,7 +37,29 @@ pub fn parse_type_text(text: &str) -> Option<Type> {
     parser.check(&TokenType::Eof).then_some(ty)
 }
 
+/// A reference type that the borrow checker has not given a region yet.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "REGION_UNSET is a small constant that fits in usize on every target"
+)]
+fn unbound_reference(inner: Type, is_mut: bool) -> Type {
+    Type::Borrow {
+        inner: Box::new(inner),
+        mem_space: None,
+        is_mut,
+        // Not yet bound to a scope depth — the borrow checker assigns the real region during
+        // checking. Reserved sentinel, never a real depth (#267).
+        region_id: crate::syntax::REGION_UNSET as usize,
+    }
+}
+
 impl<'a> Parser<'a> {
+    /// A device written as `Topology::X`, such as `Topology::CPU` or `Topology::GPU[0]`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tokens are not `Topology::` and a name, when `NPU` or `AccCore` has no
+    /// index, or when an index does not parse.
     pub(crate) fn parse_topology(&mut self) -> ParseResult<'a, Topology> {
         self.consume(&TokenType::Topology, "Expected 'Topology'")?;
         self.consume(&TokenType::DoubleColon, "Expected '::' after 'Topology'")?;
@@ -46,19 +72,7 @@ impl<'a> Parser<'a> {
             "Current" => Ok(Topology::Current),
             "NPU" => {
                 if self.match_token(&TokenType::LeftBracket) {
-                    let mut expr = self.parse_expr()?;
-                    super::expr::stamp_dim_literals(&mut expr);
-                    self.consume(&TokenType::RightBracket, "Expected ']'")?;
-                    // If the expression is a range like 0..4, convert to Slice
-                    if let Expr::Range(RangeExpr { start, end, .. }) = expr {
-                        Ok(Topology::Slice(
-                            Box::new(Topology::NPU(start.clone())),
-                            start,
-                            end,
-                        ))
-                    } else {
-                        Ok(Topology::NPU(Box::new(expr)))
-                    }
+                    self.parse_device_index(Topology::NPU)
                 } else {
                     Err(self.error("Expected index for NPU"))
                 }
@@ -80,18 +94,7 @@ impl<'a> Parser<'a> {
                 // multi-device support and means device 0, which is what every program
                 // written against it meant.
                 if self.match_token(&TokenType::LeftBracket) {
-                    let mut expr = self.parse_expr()?;
-                    super::expr::stamp_dim_literals(&mut expr);
-                    self.consume(&TokenType::RightBracket, "Expected ']'")?;
-                    if let Expr::Range(RangeExpr { start, end, .. }) = expr {
-                        Ok(Topology::Slice(
-                            Box::new(Topology::GPU(start.clone())),
-                            start,
-                            end,
-                        ))
-                    } else {
-                        Ok(Topology::GPU(Box::new(expr)))
-                    }
+                    self.parse_device_index(Topology::GPU)
                 } else {
                     Ok(Topology::gpu(0))
                 }
@@ -106,8 +109,33 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The index of an `NPU` or a `GPU`, after its `[` and up to the `]`. `device` makes the
+    /// topology of one device from its index. A range such as `0..4` gives a slice of devices.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the index does not parse or the `]` is missing.
+    fn parse_device_index(
+        &mut self,
+        device: fn(Box<Expr>) -> Topology,
+    ) -> ParseResult<'a, Topology> {
+        let mut expr = self.parse_expr()?;
+        super::expr::stamp_dim_literals(&mut expr);
+        self.consume(&TokenType::RightBracket, "Expected ']'")?;
+        // If the expression is a range like 0..4, convert to Slice
+        if let Expr::Range(RangeExpr { start, end, .. }) = expr {
+            Ok(Topology::Slice(Box::new(device(start.clone())), start, end))
+        } else {
+            Ok(device(Box::new(expr)))
+        }
+    }
+
     /// Parse a topology in an operand position (a `Reachable<A, B>` argument): either a
     /// `Topology::X` reference or a bare identifier naming a topology variable.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the cursor is at neither a `Topology::X` nor a name.
     pub(crate) fn parse_topology_operand(&mut self) -> ParseResult<'a, Topology> {
         if self.check(&TokenType::Topology) {
             self.parse_topology()
@@ -117,6 +145,11 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A memory space written as `Memory::X`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tokens are not `Memory::` and a name.
     pub(crate) fn parse_memory_space(&mut self) -> ParseResult<'a, MemorySpace> {
         self.consume(&TokenType::Memory, "Expected 'Memory'")?;
         self.consume(&TokenType::DoubleColon, "Expected '::' after 'Memory'")?;
@@ -134,6 +167,11 @@ impl<'a> Parser<'a> {
     /// Both name one location, and which one the source picked is not part of the type -- the
     /// unwritten projection is derived, here from the built-in tables and then corrected in name
     /// resolution, where a declared topology's `memory:` is finally in scope.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the cursor is at neither `Topology` nor `Memory`, or when what follows does
+    /// not parse.
     pub(crate) fn parse_placement(&mut self) -> ParseResult<'a, Placement> {
         if self.check(&TokenType::Topology) {
             Ok(Placement::on(self.parse_topology()?))
@@ -148,6 +186,10 @@ impl<'a> Parser<'a> {
     }
 
     /// A function's return type: any type, or `!` for a function that never returns.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tokens at the cursor are neither `!` nor a type.
     pub(crate) fn parse_return_type(&mut self) -> ParseResult<'a, Type> {
         if self.match_token(&TokenType::Bang) {
             return Ok(crate::syntax::never_ty());
@@ -155,70 +197,26 @@ impl<'a> Parser<'a> {
         self.parse_type()
     }
 
+    /// Parses a type.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tokens at the cursor are not a type.
     pub(crate) fn parse_type(&mut self) -> ParseResult<'a, Type> {
         // `&&T` is a reference to a reference; the lexer made the two `&`s one token.
         if self.match_token(&TokenType::AndAnd) {
             let is_mut = self.match_token(&TokenType::Mut);
             let inner = self.parse_type()?;
-            let reference = |inner: Type, is_mut: bool| Type::Borrow {
-                inner: Box::new(inner),
-                mem_space: None,
-                is_mut,
-                region_id: crate::syntax::REGION_UNSET as usize,
-            };
-            return Ok(reference(reference(inner, is_mut), false));
+            return Ok(unbound_reference(unbound_reference(inner, is_mut), false));
         }
         if self.match_token(&TokenType::Ampersand) {
             let is_mut = self.match_token(&TokenType::Mut);
             let inner = self.parse_type()?;
-            Ok(Type::Borrow {
-                inner: Box::new(inner),
-                mem_space: None,
-                is_mut,
-                // Not yet bound to a scope depth — the borrow checker assigns the real region during
-                // checking. Reserved sentinel, never a real depth (#267).
-                region_id: crate::syntax::REGION_UNSET as usize,
-            })
+            Ok(unbound_reference(inner, is_mut))
         } else if self.match_token(&TokenType::Star) {
-            let is_mut = if self.check(&TokenType::Mut) {
-                self.advance();
-                true
-            } else if self.check(&TokenType::Identifier("const")) {
-                self.advance();
-                false
-            } else {
-                return Err(self.error("Expected 'mut' or 'const' after '*'"));
-            };
-            let inner = self.parse_type()?;
-            // `*mut f32 in Memory::GPU_HBM` points into device memory. A bare pointer points into
-            // host memory, and so does one that says so: the two spellings are one type.
-            let place = if self.match_token(&TokenType::In) {
-                let p = self.parse_placement()?;
-                (p.space != MemorySpace::CPUDRAM).then_some(p)
-            } else {
-                None
-            };
-            Ok(Type::Pointer(Box::new(inner), place, is_mut))
+            self.parse_pointer_type()
         } else if self.match_token(&TokenType::LeftParen) {
-            // `(A, B)`, a tuple, or `(A)`, a type in brackets.
-            let mut elems = vec![self.parse_type()?];
-            let mut is_tuple = false;
-            while self.match_token(&TokenType::Comma) {
-                is_tuple = true;
-                if self.check(&TokenType::RightParen) {
-                    break;
-                }
-                elems.push(self.parse_type()?);
-            }
-            self.consume(&TokenType::RightParen, "Expected ')' after a tuple type")?;
-            if !is_tuple {
-                return Ok(elems.pop().expect("one element"));
-            }
-            let name = self.tuple_struct(elems.len())?;
-            Ok(Type::GenericInstance(
-                Box::new(Type::Struct(name.into(), None)),
-                elems,
-            ))
+            self.parse_tuple_type()
         } else if self.match_token(&TokenType::Ref) {
             self.consume(&TokenType::LeftAngle, "Expected '<'")?;
             let inner = self.parse_type()?;
@@ -248,89 +246,192 @@ impl<'a> Parser<'a> {
             self.advance();
             Ok(Type::Scalar(ElementType::I32))
         } else if self.match_token(&TokenType::LeftAngle) {
-            let n = match &self.advance().kind {
-                TokenType::Number(s) => s
-                    .parse::<usize>()
-                    .map_err(|_| self.error("Expected integer for SIMD size"))?,
-                _ => return Err(self.error("Expected number after '<' in SIMD type")),
-            };
-            match &self.advance().kind {
-                TokenType::Identifier(s) if *s == "x" => {}
-                _ => return Err(self.error("Expected 'x' after size in SIMD type")),
-            }
-            let el_ty_ident = match &self.advance().kind {
-                TokenType::Identifier(s) => *s,
-                _ => return Err(self.error("Expected element type after 'x' in SIMD type")),
-            };
-            let el_ty = std::str::FromStr::from_str(el_ty_ident)
-                .map_err(|_| self.error(&format!("Unknown SIMD element type {}", el_ty_ident)))?;
-            self.consume(
-                &TokenType::RightAngle,
-                "Expected '>' after SIMD element type",
-            )?;
-            // A power of two in the first cut. `<3 x f32>` is not merely unusual: LLVM gives it a
-            // store size of 16, where lane-count times element size says 12, so admitting it would
-            // put a following struct field at an offset the datalayout disagrees with.
-            if !n.is_power_of_two() {
-                return Err(self.error(&format!(
-                    "Expected a power of two for the lane count of a vector type, found {n}"
-                )));
-            }
-            Ok(Type::Simd(el_ty, n))
+            self.parse_simd_type()
         } else if self.match_token(&TokenType::Fn) {
-            self.consume(&TokenType::LeftParen, "Expected '(' after 'fn'")?;
-            let mut params = Vec::new();
-            while !self.check(&TokenType::RightParen) && !self.check(&TokenType::Eof) {
-                params.push(self.parse_type()?);
-                if !self.match_token(&TokenType::Comma) {
-                    break;
-                }
-            }
-            self.consume(
-                &TokenType::RightParen,
-                "Expected ')' after function parameters",
-            )?;
-            self.consume(&TokenType::Arrow, "Expected '->' after function parameters")?;
-            let ret = self.parse_type()?;
-            Ok(Type::Function(params, Box::new(ret), false))
+            self.parse_fn_type()
         } else if self.match_token(&TokenType::OrOr) {
             self.consume(&TokenType::Arrow, "Expected '->' after closure parameters")?;
             let ret = self.parse_type()?;
             Ok(Type::Closure(Vec::new(), Box::new(ret)))
         } else if self.match_token(&TokenType::Pipe) {
-            let mut params = Vec::new();
-            if !self.check(&TokenType::Pipe) {
-                while !self.check(&TokenType::Pipe) && !self.check(&TokenType::Eof) {
-                    params.push(self.parse_type()?);
-                    if !self.match_token(&TokenType::Comma) {
-                        break;
-                    }
-                }
-            }
-            self.consume(
-                &TokenType::Pipe,
-                "Expected '|' after closure type parameters",
-            )?;
-            self.consume(&TokenType::Arrow, "Expected '->' after closure parameters")?;
-            let ret = self.parse_type()?;
-            Ok(Type::Closure(params, Box::new(ret)))
+            self.parse_closure_type()
         } else {
-            if let TokenType::Identifier(s) = &self.peek().kind {
-                if self.generic_params.iter().any(|p| p == *s) {
-                    let mut s = s.to_string();
-                    self.advance();
-                    // `I::Item`, an associated type of the parameter. A type variable of its
-                    // own, bound when the instantiation says what `I` is.
-                    if self.match_token(&TokenType::DoubleColon) {
-                        let assoc = self.expect_identifier("Expected an associated type name")?;
-                        s = format!("{s}::{assoc}");
-                    }
-                    return Ok(Type::Generic(s.into(), None));
+            self.parse_generic_param_or_named_type()
+        }
+    }
+
+    /// The rest of a raw pointer type, after its `*`: `mut T` or `const T`, with an optional
+    /// `in` placement.
+    ///
+    /// # Errors
+    ///
+    /// Fails when neither `mut` nor `const` follows the `*`, or when the pointee type or the
+    /// placement does not parse.
+    fn parse_pointer_type(&mut self) -> ParseResult<'a, Type> {
+        let is_mut = if self.check(&TokenType::Mut) {
+            self.advance();
+            true
+        } else if self.check(&TokenType::Identifier("const")) {
+            self.advance();
+            false
+        } else {
+            return Err(self.error("Expected 'mut' or 'const' after '*'"));
+        };
+        let inner = self.parse_type()?;
+        // `*mut f32 in Memory::GPU_HBM` points into device memory. A bare pointer points into
+        // host memory, and so does one that says so: the two spellings are one type.
+        let place = if self.match_token(&TokenType::In) {
+            let p = self.parse_placement()?;
+            (p.space != MemorySpace::CPUDRAM).then_some(p)
+        } else {
+            None
+        };
+        Ok(Type::Pointer(Box::new(inner), place, is_mut))
+    }
+
+    /// The rest of a tuple type `(A, B)` or of a type in brackets `(A)`, after the `(`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when an element type does not parse, when the `)` is missing, or when the tuple
+    /// does not have 2 to `MAX_TUPLE` elements.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic in practice: the list of elements always holds the first type parsed.
+    fn parse_tuple_type(&mut self) -> ParseResult<'a, Type> {
+        // `(A, B)`, a tuple, or `(A)`, a type in brackets.
+        let mut elems = vec![self.parse_type()?];
+        let mut is_tuple = false;
+        while self.match_token(&TokenType::Comma) {
+            is_tuple = true;
+            if self.check(&TokenType::RightParen) {
+                break;
+            }
+            elems.push(self.parse_type()?);
+        }
+        self.consume(&TokenType::RightParen, "Expected ')' after a tuple type")?;
+        if !is_tuple {
+            return Ok(elems
+                .pop()
+                .expect("the list holds the first type that was parsed"));
+        }
+        let name = self.tuple_struct(elems.len())?;
+        Ok(Type::GenericInstance(
+            Box::new(Type::Struct(name.into(), None)),
+            elems,
+        ))
+    }
+
+    /// The rest of a vector type such as `<4 x f32>`, after the `<`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the lane count is not a whole number or not a power of two, when the `x` or
+    /// the `>` is missing, or when the element type is unknown.
+    fn parse_simd_type(&mut self) -> ParseResult<'a, Type> {
+        let n = match &self.advance().kind {
+            TokenType::Number(s) => s
+                .parse::<usize>()
+                .map_err(|_not_a_number| self.error("Expected integer for SIMD size"))?,
+            _ => return Err(self.error("Expected number after '<' in SIMD type")),
+        };
+        match &self.advance().kind {
+            TokenType::Identifier(s) if *s == "x" => {}
+            _ => return Err(self.error("Expected 'x' after size in SIMD type")),
+        }
+        let el_ty_ident = match &self.advance().kind {
+            TokenType::Identifier(s) => *s,
+            _ => return Err(self.error("Expected element type after 'x' in SIMD type")),
+        };
+        let el_ty = std::str::FromStr::from_str(el_ty_ident).map_err(|_unknown_name| {
+            self.error(&format!("Unknown SIMD element type {el_ty_ident}"))
+        })?;
+        self.consume(
+            &TokenType::RightAngle,
+            "Expected '>' after SIMD element type",
+        )?;
+        // A power of two in the first cut. `<3 x f32>` is not merely unusual: LLVM gives it a
+        // store size of 16, where lane-count times element size says 12, so admitting it would
+        // put a following struct field at an offset the datalayout disagrees with.
+        if !n.is_power_of_two() {
+            return Err(self.error(&format!(
+                "Expected a power of two for the lane count of a vector type, found {n}"
+            )));
+        }
+        Ok(Type::Simd(el_ty, n))
+    }
+
+    /// The rest of a function type such as `fn(i32) -> i32`, after the `fn`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a parenthesis or the `->` is missing, or when a parameter type or the return
+    /// type does not parse.
+    fn parse_fn_type(&mut self) -> ParseResult<'a, Type> {
+        self.consume(&TokenType::LeftParen, "Expected '(' after 'fn'")?;
+        let mut params = Vec::new();
+        while !self.check(&TokenType::RightParen) && !self.check(&TokenType::Eof) {
+            params.push(self.parse_type()?);
+            if !self.match_token(&TokenType::Comma) {
+                break;
+            }
+        }
+        self.consume(
+            &TokenType::RightParen,
+            "Expected ')' after function parameters",
+        )?;
+        self.consume(&TokenType::Arrow, "Expected '->' after function parameters")?;
+        let ret = self.parse_type()?;
+        Ok(Type::Function(params, Box::new(ret), false))
+    }
+
+    /// The rest of a closure type such as `|i32| -> i32`, after the first `|`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the second `|` or the `->` is missing, or when a parameter type or the return
+    /// type does not parse.
+    fn parse_closure_type(&mut self) -> ParseResult<'a, Type> {
+        let mut params = Vec::new();
+        if !self.check(&TokenType::Pipe) {
+            while !self.check(&TokenType::Pipe) && !self.check(&TokenType::Eof) {
+                params.push(self.parse_type()?);
+                if !self.match_token(&TokenType::Comma) {
+                    break;
                 }
             }
-
-            self.parse_named_type()
         }
+        self.consume(
+            &TokenType::Pipe,
+            "Expected '|' after closure type parameters",
+        )?;
+        self.consume(&TokenType::Arrow, "Expected '->' after closure parameters")?;
+        let ret = self.parse_type()?;
+        Ok(Type::Closure(params, Box::new(ret)))
+    }
+
+    /// A generic parameter in scope, such as `T` or `I::Item`, or else a named type.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a name is missing after `::`, or when the named type does not parse.
+    fn parse_generic_param_or_named_type(&mut self) -> ParseResult<'a, Type> {
+        if let TokenType::Identifier(s) = &self.peek().kind {
+            if self.generic_params.iter().any(|p| p == *s) {
+                let mut s = s.to_string();
+                self.advance();
+                // `I::Item`, an associated type of the parameter. A type variable of its
+                // own, bound when the instantiation says what `I` is.
+                if self.match_token(&TokenType::DoubleColon) {
+                    let assoc = self.expect_identifier("Expected an associated type name")?;
+                    s = format!("{s}::{assoc}");
+                }
+                return Ok(Type::Generic(s.into(), None));
+            }
+        }
+
+        self.parse_named_type()
     }
 
     /// Parse one constant argument of a generic instantiation, such as the `N - 1` in
@@ -339,10 +440,21 @@ impl<'a> Parser<'a> {
     /// Stops above the comparisons so the closing `>` stays a bracket rather than becoming
     /// a greater-than. That leaves arithmetic and the bitwise operators, which is what an
     /// argument in this position is for.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tokens at the cursor are not an expression.
     fn parse_const_arg_expr(&mut self) -> ParseResult<'a, Expr> {
         self.parse_binary_expr(CONST_ARG_PRECEDENCE)
     }
 
+    /// The arguments of a generic type, after the `<` and through the `>`. Each one is a type
+    /// or a constant expression.
+    ///
+    /// # Errors
+    ///
+    /// Fails when an argument is neither a type nor a constant expression, or when the `>` is
+    /// missing.
     pub(crate) fn parse_generic_type_args(&mut self) -> ParseResult<'a, Vec<Type>> {
         let mut type_args = Vec::new();
         while !self.check(&TokenType::RightAngle) && !self.check(&TokenType::Eof) {
@@ -364,17 +476,16 @@ impl<'a> Parser<'a> {
                 let parsed_type = self.parse_type().ok().filter(|_| {
                     self.check(&TokenType::Comma) || self.check(&TokenType::RightAngle)
                 });
-                match parsed_type {
-                    Some(ty) => type_args.push(ty),
-                    None => {
-                        self.pos = saved_pos;
-                        match self.parse_const_arg_expr() {
-                            Ok(expr) => type_args.push(Type::Const(Box::new(expr))),
-                            Err(_) => {
-                                return Err(self.error(
-                                    "Expected type or constant expression in generic arguments",
-                                ))
-                            }
+                if let Some(ty) = parsed_type {
+                    type_args.push(ty)
+                } else {
+                    self.pos = saved_pos;
+                    match self.parse_const_arg_expr() {
+                        Ok(expr) => type_args.push(Type::Const(Box::new(expr))),
+                        Err(_) => {
+                            return Err(self.error(
+                                "Expected type or constant expression in generic arguments",
+                            ))
                         }
                     }
                 }
@@ -391,6 +502,13 @@ impl<'a> Parser<'a> {
         Ok(type_args)
     }
 
+    /// A type that starts with a name: a path such as `a::B`, a `Tensor`, `Matrix`, a scalar such
+    /// as `f32`, or a struct or enum with its generic arguments.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the cursor is not at a name, or when what follows the name is not a valid rest
+    /// of that type.
     pub(crate) fn parse_named_type(&mut self) -> ParseResult<'a, Type> {
         let ident = match &self.advance().kind {
             TokenType::Identifier(s) => s.to_string(),
@@ -403,98 +521,11 @@ impl<'a> Parser<'a> {
         // only take this branch when a `::` actually follows the first segment. The full `::`-joined
         // path is kept as the nominal's name Symbol so the AST shape is unchanged.
         if self.check(&TokenType::DoubleColon) {
-            let mut segments = vec![ident];
-            while self.match_token(&TokenType::DoubleColon) {
-                segments
-                    .push(self.expect_identifier("Expected identifier after '::' in type path")?);
-            }
-            // `Self::Item` is a trait's associated type, not a path to a declared one. It is a
-            // type variable the impl binds, so it is parsed as one and substituted away with
-            // the trait's other parameters before name resolution runs.
-            if segments.len() == 2 && segments[0] == "Self" {
-                return Ok(Type::Generic(
-                    crate::symbol::Symbol::from(segments.join("::").as_ref()),
-                    None,
-                ));
-            }
-            let base_type = Type::Struct(
-                crate::symbol::Symbol::from(segments.join("::").as_ref()),
-                None,
-            );
-            if self.match_token(&TokenType::LeftAngle) {
-                let type_args = self.parse_generic_type_args()?;
-                return Ok(Type::GenericInstance(Box::new(base_type), type_args));
-            }
-            return Ok(base_type);
+            return self.parse_qualified_type(ident);
         }
 
         match ident.as_ref() {
-            "Tensor" => {
-                if !matches!(&self.peek().kind, TokenType::LeftAngle) {
-                    return Err(self.error(DIMS_REQUIRED));
-                }
-                {
-                    self.advance(); // consume '<'
-                    let ty_ident = match self.advance().kind.clone() {
-                        TokenType::Identifier(s) => s,
-                        _ => return Err(self.error("Expected element type after '<'")),
-                    };
-                    let el_ty = if let Ok(parsed_ty) = std::str::FromStr::from_str(ty_ident) {
-                        parsed_ty
-                    } else if self.generic_params.iter().any(|p| p.as_str() == ty_ident) {
-                        ElementType::Generic(ty_ident.into())
-                    } else {
-                        return Err(self.error(&format!("Unknown element type {}", ty_ident)));
-                    };
-                    let mut dims = Vec::new();
-                    // `Tensor<f32, []>` is rank 0 and states its shape; `Tensor<f32>` states
-                    // nothing. Both end with an empty `dims`, so the list has to be tracked.
-                    let mut saw_dims_list = false;
-                    if self.match_token(&TokenType::Comma) {
-                        if self.match_token(&TokenType::LeftBracket) {
-                            saw_dims_list = true;
-                            while !self.check(&TokenType::RightBracket)
-                                && !self.check(&TokenType::Eof)
-                            {
-                                if self.match_token(&TokenType::Question) {
-                                    dims.push(Dim::Dyn);
-                                } else {
-                                    let mut dim = self.parse_expr()?;
-                                    super::expr::stamp_dim_literals(&mut dim);
-                                    dims.push(Dim::Static(dim));
-                                }
-                                if !self.match_token(&TokenType::Comma) {
-                                    break;
-                                }
-                            }
-                            self.consume(
-                                &TokenType::RightBracket,
-                                "Expected ']' after Tensor dimensions",
-                            )?;
-                        } else {
-                            return Err(self.error("Expected '[' for Tensor dimensions"));
-                        }
-                    }
-
-                    let mut top = None;
-                    if self.match_token(&TokenType::Comma) {
-                        top = Some(self.parse_placement()?);
-                    }
-
-                    self.consume(
-                        &TokenType::RightAngle,
-                        "Expected '>' after Tensor parameters",
-                    )?;
-                    // A `Tensor` carries its shape. The dims-less spelling used to mean four
-                    // unrelated things at once -- an erased static shape, a run-time shape, a
-                    // scalar, and an error placeholder -- and the two compilers read it two
-                    // different ways (Vx#399, Vx#409).
-                    if !saw_dims_list {
-                        return Err(self.error(DIMS_REQUIRED));
-                    }
-                    Ok(Type::Tensor(el_ty, dims, top))
-                }
-            }
+            "Tensor" => self.parse_tensor_type(),
             // The old spelling of a rank-2 tensor with run-time extents. Refused with the
             // replacement written out rather than aliased: rank is part of the type, and this
             // name never stated one.
@@ -525,5 +556,104 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+    }
+
+    /// The rest of a path type such as `Mod::Sub::Name`, after its first segment `ident`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a `::` is not followed by a name, or when the generic arguments do not parse.
+    fn parse_qualified_type(&mut self, ident: String) -> ParseResult<'a, Type> {
+        let mut segments = vec![ident];
+        while self.match_token(&TokenType::DoubleColon) {
+            segments.push(self.expect_identifier("Expected identifier after '::' in type path")?);
+        }
+        // `Self::Item` is a trait's associated type, not a path to a declared one. It is a
+        // type variable the impl binds, so it is parsed as one and substituted away with
+        // the trait's other parameters before name resolution runs.
+        if segments.len() == 2 && segments[0] == "Self" {
+            return Ok(Type::Generic(
+                crate::symbol::Symbol::from(segments.join("::").as_ref()),
+                None,
+            ));
+        }
+        let base_type = Type::Struct(
+            crate::symbol::Symbol::from(segments.join("::").as_ref()),
+            None,
+        );
+        if self.match_token(&TokenType::LeftAngle) {
+            let type_args = self.parse_generic_type_args()?;
+            return Ok(Type::GenericInstance(Box::new(base_type), type_args));
+        }
+        Ok(base_type)
+    }
+
+    /// The rest of a `Tensor` type, after the word `Tensor`: `<f32, [2, 3]>`, with an optional
+    /// placement after the shape.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the shape is missing, when the element type is unknown, or when a bracket or a
+    /// dimension does not parse.
+    fn parse_tensor_type(&mut self) -> ParseResult<'a, Type> {
+        if !matches!(&self.peek().kind, TokenType::LeftAngle) {
+            return Err(self.error(DIMS_REQUIRED));
+        }
+        self.advance(); // consume '<'
+        let TokenType::Identifier(ty_ident) = self.advance().kind.clone() else {
+            return Err(self.error("Expected element type after '<'"));
+        };
+        let el_ty = if let Ok(parsed_ty) = std::str::FromStr::from_str(ty_ident) {
+            parsed_ty
+        } else if self.generic_params.iter().any(|p| p.as_str() == ty_ident) {
+            ElementType::Generic(ty_ident.into())
+        } else {
+            return Err(self.error(&format!("Unknown element type {ty_ident}")));
+        };
+        let mut dims = Vec::new();
+        // `Tensor<f32, []>` is rank 0 and states its shape; `Tensor<f32>` states
+        // nothing. Both end with an empty `dims`, so the list has to be tracked.
+        let mut saw_dims_list = false;
+        if self.match_token(&TokenType::Comma) {
+            if self.match_token(&TokenType::LeftBracket) {
+                saw_dims_list = true;
+                while !self.check(&TokenType::RightBracket) && !self.check(&TokenType::Eof) {
+                    if self.match_token(&TokenType::Question) {
+                        dims.push(Dim::Dyn);
+                    } else {
+                        let mut dim = self.parse_expr()?;
+                        super::expr::stamp_dim_literals(&mut dim);
+                        dims.push(Dim::Static(dim));
+                    }
+                    if !self.match_token(&TokenType::Comma) {
+                        break;
+                    }
+                }
+                self.consume(
+                    &TokenType::RightBracket,
+                    "Expected ']' after Tensor dimensions",
+                )?;
+            } else {
+                return Err(self.error("Expected '[' for Tensor dimensions"));
+            }
+        }
+
+        let mut top = None;
+        if self.match_token(&TokenType::Comma) {
+            top = Some(self.parse_placement()?);
+        }
+
+        self.consume(
+            &TokenType::RightAngle,
+            "Expected '>' after Tensor parameters",
+        )?;
+        // A `Tensor` carries its shape. The dims-less spelling used to mean four
+        // unrelated things at once -- an erased static shape, a run-time shape, a
+        // scalar, and an error placeholder -- and the two compilers read it two
+        // different ways (Vx#399, Vx#409).
+        if !saw_dims_list {
+            return Err(self.error(DIMS_REQUIRED));
+        }
+        Ok(Type::Tensor(el_ty, dims, top))
     }
 }

@@ -18,10 +18,10 @@ use crate::syntax::{Expr, MemorySpace, StructDecl, Topology, Type};
 use crate::{hir::env::Value, syntax::Function};
 use std::collections::{HashMap, HashSet};
 
-/// Compile-time evaluation: the constant environment and the constraints gathered from it.
 /// One tile placed in a memory space: what it costs, where it lives, and when it happened.
 #[derive(Debug, Clone)]
 pub struct Placement {
+    /// The tile's size in bytes, rounded up to the space's granule.
     pub bytes: u64,
     /// The blocks open when it was placed, outermost first. A tile is live for exactly the
     /// program points inside its innermost block.
@@ -31,6 +31,7 @@ pub struct Placement {
     pub order: usize,
 }
 
+/// Compile-time evaluation: the constant environment and the constraints gathered from it.
 pub struct ConstEvalState {
     /// Scoped constant bindings, innermost last.
     pub env: Vec<HashMap<Symbol, Value>>,
@@ -115,11 +116,6 @@ impl ComptimeValueFacts {
     }
 }
 
-/// The value part of a comptime interpretation result.
-///
-/// `concrete == None` means the expression was modelled but did not yield a constant. It says
-/// nothing about support or effects; those are independent parts of [`ComptimeEvalOutcome`] and
-/// [`ComptimeEvalContext`].
 /// Component values retained beside the legacy scalar/array [`Value`]. They let the transition
 /// interpreter model structs and partially-known arrays without assigning every field or element
 /// the union of its siblings' mutable-reference and callable facts.
@@ -129,6 +125,11 @@ pub(crate) enum ComptimeAggregateValue {
     Struct(HashMap<Symbol, ComptimeEvalValue>),
 }
 
+/// The value part of a comptime interpretation result.
+///
+/// `concrete == None` means the expression was modelled but did not yield a constant. It says
+/// nothing about support or effects; those are independent parts of [`ComptimeEvalOutcome`] and
+/// [`ComptimeEvalContext`].
 #[derive(Clone, Default, PartialEq)]
 pub(crate) struct ComptimeEvalValue {
     pub concrete: Option<Value>,
@@ -147,6 +148,10 @@ impl ComptimeEvalValue {
 
     /// Join values from alternative control-flow paths. A concrete result survives only when both
     /// paths proved the same concrete value; facts always merge as may-facts.
+    ///
+    /// # Panics
+    /// Never in practice: a struct field is looked up only after both structs were found to have
+    /// the same field names.
     pub(crate) fn merge_from(&mut self, other: &Self) {
         if self.concrete != other.concrete {
             self.concrete = None;
@@ -203,10 +208,9 @@ pub(crate) enum ComptimeEvalUnsupportedReason {
 
 impl ComptimeEvalUnsupportedReason {
     pub(crate) fn merge_from(&mut self, other: Self) {
-        use ComptimeEvalUnsupportedReason::*;
+        use ComptimeEvalUnsupportedReason::{None, Unclassified};
         *self = match (*self, other) {
-            (None, reason) => reason,
-            (reason, None) => reason,
+            (None, reason) | (reason, None) => reason,
             _ => Unclassified,
         };
     }
@@ -352,6 +356,10 @@ impl ComptimeEvalContext {
         self.local_scopes.push(HashMap::new());
     }
 
+    /// Closes the innermost scope.
+    ///
+    /// # Panics
+    /// When only the root scope is open, which means a `pop_scope` without a `push_scope`.
     pub(crate) fn pop_scope(&mut self) {
         assert!(
             self.local_scopes.len() > 1,
@@ -367,6 +375,10 @@ impl ComptimeEvalContext {
             .find_map(|scope| scope.get(name))
     }
 
+    /// Binds `name` in the innermost scope.
+    ///
+    /// # Panics
+    /// Never in practice: the root scope is opened by `new` and `pop_scope` never closes it.
     pub(crate) fn declare(&mut self, name: Symbol, facts: ComptimeValueFacts) {
         self.local_scopes
             .last_mut()
@@ -435,6 +447,10 @@ impl ComptimeEvalContext {
     /// Merge an alternative branch into this one. Branch-local declarations must have been popped
     /// before the merge. A binding present on only one path is not available afterwards; a binding
     /// present on both paths keeps the union of its may-facts. Escaping writes always union.
+    ///
+    /// # Panics
+    /// In a debug build, when the two branches do not have the same number of open scopes or
+    /// open calls.
     pub(crate) fn merge_branch(&mut self, branch: &Self) {
         debug_assert_eq!(self.local_scopes.len(), branch.local_scopes.len());
         for (scope, other_scope) in self.local_scopes.iter_mut().zip(&branch.local_scopes) {
@@ -462,6 +478,11 @@ impl Default for ComptimeEvalContext {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod comptime_eval_tests {
     use super::*;
 
@@ -649,7 +670,7 @@ pub struct SeamState {
     ///
     /// The machine (the lowering's `for Topology::X`, as its display name) is here because a
     /// capability check that knows only the edge pair cannot tell WHOSE edge: `raw::async_copy`
-    /// asked "does any topology's L2 -> SMEM carry copy_engine", so one machine declaring the
+    /// asked "does any topology's L2 -> SMEM carry `copy_engine`", so one machine declaring the
     /// engine armed every machine's lowerings for the like-named edge.
     pub lowering_edge: Option<(MemorySpace, MemorySpace, String)>,
     /// The current lowering method's parameter names: the only tiles `raw::` may touch. A local
@@ -719,8 +740,12 @@ pub struct TrafficState {
 /// A resolved call, recorded where the checker resolves it: who is called, from inside which
 /// open blocks, and where it sits in program order relative to the placements around it.
 pub struct CallSite {
+    /// The name of the function that is called.
     pub callee: String,
+    /// The blocks open at the call, outermost first.
     pub scope: Vec<u32>,
+    /// Position in program order, on the same counter as the placements.
     pub order: usize,
+    /// Where the call is in the source.
     pub span: crate::syntax::Span,
 }

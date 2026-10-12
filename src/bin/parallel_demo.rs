@@ -61,9 +61,7 @@ fn main() {
 
     let report = std::io::stderr();
     let mut w = report.lock();
-    let hw = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(0);
+    let hw = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
     writeln!(
         w,
         "\n╔══════════════════════════════════════════════════════════════════╗"

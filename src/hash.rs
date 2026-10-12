@@ -29,13 +29,14 @@ const FNV_PRIME_64: u64 = 0x0000_0100_0000_01b3;
 fn fnv1a_64(hash: u64, bytes: &[u8]) -> u64 {
     let mut hash = hash;
     for b in bytes {
-        hash ^= *b as u64;
+        hash ^= u64::from(*b);
         hash = hash.wrapping_mul(FNV_PRIME_64);
     }
     hash
 }
 
 /// Computes the stable 64-bit content hash (GID word 0) for a given module path.
+#[must_use]
 pub fn compute_module_hash(module_path: &str) -> u64 {
     fnv1a_64(FNV_OFFSET_BASIS_64, module_path.as_bytes())
 }
@@ -49,13 +50,16 @@ pub enum DefPath<'a> {
     /// An anonymous closure or comptime block, defined by its structural layout
     /// or its position within a specific parent item, rather than file line number.
     Anonymous {
+        /// The symbol hash of the item this definition is written inside.
         parent_hash: u64,
+        /// A hash of the definition's own shape, or of its position inside the parent.
         structural_hash: u64,
     },
 }
 
-impl<'a> DefPath<'a> {
-    /// Computes the deterministic 64-bit Word 1 for the TypeId (stable FNV-1a; see [`fnv1a_64`]).
+impl DefPath<'_> {
+    /// Computes the deterministic 64-bit Word 1 for the `TypeId` (stable FNV-1a; see [`fnv1a_64`]).
+    #[must_use]
     pub fn compute_symbol_hash(&self) -> u64 {
         match self {
             DefPath::Named(name) => {
@@ -78,6 +82,11 @@ impl<'a> DefPath<'a> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 
@@ -116,19 +125,19 @@ mod tests {
 
         let anon1 = DefPath::Anonymous {
             parent_hash: parent,
-            structural_hash: 0x12345678,
+            structural_hash: 0x1234_5678,
         };
 
         let anon2 = DefPath::Anonymous {
             parent_hash: parent,
-            structural_hash: 0x12345678,
+            structural_hash: 0x1234_5678,
         };
 
         assert_eq!(anon1.compute_symbol_hash(), anon2.compute_symbol_hash());
 
         let anon_different_structure = DefPath::Anonymous {
             parent_hash: parent,
-            structural_hash: 0x87654321,
+            structural_hash: 0x8765_4321,
         };
 
         assert_ne!(

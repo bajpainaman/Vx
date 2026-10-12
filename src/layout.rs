@@ -31,8 +31,11 @@ use crate::syntax::{ElementType, EnumDecl, StructDecl, Type};
 /// field is `Opaque`: modelled for size/offset but not decomposed into a loadable scalar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldTy {
+    /// A scalar value of this element type.
     Scalar(ElementType),
+    /// A struct or enum held by value, named by its GID.
     Nominal(TypeId),
+    /// A pointer, a borrow or a function pointer: one pointer-sized word.
     Opaque,
     /// A tensor held by value: its memref descriptor (two pointers, an offset, and a size and a
     /// stride per rank). The element and rank fix the descriptor's shape; the extents are in the
@@ -45,9 +48,13 @@ pub enum FieldTy {
 /// The byte offset, size, and type of a single struct field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldLayout {
+    /// The field's declared name.
     pub name: Symbol,
+    /// How many bytes into the struct the field starts.
     pub offset: usize,
+    /// How many bytes the field takes.
     pub size: usize,
+    /// What kind of value the field holds.
     pub ty: FieldTy,
 }
 
@@ -56,12 +63,16 @@ pub struct FieldLayout {
 /// empty for enums.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeLayout {
+    /// The total size in bytes, rounded up to the alignment.
     pub size: usize,
+    /// The alignment in bytes: the largest alignment of any field.
     pub align: usize,
+    /// Each field's layout, in declaration order. Empty for an enum.
     pub fields: Vec<FieldLayout>,
 }
 
 /// Round `n` up to the next multiple of `align` (a power of two, `>= 1`).
+#[must_use]
 pub fn align_up(n: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
     (n + align - 1) & !(align - 1)
@@ -70,6 +81,7 @@ pub fn align_up(n: usize, align: usize) -> usize {
 /// Size and alignment (bytes) of a scalar element type, with natural alignment
 /// (`align == size`). Returns `None` for a `Generic` type variable — it has no
 /// concrete layout until the enclosing type is monomorphized.
+#[must_use]
 pub fn scalar_size_align(et: &ElementType) -> Option<(usize, usize)> {
     // Byte size = the dense bit width rounded up to a whole byte (padded storage: a sub-byte `I4`
     // field occupies 1 byte). Derived from the single width source `ElementType::bits`, so this can no
@@ -84,6 +96,7 @@ pub fn scalar_size_align(et: &ElementType) -> Option<(usize, usize)> {
 /// Lanes pack densely and the total rounds up to a whole byte, so `<8 x i4>` is 4 bytes, not 8.
 /// Alignment is the size rounded up to a power of two, which is what the LLVM datalayout assigns
 /// `vector<NxT>`: `<4 x f32>` is 16/16. A generic element has no width and declines.
+#[must_use]
 pub fn vector_size_align(el: &ElementType, lanes: usize) -> Option<(usize, usize)> {
     if lanes == 0 {
         return None;
@@ -105,6 +118,8 @@ pub struct LayoutComputer<'a> {
 }
 
 impl<'a> LayoutComputer<'a> {
+    /// Makes a computer over these struct and enum declarations, with nothing computed yet.
+    #[must_use]
     pub fn new(
         structs: FxHashMap<TypeId, &'a StructDecl>,
         enums: FxHashMap<TypeId, &'a EnumDecl>,
@@ -141,7 +156,7 @@ impl<'a> LayoutComputer<'a> {
             return self.struct_layout(s);
         }
         if let Some(&e) = self.enums.get(&id) {
-            return self.enum_layout(e);
+            return Self::enum_layout(e);
         }
         None
     }
@@ -169,7 +184,7 @@ impl<'a> LayoutComputer<'a> {
         })
     }
 
-    fn enum_layout(&mut self, decl: &'a EnumDecl) -> Option<TypeLayout> {
+    fn enum_layout(decl: &EnumDecl) -> Option<TypeLayout> {
         // Payload-carrying (tagged-union) enums need a layout that matches the
         // codegen representation exactly; deferred. A C-like enum (no payloads)
         // is a bare `i32` discriminant, matching the enum tag in codegen.
@@ -261,6 +276,11 @@ impl<'a> LayoutComputer<'a> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 

@@ -78,6 +78,7 @@ use crate::syntax::{
 /// in the **return slot**, whose field is 9 bits. The [`REGION_UNSET`] sentinel maps to the slot-0
 /// sentinel [`REGION_UNSET_0`]; any real depth is clamped to [`REGION_MAX_0`] so it can neither reach
 /// the sentinel nor spill into the provenance bits above the region.
+#[must_use]
 pub fn region_for_depth_slot0(depth: u64) -> u64 {
     if depth == REGION_UNSET {
         REGION_UNSET_0
@@ -90,6 +91,7 @@ pub fn region_for_depth_slot0(depth: u64) -> u64 {
 /// sentinel is preserved as-is (a parsed reference carries it until a depth is bound); any *real*
 /// depth is clamped to [`REGION_MAX`] so it can never equal the sentinel — nesting deeper than
 /// `REGION_MAX` degrades to the shortest-lived valid region rather than overflowing into "unset".
+#[must_use]
 pub fn region_for_depth(depth: u64) -> u64 {
     if depth == REGION_UNSET {
         REGION_UNSET
@@ -111,6 +113,7 @@ pub fn region_for_depth(depth: u64) -> u64 {
 /// - `Invariant (0x0)`: Requires strict equality (`region_a == region_b`).
 /// - `Covariant (0x1)`: Source must outlive target (`region_a <= region_b`).
 /// - `Contravariant (0x2)`: Target must outlive source (`region_a >= region_b`).
+#[must_use]
 pub fn verify_subtyping_bounds(
     type_a: &TypeId,
     type_b: &TypeId,
@@ -141,6 +144,10 @@ const _: () = assert!(REGION_UNSET == REGION_MASK && REGION_UNSET_0 == REGION_MA
 
 /// The region mask of each slot. Slot 0 is the return slot: the 3 bits above its 9-bit region
 /// carry the provenance code, and must not be read as part of the lifetime.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a region mask is at most 12 bits wide"
+)]
 const SLOT_REGION_MASKS: [u16; 4] = [
     REGION_MASK_0 as u16,
     REGION_MASK as u16,
@@ -153,15 +160,15 @@ const SLOT_REGION_MASKS: [u16; 4] = [
 /// The variances must match. An unset region (a placeholder not yet bound to a scope depth)
 /// matches any region. Otherwise invariant (0) needs equal regions, covariant (1) needs the source
 /// to live at least as long (`a <= b`, as region 0 is `'static`), and contravariant (2) the reverse.
-#[inline(always)]
+#[inline]
 fn slot_compatible(a: u16, b: u16, region_mask: u16) -> bool {
     let (variance_a, variance_b) = (a >> 12, b >> 12);
     let (region_a, region_b) = (a & region_mask, b & region_mask);
-    let unset = (region_a == region_mask) | (region_b == region_mask);
-    let ordered = ((variance_a == 0) & (region_a == region_b))
-        | ((variance_a == 1) & (region_a <= region_b))
-        | ((variance_a == 2) & (region_a >= region_b));
-    (variance_a == variance_b) & (unset | ordered)
+    let unset = (region_a == region_mask) || (region_b == region_mask);
+    let ordered = (variance_a == 0) && (region_a == region_b)
+        || (variance_a == 1) && (region_a <= region_b)
+        || (variance_a == 2) && (region_a >= region_b);
+    (variance_a == variance_b) && (unset | ordered)
 }
 
 /// Whether all four slots of `bits_a` may stand in for those of `bits_b`.
@@ -169,6 +176,10 @@ fn slot_compatible(a: u16, b: u16, region_mask: u16) -> bool {
 /// Every slot is checked and the answers are combined with `&`, with no early exit. That gives no
 /// data-dependent branches to mispredict, and lets LLVM put the four slots in one SIMD register.
 #[inline]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the cast cuts one 16-bit slot out of the 64-bit word"
+)]
 fn fast_path_slots_compatible(bits_a: u64, bits_b: u64) -> bool {
     let mut all = true;
     for (i, &region_mask) in SLOT_REGION_MASKS.iter().enumerate() {
@@ -189,11 +200,21 @@ fn evaluate_slow_path_variance(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use crate::gid::TypeId;
     use crate::session::{GlobalSession, LocalWorkerState};
     use std::sync::Arc;
+
+    /// A region constant as the 16-bit value a slot stores.
+    fn region_u16(region: u64) -> u16 {
+        u16::try_from(region).expect("a region constant fits in 16 bits")
+    }
 
     fn worker() -> LocalWorkerState {
         LocalWorkerState::new(Arc::new(GlobalSession::new(1)))
@@ -254,8 +275,8 @@ mod tests {
                 for vb in 0u16..16 {
                     for &ra in regions {
                         for &rb in regions {
-                            let a = (((va << 12) | ra) as u64) << (16 * slot);
-                            let b = (((vb << 12) | rb) as u64) << (16 * slot);
+                            let a = u64::from((va << 12) | ra) << (16 * slot);
+                            let b = u64::from((vb << 12) | rb) << (16 * slot);
                             assert_eq!(
                                 fast_path_slots_compatible(a, b),
                                 slots_compatible_reference(a, b),
@@ -301,7 +322,7 @@ mod tests {
         for _ in 0..1_000_000 {
             let (a, b) = (realistic(), realistic());
             let expected = slots_compatible_reference(a, b);
-            passed += expected as u32;
+            passed += u32::from(expected);
             assert_eq!(
                 fast_path_slots_compatible(a, b),
                 expected,
@@ -385,7 +406,7 @@ mod tests {
     #[test]
     fn unset_region_is_a_wildcard() {
         let w = worker();
-        let unset = REGION_UNSET as u16;
+        let unset = region_u16(REGION_UNSET);
         // Covariant: unset on either side passes regardless of the other operand's depth. (A
         // numeric read would fail `4095 <= 5`.)
         assert!(verify_subtyping_bounds(
@@ -423,8 +444,8 @@ mod tests {
         assert_ne!(REGION_MAX_0, REGION_UNSET_0);
 
         // --- Slot 0: 9-bit region, max real = 510. ---
-        let max0 = REGION_MAX_0 as u16; // 510
-                                        // Two real regions compare by depth: invariant requires exact equality.
+        let max0 = region_u16(REGION_MAX_0); // 510
+                                             // Two real regions compare by depth: invariant requires exact equality.
         assert!(verify_subtyping_bounds(
             &lifetime_gid(max0, 0x0),
             &lifetime_gid(max0, 0x0),
@@ -449,12 +470,12 @@ mod tests {
         // Max real vs the slot-0 sentinel passes (wildcard) — distinct from vs a real 510 (invariant).
         assert!(verify_subtyping_bounds(
             &lifetime_gid(max0, 0x0),
-            &lifetime_gid(REGION_UNSET_0 as u16, 0x0),
+            &lifetime_gid(region_u16(REGION_UNSET_0), 0x0),
             &w
         ));
 
         // --- Parameter slot 1: 12-bit region, max real = 4094, unchanged by the narrowing. ---
-        let max_real = REGION_MAX as u16; // 4094
+        let max_real = region_u16(REGION_MAX); // 4094
         assert!(verify_subtyping_bounds(
             &lifetime_gid_at(1, max_real, 0x0),
             &lifetime_gid_at(1, max_real, 0x0),
@@ -468,7 +489,7 @@ mod tests {
         // A real 4094 in a param slot is a wildcard only against the 4095 sentinel.
         assert!(verify_subtyping_bounds(
             &lifetime_gid_at(1, max_real, 0x0),
-            &lifetime_gid_at(1, REGION_UNSET as u16, 0x0),
+            &lifetime_gid_at(1, region_u16(REGION_UNSET), 0x0),
             &w
         ));
     }

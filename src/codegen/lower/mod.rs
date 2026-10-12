@@ -10,7 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::*;
+use super::{
+    returns_through_slot, BinaryOp, BlockLike, ElementType, Expr, LogicalOp, MatchArm,
+    MeliorGenerator, Pattern, Region, RegionLike, RelationalOp, Type, Value, ValueLike,
+};
 use melior::ir::{
     attribute::{
         ArrayAttribute, Attribute, DenseI32ArrayAttribute, FlatSymbolRefAttribute,
@@ -27,8 +30,11 @@ mod seam_cert;
 mod stmt;
 mod tensors;
 
+/// A piece of Vx syntax that can generate MLIR code for itself.
 pub trait LowerToMelior<'c> {
+    /// What generating the code gives back, for example a value and the block to continue in.
     type Output;
+    /// Generates the MLIR code for `self`, adding its operations to `block`.
     fn lower(
         &self,
         gen: &mut MeliorGenerator<'c>,
@@ -36,8 +42,13 @@ pub trait LowerToMelior<'c> {
     ) -> Self::Output;
 }
 
+/// Tells which MLIR `arith` operation implements a Vx operator.
 pub trait MeliorOpInfo {
+    /// The name of the MLIR operation for this operator. It depends on whether the operands
+    /// are floats and whether they are unsigned.
     fn get_op_name(&self, is_float: bool, is_unsigned: bool) -> &'static str;
+    /// The comparison code that `arith.cmpi` or `arith.cmpf` takes, or `None` when the
+    /// operator is not a comparison.
     fn get_predicate(&self, is_float: bool, is_unsigned: bool) -> Option<i64>;
 }
 
@@ -170,6 +181,10 @@ impl MeliorOpInfo for LogicalOp {
 /// checks dominance only for blocks reachable from the entry, and a block with
 /// no predecessors is not one. The alternative -- piling the rest of the
 /// function on after a `func.return` -- does not compile at all.
+///
+/// # Panics
+///
+/// Panics if `block` is not inside a region. Every block that code is generated into is.
 pub(crate) fn dead_continuation<'c>(
     block: melior::ir::BlockRef<'c, 'c>,
 ) -> melior::ir::BlockRef<'c, 'c> {
@@ -185,6 +200,13 @@ pub(crate) fn topology_to_i32(top: &syntax::Topology) -> i32 {
     crate::arch::topology_dispatch_id(top)
 }
 
+/// The element type of a `memref` or `tensor` type written as MLIR text: `f32` for
+/// `memref<4x4xf32>`.
+///
+/// # Errors
+///
+/// Returns an error if the text is not a `memref<..>` or `tensor<..>` type, or if its
+/// element type is not one of `bf16`, `f16`, `f32`, `f64`, `i32`, `i64` and `i1`.
 pub(crate) fn extract_mlir_element_type(ty_str: &str) -> Result<&'static str, String> {
     let mut inner = ty_str;
     if inner.starts_with("memref<") && inner.ends_with('>') {
@@ -192,7 +214,7 @@ pub(crate) fn extract_mlir_element_type(ty_str: &str) -> Result<&'static str, St
     } else if inner.starts_with("tensor<") && inner.ends_with('>') {
         inner = &inner[7..inner.len() - 1];
     } else {
-        return Err(format!("Unsupported MLIR element type in: {}", ty_str));
+        return Err(format!("Unsupported MLIR element type in: {ty_str}"));
     }
 
     if let Some(idx) = inner.find(',') {
@@ -213,10 +235,16 @@ pub(crate) fn extract_mlir_element_type(ty_str: &str) -> Result<&'static str, St
         "i32" => Ok("i32"),
         "i64" => Ok("i64"),
         "i1" => Ok("i1"),
-        _ => Err(format!("Unsupported MLIR element type in: {}", ty_str)),
+        _ => Err(format!("Unsupported MLIR element type in: {ty_str}")),
     }
 }
 
+/// Declares the Enzyme wrapper function that differentiates `target_fn`, the first time it is
+/// needed, and returns its name. `base_name` says which kind of derivative is wanted.
+///
+/// # Panics
+///
+/// Panics if MLIR refuses to build the `func.func` declaration, which would be a compiler bug.
 pub(crate) fn emit_enzyme_decl<'c>(
     gen: &mut MeliorGenerator<'c>,
     base_name: &str,
@@ -261,6 +289,12 @@ pub(crate) fn emit_enzyme_decl<'c>(
 /// `value_ty` is `Some` exactly when the merge block takes an argument. An arm that diverges
 /// (its body ends in `return`) branches nowhere and contributes no value, which is what lets a
 /// match whose arms all return type-check and lower.
+///
+/// # Errors
+///
+/// Returns an error if a statement of the body fails to generate code, if the match needs a
+/// value and the arm ends in a statement, or if the arm's value has a different type from the
+/// one the match gives.
 fn lower_match_arm_body<'c>(
     gen: &mut MeliorGenerator<'c>,
     body: &[syntax::Statement],
@@ -286,12 +320,11 @@ fn lower_match_arm_body<'c>(
                 continue;
             }
         }
-        match gen.generate_statement(stmt, b)? {
-            Some(nb) => b = nb,
-            None => {
-                terminated = true;
-                break;
-            }
+        if let Some(nb) = gen.generate_statement(stmt, b)? {
+            b = nb
+        } else {
+            terminated = true;
+            break;
         }
     }
     if terminated {
@@ -369,7 +402,7 @@ fn declared_payload_ty(
     if !params.is_empty() {
         let quoted = match_ty_text.split('"').nth(1)?;
         let args: Vec<&str> = quoted
-            .strip_prefix(&format!("{}_", base))?
+            .strip_prefix(&format!("{base}_"))?
             .split('_')
             .collect();
         if args.len() != params.len() || !args.iter().all(|a| is_plain_scalar(a)) {
@@ -391,11 +424,153 @@ fn is_plain_scalar(text: &str) -> bool {
     parse_scalar_type(text).is_some()
 }
 
+/// What the steps of `lower_usize_checked` share: the block they add operations to, and the
+/// location and types every one of those operations uses.
+struct UsizeCheck<'c, 'a> {
+    block: &'a melior::ir::BlockRef<'c, 'c>,
+    loc: melior::ir::Location<'c>,
+    ctx: &'c melior::Context,
+    i64_ty: melior::ir::Type<'c>,
+    i1_ty: melior::ir::Type<'c>,
+}
+
+impl<'c> UsizeCheck<'c, '_> {
+    /// Adds `op` to the block and returns its first result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `op` has no result.
+    fn append(
+        &self,
+        op: melior::ir::Operation<'c>,
+    ) -> Result<melior::ir::Value<'c, 'c>, LowerError> {
+        Ok(self.block.append_operation(op).result(0)?.into())
+    }
+
+    /// The `i64` constant `v`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if MLIR refuses to build the constant.
+    fn constant(&self, v: i64) -> Result<melior::ir::Value<'c, 'c>, LowerError> {
+        self.append(
+            OperationBuilder::new("arith.constant", self.loc)
+                .add_results(&[self.i64_ty])
+                .add_attributes(&[(
+                    Identifier::new(self.ctx, "value"),
+                    IntegerAttribute::new(self.i64_ty, v).into(),
+                )])
+                .build()?,
+        )
+    }
+
+    /// The two-operand operation `name` on `x` and `y`, with a result of type `ty`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if MLIR refuses to build the operation.
+    fn binary(
+        &self,
+        name: &str,
+        x: melior::ir::Value<'c, 'c>,
+        y: melior::ir::Value<'c, 'c>,
+        ty: melior::ir::Type<'c>,
+    ) -> Result<melior::ir::Value<'c, 'c>, LowerError> {
+        self.append(
+            OperationBuilder::new(name, self.loc)
+                .add_operands(&[x, y])
+                .add_results(&[ty])
+                .build()?,
+        )
+    }
+
+    /// An `arith.cmpi` of `x` and `y`. The predicates used here are: eq = 0, sge = 5, ult = 6,
+    /// ule = 7, uge = 9.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if MLIR refuses to build the comparison.
+    fn compare(
+        &self,
+        pred: i64,
+        x: melior::ir::Value<'c, 'c>,
+        y: melior::ir::Value<'c, 'c>,
+    ) -> Result<melior::ir::Value<'c, 'c>, LowerError> {
+        self.append(
+            OperationBuilder::new("arith.cmpi", self.loc)
+                .add_operands(&[x, y])
+                .add_results(&[self.i1_ty])
+                .add_attributes(&[(
+                    Identifier::new(self.ctx, "predicate"),
+                    IntegerAttribute::new(self.i64_ty, pred).into(),
+                )])
+                .build()?,
+        )
+    }
+
+    /// An `i1` value that is true when `a op b` stays inside the range of `usize`. `op` is one
+    /// of `+`, `-`, `*` and `<<`; any other operator is checked as `<<`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if MLIR refuses to build one of the operations of the check.
+    fn operands_fit(
+        &self,
+        op: &BinaryOp,
+        a: melior::ir::Value<'c, 'c>,
+        b: melior::ir::Value<'c, 'c>,
+    ) -> Result<melior::ir::Value<'c, 'c>, LowerError> {
+        let (i64_ty, i1_ty) = (self.i64_ty, self.i1_ty);
+        Ok(match op {
+            // a + b fits when a <= MAX - b.
+            BinaryOp::Add => {
+                let room = self.binary("arith.subi", self.constant(i64::MAX)?, b, i64_ty)?;
+                self.compare(7, a, room)?
+            }
+            BinaryOp::Sub => self.compare(9, a, b)?,
+            // The full product has no high word, and its low word has the top bit clear.
+            BinaryOp::Mul => {
+                let product = self.block.append_operation(
+                    OperationBuilder::new("arith.mului_extended", self.loc)
+                        .add_operands(&[a, b])
+                        .add_results(&[i64_ty, i64_ty])
+                        .build()?,
+                );
+                let (low, high) = (product.result(0)?.into(), product.result(1)?.into());
+                let zero = self.constant(0)?;
+                let no_high = self.compare(0, high, zero)?;
+                let low_fits = self.compare(5, low, zero)?;
+                self.binary("arith.andi", no_high, low_fits, i1_ty)?
+            }
+            // a << b fits when b < 63 and a >> (63 - b) is 0. The shift used for the check is
+            // clamped to 63, so the check itself never shifts by the width or more.
+            _ => {
+                let width = self.constant(63)?;
+                let shift_fits = self.compare(6, b, width)?;
+                let clamped = self.binary("arith.minui", b, width, i64_ty)?;
+                let back = self.binary("arith.subi", width, clamped, i64_ty)?;
+                let lost = self.binary("arith.shrui", a, back, i64_ty)?;
+                let nothing_lost = self.compare(0, lost, self.constant(0)?)?;
+                self.binary("arith.andi", shift_fits, nothing_lost, i1_ty)?
+            }
+        })
+    }
+}
+
 /// `a op b` on `usize`, for the operators that can leave its range: `+`, `-`, `*` and `<<`.
 /// The operands are checked first and a failed check traps through `cf.assert`; the operation
 /// itself then never wraps and carries `overflow<nsw, nuw>`. Checking the result instead would
 /// not work: an overflowing flagged operation gives poison, and LLVM may delete a branch on it.
 /// `None` for any other operator, which cannot leave the range.
+///
+/// # Errors
+///
+/// Returns an error if MLIR refuses to build one of the operations, or if the overflow flags
+/// do not parse.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "callers are in other files; they pass the block by reference"
+)]
 pub(crate) fn lower_usize_checked<'c>(
     gen: &mut MeliorGenerator<'c>,
     block: &melior::ir::BlockRef<'c, 'c>,
@@ -411,84 +586,16 @@ pub(crate) fn lower_usize_checked<'c>(
         _ => return Ok(None),
     };
     let i64_ty = gen.i64_ty;
-    let i1_ty = gen.i1_ty;
     let ctx = gen.context;
     let loc = gen.loc();
-    let append = |op: melior::ir::Operation<'c>| -> Result<melior::ir::Value<'c, 'c>, LowerError> {
-        Ok(block.append_operation(op).result(0)?.into())
+    let check = UsizeCheck {
+        block,
+        loc,
+        ctx,
+        i64_ty,
+        i1_ty: gen.i1_ty,
     };
-    let constant = |v: i64| -> Result<melior::ir::Value<'c, 'c>, LowerError> {
-        append(
-            OperationBuilder::new("arith.constant", loc)
-                .add_results(&[i64_ty])
-                .add_attributes(&[(
-                    Identifier::new(ctx, "value"),
-                    IntegerAttribute::new(i64_ty, v).into(),
-                )])
-                .build()?,
-        )
-    };
-    let binary = |name: &str,
-                  x: melior::ir::Value<'c, 'c>,
-                  y: melior::ir::Value<'c, 'c>,
-                  ty: melior::ir::Type<'c>|
-     -> Result<melior::ir::Value<'c, 'c>, LowerError> {
-        append(
-            OperationBuilder::new(name, loc)
-                .add_operands(&[x, y])
-                .add_results(&[ty])
-                .build()?,
-        )
-    };
-    // `arith.cmpi` predicates: eq = 0, sge = 5, ult = 6, ule = 7, uge = 9.
-    let compare = |pred: i64,
-                   x: melior::ir::Value<'c, 'c>,
-                   y: melior::ir::Value<'c, 'c>|
-     -> Result<melior::ir::Value<'c, 'c>, LowerError> {
-        append(
-            OperationBuilder::new("arith.cmpi", loc)
-                .add_operands(&[x, y])
-                .add_results(&[i1_ty])
-                .add_attributes(&[(
-                    Identifier::new(ctx, "predicate"),
-                    IntegerAttribute::new(i64_ty, pred).into(),
-                )])
-                .build()?,
-        )
-    };
-    let fits = match op {
-        // a + b fits when a <= MAX - b.
-        BinaryOp::Add => {
-            let room = binary("arith.subi", constant(i64::MAX)?, b, i64_ty)?;
-            compare(7, a, room)?
-        }
-        BinaryOp::Sub => compare(9, a, b)?,
-        // The full product has no high word, and its low word has the top bit clear.
-        BinaryOp::Mul => {
-            let product = block.append_operation(
-                OperationBuilder::new("arith.mului_extended", loc)
-                    .add_operands(&[a, b])
-                    .add_results(&[i64_ty, i64_ty])
-                    .build()?,
-            );
-            let (low, high) = (product.result(0)?.into(), product.result(1)?.into());
-            let zero = constant(0)?;
-            let no_high = compare(0, high, zero)?;
-            let low_fits = compare(5, low, zero)?;
-            binary("arith.andi", no_high, low_fits, i1_ty)?
-        }
-        // a << b fits when b < 63 and a >> (63 - b) is 0. The shift used for the check is
-        // clamped to 63, so the check itself never shifts by the width or more.
-        _ => {
-            let width = constant(63)?;
-            let shift_fits = compare(6, b, width)?;
-            let clamped = binary("arith.minui", b, width, i64_ty)?;
-            let back = binary("arith.subi", width, clamped, i64_ty)?;
-            let lost = binary("arith.shrui", a, back, i64_ty)?;
-            let nothing_lost = compare(0, lost, constant(0)?)?;
-            binary("arith.andi", shift_fits, nothing_lost, i1_ty)?
-        }
-    };
+    let fits = check.operands_fit(op, a, b)?;
     block.append_operation(
         OperationBuilder::new("cf.assert", loc)
             .add_operands(&[fits])
@@ -500,7 +607,7 @@ pub(crate) fn lower_usize_checked<'c>(
     );
     let flags = Attribute::parse(ctx, "#arith.overflow<nsw, nuw>")
         .ok_or_else(|| LowerError::from("the overflow flags did not parse".to_string()))?;
-    let result = append(
+    let result = check.append(
         OperationBuilder::new(name, loc)
             .add_operands(&[a, b])
             .add_results(&[i64_ty])
@@ -536,36 +643,357 @@ fn parse_scalar_type(text: &str) -> Option<syntax::Type> {
     }
 }
 
+/// Ends a chain of `match` arms. `block` is where control lands when no arm matched, and it
+/// branches to the merge block.
+///
+/// # Errors
+///
+/// Returns an error if MLIR refuses to build one of the operations.
+fn end_match_chain<'c>(
+    gen: &MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    merge_block: melior::ir::BlockRef<'c, 'c>,
+    value_ty: Option<melior::ir::Type<'c>>,
+) -> Result<(), LowerError> {
+    // The chain always ends in a fall-through block. In value position the checker has
+    // already established that some arm matches (a wildcard, or every variant of the
+    // scrutinee's enum), so this edge is unreachable -- but it still has to satisfy the
+    // merge block's argument, and an undef says "unreachable" where a zero would be
+    // indistinguishable from a real result.
+    let mut operands = Vec::new();
+    if let Some(ty) = value_ty {
+        let undef = block.append_operation(
+            OperationBuilder::new("llvm.mlir.undef", gen.loc())
+                .add_results(&[ty])
+                .build()?,
+        );
+        operands.push(undef.result(0)?.into());
+    }
+    block.append_operation(
+        OperationBuilder::new("cf.br", gen.loc())
+            .add_operands(&operands)
+            .add_successors(&[&*merge_block])
+            .build()?,
+    );
+    Ok(())
+}
+
+/// An `i1` value that is true when the matched enum value holds the variant `variant_name`.
+/// The tag is the first field of the enum value, or the value itself when the enum is a
+/// plain `i32`.
+///
+/// # Errors
+///
+/// Returns an error if MLIR refuses to build one of the operations.
+///
+/// # Panics
+///
+/// Panics if a variant's position in its enum does not fit in an `i64`, which cannot happen
+/// for an enum a program can declare.
+fn variant_tag_condition<'c>(
+    gen: &MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    variant_name: &str,
+    match_val: melior::ir::Value<'c, 'c>,
+    match_ty: melior::ir::Type<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, LowerError> {
+    let i32_ty = melior::ir::r#type::IntegerType::new(gen.context, 32).into();
+    let mut tag_val = 0;
+    for enum_def in gen.enums.values() {
+        for (i, v) in enum_def.iter().enumerate() {
+            if *v.0 == *variant_name {
+                tag_val = i64::try_from(i).expect("an enum has far fewer variants than i64 holds");
+                break;
+            }
+        }
+    }
+
+    let tag_op = block.append_operation(
+        OperationBuilder::new("arith.constant", gen.loc())
+            .add_results(&[i32_ty])
+            .add_attributes(&[(
+                Identifier::new(gen.context, "value"),
+                IntegerAttribute::new(i32_ty, tag_val).into(),
+            )])
+            .build()?,
+    );
+    let tag = tag_op.result(0)?.into();
+
+    let actual_tag = if match_ty.to_string() == "i32" {
+        match_val
+    } else {
+        let extract_tag_op = block.append_operation(
+            OperationBuilder::new("llvm.extractvalue", gen.loc())
+                .add_operands(&[match_val])
+                .add_results(&[i32_ty])
+                .add_attributes(&[(
+                    Identifier::new(gen.context, "position"),
+                    melior::ir::attribute::DenseI64ArrayAttribute::new(gen.context, &[0]).into(),
+                )])
+                .build()?,
+        );
+        extract_tag_op.result(0)?.into()
+    };
+
+    let cmp_op = block.append_operation(
+        OperationBuilder::new("arith.cmpi", gen.loc())
+            .add_operands(&[actual_tag, tag])
+            .add_results(&[melior::ir::r#type::IntegerType::new(gen.context, 1).into()])
+            .add_attributes(&[(
+                Identifier::new(gen.context, "predicate"),
+                IntegerAttribute::new(
+                    melior::ir::r#type::IntegerType::new(gen.context, 64).into(),
+                    0, // eq
+                )
+                .into(),
+            )])
+            .build()?,
+    );
+    Ok(cmp_op.result(0)?.into())
+}
+
+/// An `i1` value that is true when the matched integer equals the number `lit`. It is the
+/// same `arith.cmpi eq` as for an enum variant, but against `match_val` itself, with no tag
+/// to read first.
+///
+/// # Errors
+///
+/// Returns an error if MLIR refuses to build one of the operations.
+///
+/// # Panics
+///
+/// Panics if `lit` is not a number.
+fn literal_condition<'c>(
+    gen: &MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    lit: &Expr,
+    match_val: melior::ir::Value<'c, 'c>,
+    match_ty: melior::ir::Type<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, LowerError> {
+    let lit_val = match lit {
+        Expr::Number(n) => n.value.as_ref().parse::<i64>().unwrap_or(0),
+        other => panic!("Unsupported literal pattern in codegen: {other:?}"),
+    };
+    let const_op = block.append_operation(
+        OperationBuilder::new("arith.constant", gen.loc())
+            .add_results(&[match_ty])
+            .add_attributes(&[(
+                Identifier::new(gen.context, "value"),
+                IntegerAttribute::new(match_ty, lit_val).into(),
+            )])
+            .build()?,
+    );
+    let const_val = const_op.result(0)?.into();
+    let cmp_op = block.append_operation(
+        OperationBuilder::new("arith.cmpi", gen.loc())
+            .add_operands(&[match_val, const_val])
+            .add_results(&[melior::ir::r#type::IntegerType::new(gen.context, 1).into()])
+            .add_attributes(&[(
+                Identifier::new(gen.context, "predicate"),
+                IntegerAttribute::new(
+                    melior::ir::r#type::IntegerType::new(gen.context, 64).into(),
+                    0, // eq
+                )
+                .into(),
+            )])
+            .build()?,
+    );
+    Ok(cmp_op.result(0)?.into())
+}
+
+/// Reads the payload at `position` out of the matched enum value. Returns the text of the
+/// slot's type, the value read, and its type.
+///
+/// # Errors
+///
+/// Returns an error if the slot's type does not parse or MLIR refuses to build the operation.
+///
+/// # Panics
+///
+/// Panics if `position` does not fit in an `i64`, which cannot happen for a variant a program
+/// can declare.
+fn extract_payload_slot<'c>(
+    gen: &MeliorGenerator<'c>,
+    then_block: melior::ir::BlockRef<'c, 'c>,
+    match_val: melior::ir::Value<'c, 'c>,
+    position: usize,
+    slot_text: &str,
+) -> Result<(String, melior::ir::Value<'c, 'c>, melior::ir::Type<'c>), LowerError> {
+    let mut payload_ty_str = slot_text.to_string();
+    if payload_ty_str.starts_with("struct<")
+        || payload_ty_str.starts_with("ptr")
+        || payload_ty_str.starts_with("func")
+        || payload_ty_str.starts_with("array")
+    {
+        payload_ty_str = format!("!llvm.{payload_ty_str}");
+    }
+    let payload_ty = melior::ir::Type::parse(gen.context, &payload_ty_str).ok_or_else(|| {
+        crate::codegen::lower::LowerError::ParseType("Type::parse failed".to_string())
+    })?;
+    // Field 0 of the enum value is the tag, so the payloads start at field 1.
+    let field = i64::try_from(position).expect("a variant has far fewer fields than i64 holds") + 1;
+    let extract_payload_op = OperationBuilder::new("llvm.extractvalue", gen.loc())
+        .add_operands(&[match_val])
+        .add_results(&[payload_ty])
+        .add_attributes(&[(
+            Identifier::new(gen.context, "position"),
+            melior::ir::attribute::DenseI64ArrayAttribute::new(gen.context, &[field]).into(),
+        )])
+        .build()?;
+    let payload_val: melior::ir::Value<'_, '_> = then_block
+        .append_operation(extract_payload_op)
+        .result(0)?
+        .into();
+    Ok((payload_ty_str, payload_val, payload_ty))
+}
+
+/// Cuts a payload back to the integer type `narrower` when there is one, and returns the
+/// payload unchanged otherwise.
+///
+/// # Errors
+///
+/// Returns an error if `narrower` does not parse or MLIR refuses to build the operation.
+fn truncate_payload<'c>(
+    gen: &MeliorGenerator<'c>,
+    then_block: melior::ir::BlockRef<'c, 'c>,
+    narrower: Option<String>,
+    (payload_val, payload_ty): (melior::ir::Value<'c, 'c>, melior::ir::Type<'c>),
+) -> Result<(melior::ir::Value<'c, 'c>, melior::ir::Type<'c>), LowerError> {
+    Ok(match narrower {
+        Some(text) => {
+            let ty = melior::ir::Type::parse(gen.context, &text).ok_or_else(|| {
+                crate::codegen::lower::LowerError::ParseType("Type::parse failed".to_string())
+            })?;
+            let trunc = OperationBuilder::new("arith.trunci", gen.loc())
+                .add_operands(&[payload_val])
+                .add_results(&[ty])
+                .build()?;
+            (then_block.append_operation(trunc).result(0)?.into(), ty)
+        }
+        None => (payload_val, payload_ty),
+    })
+}
+
+/// Turns a payload kept as integer bits back into the float type `declared_float` when there
+/// is one, and returns the payload unchanged otherwise.
+///
+/// # Errors
+///
+/// Returns an error if the float type has no known width, a type does not parse, or MLIR
+/// refuses to build an operation.
+fn payload_float_from_bits<'c>(
+    gen: &MeliorGenerator<'c>,
+    then_block: melior::ir::BlockRef<'c, 'c>,
+    declared_float: Option<String>,
+    (payload_val, payload_ty): (melior::ir::Value<'c, 'c>, melior::ir::Type<'c>),
+) -> Result<(melior::ir::Value<'c, 'c>, melior::ir::Type<'c>), LowerError> {
+    Ok(match declared_float {
+        Some(text) => {
+            let bits = crate::codegen::generator::scalar_type_bits(&text)
+                .ok_or_else(|| LowerError::from(format!("a float of no width: {text}")))?;
+            let mut val = payload_val;
+            if payload_ty.to_string() != format!("i{bits}") {
+                let as_int = melior::ir::Type::parse(gen.context, &format!("i{bits}"))
+                    .ok_or_else(|| LowerError::ParseType("Type::parse failed".into()))?;
+                let trunc = OperationBuilder::new("arith.trunci", gen.loc())
+                    .add_operands(&[val])
+                    .add_results(&[as_int])
+                    .build()?;
+                val = then_block.append_operation(trunc).result(0)?.into();
+            }
+            let ty = melior::ir::Type::parse(gen.context, &text)
+                .ok_or_else(|| LowerError::ParseType("Type::parse failed".into()))?;
+            let cast = OperationBuilder::new("arith.bitcast", gen.loc())
+                .add_operands(&[val])
+                .add_results(&[ty])
+                .build()?;
+            (then_block.append_operation(cast).result(0)?.into(), ty)
+        }
+        None => (payload_val, payload_ty),
+    })
+}
+
+/// Binds each name in an enum-variant pattern to the payload value at its position, read from
+/// that position's slot in `then_block`. `_` binds nothing, and a pattern that is not an enum
+/// variant with payloads binds nothing at all.
+///
+/// # Errors
+///
+/// Returns an error if a payload's type does not parse or MLIR refuses to build an operation.
+fn bind_variant_payloads<'c>(
+    gen: &mut MeliorGenerator<'c>,
+    then_block: melior::ir::BlockRef<'c, 'c>,
+    pattern: &Pattern,
+    match_val: melior::ir::Value<'c, 'c>,
+    match_ty: melior::ir::Type<'c>,
+) -> Result<(), LowerError> {
+    if let Pattern::EnumVariant(en, vn, Some(payloads)) = pattern {
+        let opt_ty_str = match_ty.to_string();
+        let slots = crate::codegen::lower::expr::enum_payload_slot_texts(&opt_ty_str);
+        for (position, pattern) in payloads.iter().enumerate() {
+            let Pattern::Identifier(name) = pattern else {
+                continue;
+            };
+            let Some(slot_text) = slots.get(position) else {
+                continue;
+            };
+            let (payload_ty_str, payload_val, payload_ty) =
+                extract_payload_slot(gen, then_block, match_val, position, slot_text)?;
+
+            // The slot may be wider than this variant declares, so cut the value back
+            // to its own type before the arm body sees it.
+            let narrower =
+                declared_payload_ty(gen, en.as_ref(), vn.as_ref(), position, &opt_ty_str).filter(
+                    |text| crate::codegen::lower::expr::is_narrower_int(&payload_ty_str, text),
+                );
+            let payload = truncate_payload(gen, then_block, narrower, (payload_val, payload_ty))?;
+            // A float kept in an integer slot comes back out from its bits.
+            let declared_float =
+                declared_payload_ty(gen, en.as_ref(), vn.as_ref(), position, &opt_ty_str).filter(
+                    |text| {
+                        crate::codegen::generator::is_float_text(text)
+                            && payload_ty_str.starts_with('i')
+                    },
+                );
+            let (payload_val, payload_ty) =
+                payload_float_from_bits(gen, then_block, declared_float, payload)?;
+            gen.note_shadow(name.as_ref());
+            gen.env
+                .insert(name.to_string().into(), (payload_val, payload_ty));
+        }
+    }
+    Ok(())
+}
+
+/// Generates the code for the arms of a `match`, one after another. Each arm tests the matched
+/// value, runs its body when the test passes, and goes on to the next arm otherwise. Every arm
+/// ends by branching to `merge_block`, with the arm's value when `value_ty` is `Some`.
+/// Returns `block`.
+///
+/// # Errors
+///
+/// Returns an error if an arm's body fails to generate code, a payload's type does not parse,
+/// or MLIR refuses to build an operation.
+///
+/// # Panics
+///
+/// Panics if `block` is not inside a region, or if an arm's pattern is not a wildcard, an enum
+/// variant or a number.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "callers are in other files; they pass these seven values one by one"
+)]
 pub fn generate_match_chain<'c>(
     gen: &mut MeliorGenerator<'c>,
     arms: &[MatchArm],
     match_val: melior::ir::Value<'c, 'c>,
-    _match_ty: melior::ir::Type<'c>,
+    match_ty: melior::ir::Type<'c>,
     block: melior::ir::BlockRef<'c, 'c>,
     merge_block: melior::ir::BlockRef<'c, 'c>,
     value_ty: Option<melior::ir::Type<'c>>,
 ) -> Result<melior::ir::BlockRef<'c, 'c>, LowerError> {
     if arms.is_empty() {
-        // The chain always ends in a fall-through block. In value position the checker has
-        // already established that some arm matches (a wildcard, or every variant of the
-        // scrutinee's enum), so this edge is unreachable -- but it still has to satisfy the
-        // merge block's argument, and an undef says "unreachable" where a zero would be
-        // indistinguishable from a real result.
-        let mut operands = Vec::new();
-        if let Some(ty) = value_ty {
-            let undef = block.append_operation(
-                OperationBuilder::new("llvm.mlir.undef", gen.loc())
-                    .add_results(&[ty])
-                    .build()?,
-            );
-            operands.push(undef.result(0)?.into());
-        }
-        block.append_operation(
-            OperationBuilder::new("cf.br", gen.loc())
-                .add_operands(&operands)
-                .add_successors(&[&*merge_block])
-                .build()?,
-        );
+        end_match_chain(gen, block, merge_block, value_ty)?;
         return Ok(block);
     }
 
@@ -585,96 +1013,10 @@ pub fn generate_match_chain<'c>(
 
     let cond_val = match &arm.pattern {
         Pattern::EnumVariant(_, variant_name, _) => {
-            let i32_ty = melior::ir::r#type::IntegerType::new(gen.context, 32).into();
-            let mut tag_val = 0;
-            for enum_def in gen.enums.values() {
-                for (i, v) in enum_def.iter().enumerate() {
-                    if *v.0 == **variant_name {
-                        tag_val = i as i64;
-                        break;
-                    }
-                }
-            }
-
-            let tag_op = block.append_operation(
-                OperationBuilder::new("arith.constant", gen.loc())
-                    .add_results(&[i32_ty])
-                    .add_attributes(&[(
-                        Identifier::new(gen.context, "value"),
-                        IntegerAttribute::new(i32_ty, tag_val).into(),
-                    )])
-                    .build()?,
-            );
-            let tag = tag_op.result(0)?.into();
-
-            let actual_tag = if _match_ty.to_string() == "i32" {
-                match_val
-            } else {
-                let extract_tag_op = block.append_operation(
-                    OperationBuilder::new("llvm.extractvalue", gen.loc())
-                        .add_operands(&[match_val])
-                        .add_results(&[i32_ty])
-                        .add_attributes(&[(
-                            Identifier::new(gen.context, "position"),
-                            melior::ir::attribute::DenseI64ArrayAttribute::new(gen.context, &[0])
-                                .into(),
-                        )])
-                        .build()?,
-                );
-                extract_tag_op.result(0)?.into()
-            };
-
-            let cmp_op = block.append_operation(
-                OperationBuilder::new("arith.cmpi", gen.loc())
-                    .add_operands(&[actual_tag, tag])
-                    .add_results(&[melior::ir::r#type::IntegerType::new(gen.context, 1).into()])
-                    .add_attributes(&[(
-                        Identifier::new(gen.context, "predicate"),
-                        IntegerAttribute::new(
-                            melior::ir::r#type::IntegerType::new(gen.context, 64).into(),
-                            0, // eq
-                        )
-                        .into(),
-                    )])
-                    .build()?,
-            );
-            cmp_op.result(0)?.into()
+            variant_tag_condition(gen, block, variant_name.as_ref(), match_val, match_ty)?
         }
-        // A scalar literal arm (`0 => …`, `1 => …`) over an integer scrutinee: compare the
-        // scrutinee against the literal with the same `arith.cmpi eq` shape as the enum-tag path,
-        // but against `match_val` directly (no tag extraction). Without this, an integer `match`
-        // ICE'd here — `Unsupported pattern in codegen` (#263).
-        Pattern::Literal(lit) => {
-            let lit_val = match lit {
-                Expr::Number(n) => n.value.as_ref().parse::<i64>().unwrap_or(0),
-                other => panic!("Unsupported literal pattern in codegen: {:?}", other),
-            };
-            let const_op = block.append_operation(
-                OperationBuilder::new("arith.constant", gen.loc())
-                    .add_results(&[_match_ty])
-                    .add_attributes(&[(
-                        Identifier::new(gen.context, "value"),
-                        IntegerAttribute::new(_match_ty, lit_val).into(),
-                    )])
-                    .build()?,
-            );
-            let const_val = const_op.result(0)?.into();
-            let cmp_op = block.append_operation(
-                OperationBuilder::new("arith.cmpi", gen.loc())
-                    .add_operands(&[match_val, const_val])
-                    .add_results(&[melior::ir::r#type::IntegerType::new(gen.context, 1).into()])
-                    .add_attributes(&[(
-                        Identifier::new(gen.context, "predicate"),
-                        IntegerAttribute::new(
-                            melior::ir::r#type::IntegerType::new(gen.context, 64).into(),
-                            0, // eq
-                        )
-                        .into(),
-                    )])
-                    .build()?,
-            );
-            cmp_op.result(0)?.into()
-        }
+        // A scalar literal arm (`0 => …`, `1 => …`) over an integer scrutinee.
+        Pattern::Literal(lit) => literal_condition(gen, block, lit, match_val, match_ty)?,
         _ => panic!("Unsupported pattern in codegen"),
     };
 
@@ -689,105 +1031,7 @@ pub fn generate_match_chain<'c>(
             .build()?,
     );
 
-    // Each name in the pattern is bound to the payload value at its position, read from that
-    // position's slot. `_` binds nothing.
-    if let Pattern::EnumVariant(en, vn, Some(payloads)) = &arm.pattern {
-        let opt_ty_str = _match_ty.to_string();
-        let slots = crate::codegen::lower::expr::enum_payload_slot_texts(&opt_ty_str);
-        for (position, pattern) in payloads.iter().enumerate() {
-            let Pattern::Identifier(name) = pattern else {
-                continue;
-            };
-            let Some(slot_text) = slots.get(position) else {
-                continue;
-            };
-            let mut payload_ty_str = slot_text.clone();
-            if payload_ty_str.starts_with("struct<")
-                || payload_ty_str.starts_with("ptr")
-                || payload_ty_str.starts_with("func")
-                || payload_ty_str.starts_with("array")
-            {
-                payload_ty_str = format!("!llvm.{}", payload_ty_str);
-            }
-            let payload_ty =
-                melior::ir::Type::parse(gen.context, &payload_ty_str).ok_or_else(|| {
-                    crate::codegen::lower::LowerError::ParseType("Type::parse failed".to_string())
-                })?;
-            let extract_payload_op = OperationBuilder::new("llvm.extractvalue", gen.loc())
-                .add_operands(&[match_val])
-                .add_results(&[payload_ty])
-                .add_attributes(&[(
-                    Identifier::new(gen.context, "position"),
-                    melior::ir::attribute::DenseI64ArrayAttribute::new(
-                        gen.context,
-                        &[position as i64 + 1],
-                    )
-                    .into(),
-                )])
-                .build()?;
-            let payload_val: melior::ir::Value = then_block
-                .append_operation(extract_payload_op)
-                .result(0)?
-                .into();
-
-            // The slot may be wider than this variant declares, so cut the value back
-            // to its own type before the arm body sees it.
-            let narrower =
-                declared_payload_ty(gen, en.as_ref(), vn.as_ref(), position, &opt_ty_str).filter(
-                    |text| crate::codegen::lower::expr::is_narrower_int(&payload_ty_str, text),
-                );
-            let (payload_val, payload_ty) = match narrower {
-                Some(text) => {
-                    let ty = melior::ir::Type::parse(gen.context, &text).ok_or_else(|| {
-                        crate::codegen::lower::LowerError::ParseType(
-                            "Type::parse failed".to_string(),
-                        )
-                    })?;
-                    let trunc = OperationBuilder::new("arith.trunci", gen.loc())
-                        .add_operands(&[payload_val])
-                        .add_results(&[ty])
-                        .build()?;
-                    (then_block.append_operation(trunc).result(0)?.into(), ty)
-                }
-                None => (payload_val, payload_ty),
-            };
-            // A float kept in an integer slot comes back out from its bits.
-            let declared_float =
-                declared_payload_ty(gen, en.as_ref(), vn.as_ref(), position, &opt_ty_str).filter(
-                    |text| {
-                        crate::codegen::generator::is_float_text(text)
-                            && payload_ty_str.starts_with('i')
-                    },
-                );
-            let (payload_val, payload_ty) = match declared_float {
-                Some(text) => {
-                    let bits = crate::codegen::generator::scalar_type_bits(&text)
-                        .ok_or_else(|| LowerError::from(format!("a float of no width: {text}")))?;
-                    let mut val = payload_val;
-                    if payload_ty.to_string() != format!("i{bits}") {
-                        let as_int = melior::ir::Type::parse(gen.context, &format!("i{bits}"))
-                            .ok_or_else(|| LowerError::ParseType("Type::parse failed".into()))?;
-                        let trunc = OperationBuilder::new("arith.trunci", gen.loc())
-                            .add_operands(&[val])
-                            .add_results(&[as_int])
-                            .build()?;
-                        val = then_block.append_operation(trunc).result(0)?.into();
-                    }
-                    let ty = melior::ir::Type::parse(gen.context, &text)
-                        .ok_or_else(|| LowerError::ParseType("Type::parse failed".into()))?;
-                    let cast = OperationBuilder::new("arith.bitcast", gen.loc())
-                        .add_operands(&[val])
-                        .add_results(&[ty])
-                        .build()?;
-                    (then_block.append_operation(cast).result(0)?.into(), ty)
-                }
-                None => (payload_val, payload_ty),
-            };
-            gen.note_shadow(name.as_ref());
-            gen.env
-                .insert(name.to_string().into(), (payload_val, payload_ty));
-        }
-    }
+    bind_variant_payloads(gen, then_block, &arm.pattern, match_val, match_ty)?;
 
     lower_match_arm_body(gen, &arm.body, then_block, merge_block, value_ty)?;
     gen.close_blocks_to(depth);
@@ -796,7 +1040,7 @@ pub fn generate_match_chain<'c>(
         gen,
         &arms[1..],
         match_val,
-        _match_ty,
+        match_ty,
         else_block,
         merge_block,
         value_ty,
@@ -805,6 +1049,229 @@ pub fn generate_match_chain<'c>(
     Ok(block)
 }
 
+/// Puts a closure's captured values on the stack, so that the function that runs the closure
+/// can take a pointer to them. Returns that pointer and the name of that function.
+///
+/// # Errors
+///
+/// Returns an error if MLIR refuses to build one of the operations.
+///
+/// # Panics
+///
+/// Panics if splitting the closure's type name gives no first piece, which a split never does.
+fn spill_closure_env<'c>(
+    gen: &MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    closure_val: Value<'c, 'c>,
+    closure_ty: Type<'c>,
+) -> Result<(Value<'c, 'c>, String), LowerError> {
+    let ptr_ty = gen.ptr_ty;
+    let i32_ty = gen.i32_ty;
+    let c1_op = OperationBuilder::new("arith.constant", gen.loc())
+        .add_results(&[i32_ty])
+        .add_attributes(&[(
+            Identifier::new(gen.context, "value"),
+            IntegerAttribute::new(i32_ty, 1).into(),
+        )])
+        .build()?;
+    let c1 = block.append_operation(c1_op).result(0)?.into();
+
+    let stack_slot_op = OperationBuilder::new("llvm.alloca", gen.loc())
+        .add_operands(&[c1])
+        .add_results(&[ptr_ty])
+        .add_attributes(&[(
+            Identifier::new(gen.context, "elem_type"),
+            TypeAttribute::new(closure_ty).into(),
+        )])
+        .build()?;
+    let alloca_ptr = block.append_operation(stack_slot_op).result(0)?.into();
+
+    let store_op = OperationBuilder::new("llvm.store", gen.loc())
+        .add_operands(&[closure_val, alloca_ptr])
+        .build()?;
+    block.append_operation(store_op);
+
+    // Extract invoke method name
+    let ty_str = closure_ty.to_string();
+    let struct_name = ty_str
+        .strip_prefix("!llvm.struct<\"")
+        .unwrap_or(&ty_str)
+        .split('"')
+        .next()
+        .unwrap();
+    Ok((alloca_ptr, format!("{struct_name}_call")))
+}
+
+/// Allocates the tensor that `map` writes its results into. It has the type of the input
+/// tensor, and each dimension written `?` in `dims` takes its size from the input.
+///
+/// # Errors
+///
+/// Returns an error if MLIR refuses to build one of the operations.
+///
+/// # Panics
+///
+/// Panics if the number of dimensions does not fit in an `i32`, which cannot happen for a
+/// tensor a program can declare.
+fn alloc_map_output<'c>(
+    gen: &MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    tensor_val: Value<'c, 'c>,
+    tensor_ty: Type<'c>,
+    dims: &[&str],
+) -> Result<Value<'c, 'c>, LowerError> {
+    let mut alloc_operands = Vec::new();
+    let index_ty = gen.index_ty;
+    for (i, dim_str) in dims.iter().enumerate() {
+        if *dim_str == "?" {
+            let idx_attr = IntegerAttribute::new(
+                Type::index(gen.context),
+                i64::try_from(i).expect("a tensor has far fewer dimensions than i64 holds"),
+            )
+            .into();
+            let cst_op = OperationBuilder::new("arith.constant", gen.loc())
+                .add_results(&[index_ty])
+                .add_attributes(&[(Identifier::new(gen.context, "value"), idx_attr)])
+                .build()?;
+            let idx_val = block.append_operation(cst_op).result(0)?.into();
+
+            let dim_op = OperationBuilder::new("memref.dim", gen.loc())
+                .add_operands(&[tensor_val, idx_val])
+                .add_results(&[index_ty])
+                .build()?;
+            alloc_operands.push(block.append_operation(dim_op).result(0)?.into());
+        }
+    }
+
+    let dynamic_dims = i32::try_from(alloc_operands.len())
+        .expect("a tensor has far fewer dimensions than i32 holds");
+    let alloc_op = OperationBuilder::new("memref.alloc", gen.loc())
+        .add_operands(&alloc_operands)
+        .add_attributes(&[(
+            Identifier::new(gen.context, "operandSegmentSizes"),
+            DenseI32ArrayAttribute::new(gen.context, &[dynamic_dims, 0]).into(),
+        )])
+        .add_results(&[tensor_ty])
+        .build()?;
+    Ok(block.append_operation(alloc_op).result(0)?.into())
+}
+
+/// Fills the body of the `linalg.generic` of `map`: it calls the closure on one element and
+/// gives back the result. Returns the region that holds that body.
+///
+/// # Errors
+///
+/// Returns an error if the element type does not parse or MLIR refuses to build an operation.
+fn map_body_region<'c>(
+    gen: &MeliorGenerator<'c>,
+    block_generic: melior::ir::Block<'c>,
+    env_ptr: Value<'c, 'c>,
+    invoke_method: &str,
+    el_ty_str: &str,
+) -> Result<melior::ir::Region<'c>, LowerError> {
+    let region = Region::new();
+    let call_op = OperationBuilder::new("func.call", gen.loc())
+        .add_operands(&[
+            env_ptr,
+            block_generic
+                .argument(0)
+                // The message says all there is to say: the block has no first argument.
+                .map_err(|_no_such_argument| {
+                    crate::codegen::lower::LowerError::from(format!("Missing argument {} block", 0))
+                })?
+                .into(),
+        ])
+        .add_attributes(&[(
+            Identifier::new(gen.context, "callee"),
+            FlatSymbolRefAttribute::new(gen.context, invoke_method).into(),
+        )])
+        .add_results(&[Type::parse(gen.context, el_ty_str).ok_or_else(|| {
+            crate::codegen::lower::LowerError::ParseType("Type::parse failed".to_string())
+        })?])
+        .build()?;
+
+    let call_res = block_generic.append_operation(call_op).result(0)?.into();
+
+    let yield_op = OperationBuilder::new("linalg.yield", gen.loc())
+        .add_operands(&[call_res])
+        .build()?;
+    block_generic.append_operation(yield_op);
+    region.append_block(block_generic);
+    Ok(region)
+}
+
+/// Adds the `linalg.generic` of `map` to `block`. `operands` are the input tensor and the
+/// output tensor, and `region` is the body that runs for each element.
+///
+/// # Errors
+///
+/// Returns an error if MLIR refuses to build the operation.
+///
+/// # Panics
+///
+/// Panics if MLIR does not parse the affine map or the iterator type written here, which
+/// would be a compiler bug.
+fn append_map_generic<'c>(
+    gen: &MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    operands: &[Value<'c, 'c>],
+    rank: usize,
+    region: melior::ir::Region<'c>,
+) -> Result<(), LowerError> {
+    use std::fmt::Write as _;
+    // Affine maps: both input and output are identity maps
+    let mut more_dims = String::new();
+    for i in 1..rank {
+        write!(more_dims, ", d{i}").expect("writing to a String cannot fail");
+    }
+    let affine_map = format!("affine_map<(d0{more_dims}) -> (d0{more_dims})>");
+    // For rank 0 it's affine_map<() -> ()>
+    let affine_map_attr = if rank == 0 {
+        Attribute::parse(gen.context, "affine_map<() -> ()>").unwrap()
+    } else {
+        Attribute::parse(gen.context, &affine_map).unwrap()
+    };
+
+    let linalg_generic = OperationBuilder::new("linalg.generic", gen.loc())
+        .add_operands(operands)
+        .add_attributes(&[
+            (
+                Identifier::new(gen.context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(gen.context, &[1, 1]).into(),
+            ),
+            (
+                Identifier::new(gen.context, "indexing_maps"),
+                ArrayAttribute::new(gen.context, &[affine_map_attr, affine_map_attr]).into(),
+            ),
+            (
+                Identifier::new(gen.context, "iterator_types"),
+                ArrayAttribute::new(
+                    gen.context,
+                    &vec![
+                        Attribute::parse(gen.context, "#linalg.iterator_type<parallel>").unwrap();
+                        rank
+                    ],
+                )
+                .into(),
+            ),
+        ])
+        .add_regions([region])
+        .build()?;
+    block.append_operation(linalg_generic);
+    Ok(())
+}
+
+/// `t.map(|x| ..)`: `args` is `[t, closure]`. Allocates a tensor of the same type as `t`, and
+/// a `linalg.generic` writes into it the result of calling the closure on each element.
+///
+/// # Errors
+///
+/// Returns an error if an argument fails to generate code, the element type does not parse,
+/// or MLIR refuses to build an operation.
+///
+/// # Panics
+///
+/// Panics if `t` is not a `memref`.
 pub(crate) fn lower_map_call<'c>(
     gen: &mut MeliorGenerator<'c>,
     block: melior::ir::BlockRef<'c, 'c>,
@@ -824,37 +1291,9 @@ pub(crate) fn lower_map_call<'c>(
         let rank = parts.len() - 1;
 
         // 1. Allocate output memref
-        let mut alloc_operands = Vec::new();
-        let index_ty = gen.index_ty;
-        for (i, dim_str) in parts.iter().take(rank).enumerate() {
-            if *dim_str == "?" {
-                let idx_attr = IntegerAttribute::new(Type::index(gen.context), i as i64).into();
-                let cst_op = OperationBuilder::new("arith.constant", gen.loc())
-                    .add_results(&[index_ty])
-                    .add_attributes(&[(Identifier::new(gen.context, "value"), idx_attr)])
-                    .build()?;
-                let idx_val = block.append_operation(cst_op).result(0)?.into();
-
-                let dim_op = OperationBuilder::new("memref.dim", gen.loc())
-                    .add_operands(&[tensor_val, idx_val])
-                    .add_results(&[index_ty])
-                    .build()?;
-                alloc_operands.push(block.append_operation(dim_op).result(0)?.into());
-            }
-        }
-
-        let alloc_op = OperationBuilder::new("memref.alloc", gen.loc())
-            .add_operands(&alloc_operands)
-            .add_attributes(&[(
-                Identifier::new(gen.context, "operandSegmentSizes"),
-                DenseI32ArrayAttribute::new(gen.context, &[alloc_operands.len() as i32, 0]).into(),
-            )])
-            .add_results(&[tensor_ty])
-            .build()?;
-        let out_val = block.append_operation(alloc_op).result(0)?.into();
+        let out_val = alloc_map_output(gen, block, tensor_val, tensor_ty, &parts[..rank])?;
 
         // 2. Generate linalg.generic
-        let region = Region::new();
         let block_generic = melior::ir::Block::new(&[
             (
                 Type::parse(gen.context, el_ty_str).ok_or_else(|| {
@@ -875,122 +1314,145 @@ pub(crate) fn lower_map_call<'c>(
         let (closure_val, closure_ty, block) = gen.generate_expr(&args[1], block)?;
 
         // Allocate it on stack to get a pointer
-        let ptr_ty = gen.ptr_ty;
-        let i32_ty = gen.i32_ty;
-        let c1_op = OperationBuilder::new("arith.constant", gen.loc())
-            .add_results(&[i32_ty])
-            .add_attributes(&[(
-                Identifier::new(gen.context, "value"),
-                IntegerAttribute::new(i32_ty, 1).into(),
-            )])
-            .build()?;
-        let c1 = block.append_operation(c1_op).result(0)?.into();
+        let (alloca_ptr, invoke_method) = spill_closure_env(gen, block, closure_val, closure_ty)?;
 
-        let alloca_op = OperationBuilder::new("llvm.alloca", gen.loc())
-            .add_operands(&[c1])
-            .add_results(&[ptr_ty])
-            .add_attributes(&[(
-                Identifier::new(gen.context, "elem_type"),
-                TypeAttribute::new(closure_ty).into(),
-            )])
-            .build()?;
-        let alloca_ptr = block.append_operation(alloca_op).result(0)?.into();
-
-        let store_op = OperationBuilder::new("llvm.store", gen.loc())
-            .add_operands(&[closure_val, alloca_ptr])
-            .build()?;
-        block.append_operation(store_op);
-
-        // Extract invoke method name
-        let ty_str = closure_ty.to_string();
-        let struct_name = ty_str
-            .strip_prefix("!llvm.struct<\"")
-            .unwrap_or(&ty_str)
-            .split("\"")
-            .next()
-            .unwrap();
-        let invoke_method = format!("{}_call", struct_name);
-
-        let call_op = OperationBuilder::new("func.call", gen.loc())
-            .add_operands(&[
-                alloca_ptr,
-                block_generic
-                    .argument(0)
-                    .map_err(|_| {
-                        crate::codegen::lower::LowerError::from(format!(
-                            "Missing argument {} block",
-                            0
-                        ))
-                    })?
-                    .into(),
-            ])
-            .add_attributes(&[(
-                Identifier::new(gen.context, "callee"),
-                FlatSymbolRefAttribute::new(gen.context, &invoke_method).into(),
-            )])
-            .add_results(&[Type::parse(gen.context, el_ty_str).ok_or_else(|| {
-                crate::codegen::lower::LowerError::ParseType("Type::parse failed".to_string())
-            })?])
-            .build()?;
-
-        let call_res = block_generic.append_operation(call_op).result(0)?.into();
-
-        let yield_op = OperationBuilder::new("linalg.yield", gen.loc())
-            .add_operands(&[call_res])
-            .build()?;
-        block_generic.append_operation(yield_op);
-        region.append_block(block_generic);
-
-        // Affine maps: both input and output are identity maps
-        let affine_map = format!(
-            "affine_map<(d0{}) -> (d0{})>",
-            (1..rank).map(|i| format!(", d{}", i)).collect::<String>(),
-            (1..rank).map(|i| format!(", d{}", i)).collect::<String>()
-        );
-        // For rank 0 it's affine_map<() -> ()>
-        let affine_map_attr = if rank == 0 {
-            Attribute::parse(gen.context, "affine_map<() -> ()>").unwrap()
-        } else {
-            Attribute::parse(gen.context, &affine_map).unwrap()
-        };
-
-        let linalg_generic = OperationBuilder::new("linalg.generic", gen.loc())
-            .add_operands(&[tensor_val, out_val])
-            .add_attributes(&[
-                (
-                    Identifier::new(gen.context, "operandSegmentSizes"),
-                    DenseI32ArrayAttribute::new(gen.context, &[1, 1]).into(),
-                ),
-                (
-                    Identifier::new(gen.context, "indexing_maps"),
-                    ArrayAttribute::new(gen.context, &[affine_map_attr, affine_map_attr]).into(),
-                ),
-                (
-                    Identifier::new(gen.context, "iterator_types"),
-                    ArrayAttribute::new(
-                        gen.context,
-                        &vec![
-                            Attribute::parse(gen.context, "#linalg.iterator_type<parallel>")
-                                .unwrap();
-                            rank
-                        ],
-                    )
-                    .into(),
-                ),
-            ])
-            .add_regions([region])
-            .build()?;
-        block.append_operation(linalg_generic);
+        let region = map_body_region(gen, block_generic, alloca_ptr, &invoke_method, el_ty_str)?;
+        append_map_generic(gen, block, &[tensor_val, out_val], rank, region)?;
 
         return Ok((out_val, tensor_ty, block));
     }
-    panic!("map called on unsupported tensor type: {}", tensor_ty_str);
+    panic!("map called on unsupported tensor type: {tensor_ty_str}");
+}
+
+/// Makes the rank-0 buffer that `reduce` keeps its running value in, and stores `init_val`
+/// in it.
+///
+/// # Errors
+///
+/// Returns an error if MLIR refuses to build one of the operations.
+fn reduce_accumulator<'c>(
+    gen: &MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    init_val: Value<'c, 'c>,
+    acc_ty: Type<'c>,
+) -> Result<Value<'c, 'c>, LowerError> {
+    let alloca_acc = OperationBuilder::new("memref.alloca", gen.loc())
+        .add_attributes(&[(
+            Identifier::new(gen.context, "operandSegmentSizes"),
+            DenseI32ArrayAttribute::new(gen.context, &[0, 0]).into(),
+        )])
+        .add_results(&[acc_ty])
+        .build()?;
+    let acc_val = block.append_operation(alloca_acc).result(0)?.into();
+    let store_init = OperationBuilder::new("memref.store", gen.loc())
+        .add_operands(&[init_val, acc_val])
+        .build()?;
+    block.append_operation(store_init);
+    Ok(acc_val)
+}
+
+/// Builds the body of the `linalg.generic` of `reduce`: `acc = closure(env, acc, x)` for each
+/// element `x`. Returns the region that holds that body.
+///
+/// # Errors
+///
+/// Returns an error if MLIR refuses to build one of the operations.
+fn reduce_body_region<'c>(
+    gen: &MeliorGenerator<'c>,
+    el_ty: Type<'c>,
+    env_ptr: Value<'c, 'c>,
+    invoke_method: &str,
+) -> Result<melior::ir::Region<'c>, LowerError> {
+    let region = Region::new();
+    let body = melior::ir::Block::new(&[(el_ty, gen.loc()), (el_ty, gen.loc())]);
+    // The messages say all there is to say: the block has no such argument.
+    let element = body
+        .argument(0)
+        .map_err(|_no_such_argument| LowerError::from("missing reduce element".to_string()))?;
+    let running = body
+        .argument(1)
+        .map_err(|_no_such_argument| LowerError::from("missing reduce accumulator".to_string()))?;
+    let call_op = OperationBuilder::new("func.call", gen.loc())
+        .add_operands(&[env_ptr, running.into(), element.into()])
+        .add_attributes(&[(
+            Identifier::new(gen.context, "callee"),
+            FlatSymbolRefAttribute::new(gen.context, invoke_method).into(),
+        )])
+        .add_results(&[el_ty])
+        .build()?;
+    let call_res = body.append_operation(call_op).result(0)?.into();
+    let yield_op = OperationBuilder::new("linalg.yield", gen.loc())
+        .add_operands(&[call_res])
+        .build()?;
+    body.append_operation(yield_op);
+    region.append_block(body);
+    Ok(region)
+}
+
+/// Adds the `linalg.generic` of `reduce` to `block`. `operands` are the input tensor and the
+/// accumulator, and `region` is the body that runs for each element. Every dimension is a
+/// reduction, and `vx.reassoc` marks the operation for `vx-reorderable-reductions`.
+///
+/// # Errors
+///
+/// Returns an error if an attribute does not parse or MLIR refuses to build the operation.
+fn append_reduce_generic<'c>(
+    gen: &MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    operands: &[Value<'c, 'c>],
+    rank: usize,
+    region: melior::ir::Region<'c>,
+) -> Result<(), LowerError> {
+    let dims = (0..rank)
+        .map(|i| format!("d{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let in_map = Attribute::parse(gen.context, &format!("affine_map<({dims}) -> ({dims})>"))
+        .ok_or_else(|| LowerError::from("could not parse the reduce input map".to_string()))?;
+    let out_map = Attribute::parse(gen.context, &format!("affine_map<({dims}) -> ()>"))
+        .ok_or_else(|| LowerError::from("could not parse the reduce output map".to_string()))?;
+    let reduction =
+        Attribute::parse(gen.context, "#linalg.iterator_type<reduction>").ok_or_else(|| {
+            LowerError::from("could not parse the reduction iterator type".to_string())
+        })?;
+    let unit = Attribute::parse(gen.context, "unit")
+        .ok_or_else(|| LowerError::from("could not parse a unit attribute".to_string()))?;
+    let linalg_generic = OperationBuilder::new("linalg.generic", gen.loc())
+        .add_operands(operands)
+        .add_attributes(&[
+            (
+                Identifier::new(gen.context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(gen.context, &[1, 1]).into(),
+            ),
+            (
+                Identifier::new(gen.context, "indexing_maps"),
+                ArrayAttribute::new(gen.context, &[in_map, out_map]).into(),
+            ),
+            (
+                Identifier::new(gen.context, "iterator_types"),
+                ArrayAttribute::new(gen.context, &vec![reduction; rank]).into(),
+            ),
+            (Identifier::new(gen.context, "vx.reassoc"), unit),
+        ])
+        .add_regions([region])
+        .build()?;
+    block.append_operation(linalg_generic);
+    Ok(())
 }
 
 /// `t.reduce(init, |acc, x| ..)`: `args` is `[t, init, closure]`. A rank-0 accumulator holds
 /// `init`, and a `linalg.generic` with every dimension a reduction folds each element into it
 /// by calling the closure, as `lower_map_call` does. `vx.reassoc` marks it for
 /// `vx-reorderable-reductions`.
+///
+/// # Errors
+///
+/// Returns an error if an argument fails to generate code, a type or an attribute does not
+/// parse, or MLIR refuses to build an operation.
+///
+/// # Panics
+///
+/// Panics if `t` is not a `memref`.
 pub(crate) fn lower_reduce_call<'c>(
     gen: &mut MeliorGenerator<'c>,
     block: melior::ir::BlockRef<'c, 'c>,
@@ -999,10 +1461,7 @@ pub(crate) fn lower_reduce_call<'c>(
     let (tensor_val, tensor_ty, block) = gen.generate_expr(&args[0], block)?;
     let tensor_ty_str = tensor_ty.to_string();
     let Some(inner) = tensor_ty_str.strip_prefix("memref<") else {
-        panic!(
-            "reduce called on unsupported tensor type: {}",
-            tensor_ty_str
-        );
+        panic!("reduce called on unsupported tensor type: {tensor_ty_str}");
     };
     let parts: Vec<&str> = inner
         .trim_end_matches('>')
@@ -1022,110 +1481,14 @@ pub(crate) fn lower_reduce_call<'c>(
     let acc_ty = parse(&format!("memref<{el_ty_str}>"))?;
 
     let (init_val, _, block) = gen.generate_expr(&args[1], block)?;
-    let alloca_acc = OperationBuilder::new("memref.alloca", gen.loc())
-        .add_attributes(&[(
-            Identifier::new(gen.context, "operandSegmentSizes"),
-            DenseI32ArrayAttribute::new(gen.context, &[0, 0]).into(),
-        )])
-        .add_results(&[acc_ty])
-        .build()?;
-    let acc_val = block.append_operation(alloca_acc).result(0)?.into();
-    let store_init = OperationBuilder::new("memref.store", gen.loc())
-        .add_operands(&[init_val, acc_val])
-        .build()?;
-    block.append_operation(store_init);
+    let acc_val = reduce_accumulator(gen, block, init_val, acc_ty)?;
 
     // The closure's environment, spilled to the stack for its adapter, as in `lower_map_call`.
     let (closure_val, closure_ty, block) = gen.generate_expr(&args[2], block)?;
-    let i32_ty = gen.i32_ty;
-    let c1_op = OperationBuilder::new("arith.constant", gen.loc())
-        .add_results(&[i32_ty])
-        .add_attributes(&[(
-            Identifier::new(gen.context, "value"),
-            IntegerAttribute::new(i32_ty, 1).into(),
-        )])
-        .build()?;
-    let c1 = block.append_operation(c1_op).result(0)?.into();
-    let alloca_op = OperationBuilder::new("llvm.alloca", gen.loc())
-        .add_operands(&[c1])
-        .add_results(&[gen.ptr_ty])
-        .add_attributes(&[(
-            Identifier::new(gen.context, "elem_type"),
-            TypeAttribute::new(closure_ty).into(),
-        )])
-        .build()?;
-    let env_ptr = block.append_operation(alloca_op).result(0)?.into();
-    let store_op = OperationBuilder::new("llvm.store", gen.loc())
-        .add_operands(&[closure_val, env_ptr])
-        .build()?;
-    block.append_operation(store_op);
-    let ty_str = closure_ty.to_string();
-    let struct_name = ty_str
-        .strip_prefix("!llvm.struct<\"")
-        .unwrap_or(&ty_str)
-        .split('"')
-        .next()
-        .unwrap();
-    let invoke_method = format!("{}_call", struct_name);
+    let (env_ptr, invoke_method) = spill_closure_env(gen, block, closure_val, closure_ty)?;
 
-    // The body: `acc = closure(env, acc, x)` for each element `x`.
-    let region = Region::new();
-    let body = melior::ir::Block::new(&[(el_ty, gen.loc()), (el_ty, gen.loc())]);
-    let element = body
-        .argument(0)
-        .map_err(|_| LowerError::from("missing reduce element".to_string()))?;
-    let running = body
-        .argument(1)
-        .map_err(|_| LowerError::from("missing reduce accumulator".to_string()))?;
-    let call_op = OperationBuilder::new("func.call", gen.loc())
-        .add_operands(&[env_ptr, running.into(), element.into()])
-        .add_attributes(&[(
-            Identifier::new(gen.context, "callee"),
-            FlatSymbolRefAttribute::new(gen.context, &invoke_method).into(),
-        )])
-        .add_results(&[el_ty])
-        .build()?;
-    let call_res = body.append_operation(call_op).result(0)?.into();
-    let yield_op = OperationBuilder::new("linalg.yield", gen.loc())
-        .add_operands(&[call_res])
-        .build()?;
-    body.append_operation(yield_op);
-    region.append_block(body);
-
-    let dims = (0..rank)
-        .map(|i| format!("d{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let in_map = Attribute::parse(gen.context, &format!("affine_map<({dims}) -> ({dims})>"))
-        .ok_or_else(|| LowerError::from("could not parse the reduce input map".to_string()))?;
-    let out_map = Attribute::parse(gen.context, &format!("affine_map<({dims}) -> ()>"))
-        .ok_or_else(|| LowerError::from("could not parse the reduce output map".to_string()))?;
-    let reduction =
-        Attribute::parse(gen.context, "#linalg.iterator_type<reduction>").ok_or_else(|| {
-            LowerError::from("could not parse the reduction iterator type".to_string())
-        })?;
-    let unit = Attribute::parse(gen.context, "unit")
-        .ok_or_else(|| LowerError::from("could not parse a unit attribute".to_string()))?;
-    let linalg_generic = OperationBuilder::new("linalg.generic", gen.loc())
-        .add_operands(&[tensor_val, acc_val])
-        .add_attributes(&[
-            (
-                Identifier::new(gen.context, "operandSegmentSizes"),
-                DenseI32ArrayAttribute::new(gen.context, &[1, 1]).into(),
-            ),
-            (
-                Identifier::new(gen.context, "indexing_maps"),
-                ArrayAttribute::new(gen.context, &[in_map, out_map]).into(),
-            ),
-            (
-                Identifier::new(gen.context, "iterator_types"),
-                ArrayAttribute::new(gen.context, &vec![reduction; rank]).into(),
-            ),
-            (Identifier::new(gen.context, "vx.reassoc"), unit),
-        ])
-        .add_regions([region])
-        .build()?;
-    block.append_operation(linalg_generic);
+    let region = reduce_body_region(gen, el_ty, env_ptr, &invoke_method)?;
+    append_reduce_generic(gen, block, &[tensor_val, acc_val], rank, region)?;
 
     let load_op = OperationBuilder::new("memref.load", gen.loc())
         .add_operands(&[acc_val])
@@ -1135,10 +1498,14 @@ pub(crate) fn lower_reduce_call<'c>(
     Ok((result, el_ty, block))
 }
 
+/// Why generating MLIR code for a piece of Vx syntax failed.
 #[derive(Debug)]
 pub enum LowerError {
+    /// A tensor has an element type that the operation cannot handle. Holds the type's name.
     UnsupportedElementType(String),
+    /// MLIR refused to build an operation, or a value asked for does not exist.
     Melior(melior::Error),
+    /// A type did not parse. Also used for any other failure that only has a message.
     ParseType(String),
 }
 
@@ -1154,11 +1521,9 @@ impl From<String> for LowerError {
     }
 }
 
-pub(crate) fn lower_print_call<'c>(
-    gen: &mut MeliorGenerator<'c>,
-    block: melior::ir::BlockRef<'c, 'c>,
-    args: &[Expr],
-) -> Result<(Value<'c, 'c>, Type<'c>, melior::ir::BlockRef<'c, 'c>), LowerError> {
+/// The expression that `print` really prints, with a borrow and the checker's cast taken off,
+/// and whether that expression is a tensor of `u32` or `u64`.
+fn print_operand(args: &[Expr]) -> (&Expr, bool) {
     let mut print_arg = &args[0];
     if let Expr::Borrow(borrow) = print_arg {
         print_arg = &borrow.expr;
@@ -1175,27 +1540,19 @@ pub(crate) fn lower_print_call<'c>(
             print_arg = &cast.expr;
         }
     }
+    (print_arg, unsigned_tensor)
+}
 
-    let (mut arg_val, arg_ty, block) = gen.generate_expr(print_arg, block)?;
-
-    // Scalar fast-path (#185): `printMemref*` only accepts ranked memrefs/tensors, so a
-    // bare scalar must route through the scalar `print_*` runtime helpers instead.
-    if let Some((fn_name, arg_val, arg_ty_str)) =
-        pick_scalar_print(gen, block, print_arg, arg_val, arg_ty)?
-    {
-        let result = call_scalar_print(gen, block, fn_name, arg_val, &arg_ty_str)?;
-        return Ok((result, gen.none_ty, block));
-    }
-
-    // A string is a pointer to its bytes: the `print_str` helper, as `print!` uses.
-    if arg_ty.to_string() == "!llvm.ptr" {
-        let result = call_scalar_print(gen, block, "print_str", arg_val, "!llvm.ptr")?;
-        return Ok((result, gen.none_ty, block));
-    }
-
-    let el_ty_str = extract_mlir_element_type(&arg_ty.to_string())?;
-
-    let print_fn_name = match (el_ty_str, unsigned_tensor) {
+/// The runtime function that prints a tensor with elements of type `el_ty_str`.
+///
+/// # Errors
+///
+/// Returns an error if the runtime has no function that prints this element type.
+fn tensor_print_fn_name(
+    el_ty_str: &'static str,
+    unsigned_tensor: bool,
+) -> Result<&'static str, LowerError> {
+    Ok(match (el_ty_str, unsigned_tensor) {
         ("f32", _) => "printMemrefF32",
         ("f64", _) => "printMemrefF64",
         ("i32", true) => "printMemrefU32",
@@ -1204,27 +1561,21 @@ pub(crate) fn lower_print_call<'c>(
         ("i64", false) => "printMemrefI64",
         ("bf16", _) => "printMemrefBF16",
         _ => return Err(LowerError::UnsupportedElementType(el_ty_str.to_string())),
-    };
+    })
+}
 
-    if arg_ty.to_string().contains(", ") {
-        // Strip the space and nothing else -- `memref.memory_space_cast` cannot change the shape,
-        // so naming a dynamic one here made the cast invalid for any statically shaped placed
-        // tensor (Vx#429). Falls back to the old spelling where there is no space to strip.
-        let stripped = crate::codegen::generator::strip_memref_space(&arg_ty.to_string())
-            .unwrap_or_else(|| format!("memref<?x?x{}>", el_ty_str));
-        let stripped_ty = Type::parse(gen.context, &stripped)
-            .ok_or_else(|| LowerError::ParseType(stripped.clone()))?;
-        let mcast_op = block.append_operation(
-            OperationBuilder::new("memref.memory_space_cast", gen.loc())
-                .add_operands(&[arg_val])
-                .add_results(&[stripped_ty])
-                .build()?,
-        );
-        arg_val = mcast_op.result(0)?.into();
-    }
-
-    let unranked_memref_ty = Type::parse(gen.context, &format!("memref<*x{}>", el_ty_str))
-        .ok_or_else(|| LowerError::ParseType(format!("memref<*x{}>", el_ty_str)))?;
+/// Declares the runtime function `print_fn_name`, which takes one tensor of type
+/// `unranked_memref_ty`. It does nothing if the function was declared before.
+///
+/// # Errors
+///
+/// Returns an error if the function type does not parse or MLIR refuses to build the
+/// declaration.
+fn declare_tensor_print<'c>(
+    gen: &mut MeliorGenerator<'c>,
+    print_fn_name: &'static str,
+    unranked_memref_ty: Type<'c>,
+) -> Result<(), LowerError> {
     // Declared the first time a tensor of this element type is printed.
     if gen.declared_tensor_prints.insert(print_fn_name) {
         let func_ty = Type::parse(gen.context, &format!("({unranked_memref_ty}) -> ()"))
@@ -1248,13 +1599,71 @@ pub(crate) fn lower_print_call<'c>(
             .build()?;
         gen.module.body().append_operation(decl);
     }
+    Ok(())
+}
+
+/// `print(x)`: `args` is `[x]`. A number, a `bool` or a string goes to one of the runtime's
+/// `print_*` functions, and a tensor goes to the `printMemref*` function for its element type.
+///
+/// # Errors
+///
+/// Returns an error if the argument fails to generate code, the runtime cannot print its
+/// type, a type does not parse, or MLIR refuses to build an operation.
+pub(crate) fn lower_print_call<'c>(
+    gen: &mut MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    args: &[Expr],
+) -> Result<(Value<'c, 'c>, Type<'c>, melior::ir::BlockRef<'c, 'c>), LowerError> {
+    let (print_arg, unsigned_tensor) = print_operand(args);
+
+    let (mut arg_val, arg_ty, block) = gen.generate_expr(print_arg, block)?;
+
+    // Scalar fast-path (#185): `printMemref*` only accepts ranked memrefs/tensors, so a
+    // bare scalar must route through the scalar `print_*` runtime helpers instead.
+    if let Some((fn_name, arg_val, arg_ty_str)) =
+        pick_scalar_print(gen, block, print_arg, arg_val, arg_ty)?
+    {
+        let result = call_scalar_print(gen, block, fn_name, arg_val, &arg_ty_str)?;
+        return Ok((result, gen.none_ty, block));
+    }
+
+    // A string is a pointer to its bytes: the `print_str` helper, as `print!` uses.
+    if arg_ty.to_string() == "!llvm.ptr" {
+        let result = call_scalar_print(gen, block, "print_str", arg_val, "!llvm.ptr")?;
+        return Ok((result, gen.none_ty, block));
+    }
+
+    let el_ty_str = extract_mlir_element_type(&arg_ty.to_string())?;
+
+    let print_fn_name = tensor_print_fn_name(el_ty_str, unsigned_tensor)?;
+
+    if arg_ty.to_string().contains(", ") {
+        // Strip the space and nothing else -- `memref.memory_space_cast` cannot change the shape,
+        // so naming a dynamic one here made the cast invalid for any statically shaped placed
+        // tensor (Vx#429). Falls back to the old spelling where there is no space to strip.
+        let stripped = crate::codegen::generator::strip_memref_space(&arg_ty.to_string())
+            .unwrap_or_else(|| format!("memref<?x?x{el_ty_str}>"));
+        let stripped_ty = Type::parse(gen.context, &stripped)
+            .ok_or_else(|| LowerError::ParseType(stripped.clone()))?;
+        let mcast_op = block.append_operation(
+            OperationBuilder::new("memref.memory_space_cast", gen.loc())
+                .add_operands(&[arg_val])
+                .add_results(&[stripped_ty])
+                .build()?,
+        );
+        arg_val = mcast_op.result(0)?.into();
+    }
+
+    let unranked_memref_ty = Type::parse(gen.context, &format!("memref<*x{el_ty_str}>"))
+        .ok_or_else(|| LowerError::ParseType(format!("memref<*x{el_ty_str}>")))?;
+    declare_tensor_print(gen, print_fn_name, unranked_memref_ty)?;
     let cast_op = block.append_operation(
         OperationBuilder::new("memref.cast", gen.loc())
             .add_operands(&[arg_val])
             .add_results(&[unranked_memref_ty])
             .build()?,
     );
-    let cast_val: Value = cast_op.result(0)?.into();
+    let cast_val: Value<'_, '_> = cast_op.result(0)?.into();
 
     block.append_operation(
         OperationBuilder::new("func.call", gen.loc())
@@ -1273,17 +1682,26 @@ pub(crate) fn lower_print_call<'c>(
     ))
 }
 
+/// How to print a scalar: the name of the runtime function, the value to pass to it, and the
+/// MLIR type of that value as text.
+type ScalarPrint<'c> = (&'static str, Value<'c, 'c>, String);
+
 /// Picks the runtime `print_*` function for a scalar and returns it with the value to pass
 /// and that value's MLIR type. MLIR integers carry no sign, so an unsigned value is known by
 /// the `x as u64` cast the checker wraps it in. Narrow signed integers and `f16`/`bf16` have
 /// no helper of their own and are widened (#320). `None` for anything that is not a scalar.
+///
+/// # Errors
+///
+/// Returns an error if the wider type does not parse or MLIR refuses to build the operation
+/// that widens the value.
 pub(crate) fn pick_scalar_print<'c>(
     gen: &mut MeliorGenerator<'c>,
     block: melior::ir::BlockRef<'c, 'c>,
     arg: &Expr,
     arg_val: Value<'c, 'c>,
     arg_ty: Type<'c>,
-) -> Result<Option<(&'static str, Value<'c, 'c>, String)>, LowerError> {
+) -> Result<Option<ScalarPrint<'c>>, LowerError> {
     use crate::syntax::types::{ElementType, Type as VxType};
     let arg = match arg {
         Expr::Borrow(b) => &*b.expr,
@@ -1328,6 +1746,10 @@ pub(crate) fn pick_scalar_print<'c>(
 }
 
 /// Declares the runtime print helper `fn_name` on first use and calls it with `arg_val`.
+///
+/// # Errors
+///
+/// Returns an error if `arg_ty_str` does not parse or MLIR refuses to build an operation.
 pub(crate) fn call_scalar_print<'c>(
     gen: &mut MeliorGenerator<'c>,
     block: melior::ir::BlockRef<'c, 'c>,
@@ -1341,6 +1763,11 @@ pub(crate) fn call_scalar_print<'c>(
 /// Call a runtime function, declaring it first if the module does not have it yet. The
 /// declaration takes the given argument types, not the types of the values passed, so a later
 /// call is checked against the signature the declaration really has.
+///
+/// # Errors
+///
+/// Returns an error if one of the types given as text does not parse or MLIR refuses to
+/// build an operation.
 pub(crate) fn call_runtime_fn<'c>(
     gen: &mut MeliorGenerator<'c>,
     block: melior::ir::BlockRef<'c, 'c>,
@@ -1415,269 +1842,390 @@ pub(crate) fn call_runtime_fn<'c>(
 /// gated (E6020), but the engine itself is not driven until the nvgpu route
 /// lands -- the fallback preserves the contract's semantics exactly, one
 /// element per call, ordered before the wait.
+///
+/// # Errors
+///
+/// Returns an error if an argument fails to generate code, a tile is not a tensor with
+/// dimensions known at compile time, its element type has no lowering, `prim` is not one of
+/// the eight primitives, or MLIR refuses to build an operation.
 pub(crate) fn lower_raw_primitive<'c>(
     gen: &mut MeliorGenerator<'c>,
     block: melior::ir::BlockRef<'c, 'c>,
     prim: &str,
     args: &[Expr],
-) -> Result<(Value<'c, 'c>, Type<'c>, melior::ir::BlockRef<'c, 'c>), LowerError> {
-    let index_ty = Type::index(gen.context);
-    let i64_ty = gen.i64_ty;
-
-    // The tile's static dims, read off the AST type the checker validated.
-    let tile_dims = |gen: &MeliorGenerator<'c>, e: &Expr| -> Result<Vec<u64>, LowerError> {
-        let ty = gen
-            .infer_ast_type(e)
-            .ok_or_else(|| LowerError::from("raw:: tile has no inferable type".to_string()))?;
-        let mut inner = &ty;
-        loop {
-            match inner {
-                syntax::Type::Tensor(_, dims, _) => {
-                    let mut out = Vec::new();
-                    for d in dims {
-                        let Some(n) = d.literal() else {
-                            return Err(LowerError::from(
-                                "raw:: tile has a non-static dim; the device path \
-                                 refuses dynamic shared tiles (#353)"
-                                    .to_string(),
-                            ));
-                        };
-                        out.push(n.parse::<u64>().map_err(|_| {
-                            LowerError::from("raw:: tile dim is not an integer".to_string())
-                        })?);
-                    }
-                    return Ok(out);
-                }
-                syntax::Type::Borrow { inner: b, .. }
-                | syntax::Type::Pointer(b, _, _)
-                | syntax::Type::Pinned(b, _)
-                | syntax::Type::Ref(b, _) => inner = b,
-                _ => {
-                    return Err(LowerError::from(
-                        "raw:: tile argument is not tensor-typed".to_string(),
-                    ))
-                }
-            }
-        }
-    };
-    let elem_mlir = |gen: &MeliorGenerator<'c>, e: &Expr| -> Result<Type<'c>, LowerError> {
-        let ty = gen
-            .infer_ast_type(e)
-            .ok_or_else(|| LowerError::from("raw:: tile has no inferable type".to_string()))?;
-        let mut inner = &ty;
-        loop {
-            match inner {
-                syntax::Type::Tensor(el, _, _) => {
-                    let s = match el {
-                        ElementType::F16 => "f16",
-                        ElementType::F32 => "f32",
-                        ElementType::F64 => "f64",
-                        ElementType::BF16 => "bf16",
-                        ElementType::I8 | ElementType::U8 => "i8",
-                        ElementType::I16 | ElementType::U16 => "i16",
-                        ElementType::I32 | ElementType::U32 => "i32",
-                        ElementType::I64 | ElementType::U64 | ElementType::USize => "i64",
-                        other => {
-                            return Err(LowerError::from(format!(
-                                "raw:: has no lowering for {other:?} tiles"
-                            )))
-                        }
-                    };
-                    return Ok(Type::parse(gen.context, s).unwrap());
-                }
-                syntax::Type::Borrow { inner: b, .. }
-                | syntax::Type::Pointer(b, _, _)
-                | syntax::Type::Pinned(b, _)
-                | syntax::Type::Ref(b, _) => inner = b,
-                _ => {
-                    return Err(LowerError::from(
-                        "raw:: tile argument is not tensor-typed".to_string(),
-                    ))
-                }
-            }
-        }
-    };
-    // A zero-result primitive still returns a value to the expression walk: the
-    // same index-0 dummy the block-expression lowering uses.
-    let unit = |gen: &MeliorGenerator<'c>,
-                b: melior::ir::BlockRef<'c, 'c>|
-     -> Result<(Value<'c, 'c>, Type<'c>, melior::ir::BlockRef<'c, 'c>), LowerError> {
-        let dummy = OperationBuilder::new("arith.constant", gen.loc())
-            .add_attributes(&[(
-                Identifier::new(gen.context, "value"),
-                IntegerAttribute::new(Type::index(gen.context), 0).into(),
-            )])
-            .add_results(&[Type::index(gen.context)])
-            .build()?;
-        let r = b.append_operation(dummy);
-        Ok((r.result(0)?.into(), gen.none_ty, b))
-    };
-    let const_index = |gen: &MeliorGenerator<'c>,
-                       b: melior::ir::BlockRef<'c, 'c>,
-                       v: u64|
-     -> Result<Value<'c, 'c>, LowerError> {
-        let op = OperationBuilder::new("arith.constant", gen.loc())
-            .add_attributes(&[(
-                Identifier::new(gen.context, "value"),
-                IntegerAttribute::new(index_ty, v as i64).into(),
-            )])
-            .add_results(&[index_ty])
-            .build()?;
-        Ok(b.append_operation(op).result(0)?.into())
-    };
-    // Flat i64 index -> per-dim index values, row-major: idx_k = (i / stride_k) % d_k.
-    let delinearize = |gen: &mut MeliorGenerator<'c>,
-                       b: melior::ir::BlockRef<'c, 'c>,
-                       lin_in: Value<'c, 'c>,
-                       lin_ty: Type<'c>,
-                       dims: &[u64]|
-     -> Result<Vec<Value<'c, 'c>>, LowerError> {
-        // The index expression arrives as i64 from raw::extent/lane arithmetic,
-        // but a for-loop induction variable is already `index` on this path --
-        // an index->index cast is invalid IR, so cast only when needed.
-        let lin: Value = if lin_ty == index_ty {
-            lin_in
-        } else {
-            let cast = OperationBuilder::new("arith.index_cast", gen.loc())
-                .add_operands(&[lin_in])
-                .add_results(&[index_ty])
-                .build()?;
-            b.append_operation(cast).result(0)?.into()
-        };
-        if dims.len() <= 1 {
-            return Ok(vec![lin]);
-        }
-        let mut out = Vec::new();
-        let mut stride: u64 = dims.iter().product();
-        for (k, d) in dims.iter().enumerate() {
-            stride /= d;
-            let sv = const_index(gen, b, stride)?;
-            let div = OperationBuilder::new("arith.divui", gen.loc())
-                .add_operands(&[lin, sv])
-                .add_results(&[index_ty])
-                .build()?;
-            let q: Value = b.append_operation(div).result(0)?.into();
-            let idx = if k == 0 {
-                // The leading digit needs no mod: the checked bound i < extent
-                // already caps it below dims[0].
-                q
-            } else {
-                let dv = const_index(gen, b, *d)?;
-                let rem = OperationBuilder::new("arith.remui", gen.loc())
-                    .add_operands(&[q, dv])
-                    .add_results(&[index_ty])
-                    .build()?;
-                b.append_operation(rem).result(0)?.into()
-            };
-            out.push(idx);
-        }
-        Ok(out)
-    };
-
+) -> Result<Lowered<'c>, LowerError> {
     match prim {
-        "extent" => {
-            let dims = tile_dims(gen, &args[0])?;
-            let n: u64 = dims.iter().product();
-            let op = OperationBuilder::new("arith.constant", gen.loc())
-                .add_attributes(&[(
-                    Identifier::new(gen.context, "value"),
-                    IntegerAttribute::new(i64_ty, n as i64).into(),
-                )])
-                .add_results(&[i64_ty])
-                .build()?;
-            let r = block.append_operation(op);
-            Ok((r.result(0)?.into(), i64_ty, block))
-        }
-        "lane" | "lanes" => {
-            // Thread identity, not a constant: correct under any launch geometry,
-            // and the 1x1x1 launches of today read 0 and 1 (#251). The host clone
-            // of the kernel body gets the same ops; the vx-to-llvm stage folds
-            // them to 0/1 there, because the CPU fallback runs one thread.
-            let op_name = if prim == "lane" {
-                "gpu.thread_id"
-            } else {
-                "gpu.block_dim"
-            };
-            let dim_attr = melior::ir::Attribute::parse(gen.context, "#gpu<dim x>")
-                .ok_or_else(|| LowerError::from("cannot parse #gpu<dim x>".to_string()))?;
-            let op = OperationBuilder::new(op_name, gen.loc())
-                .add_attributes(&[(Identifier::new(gen.context, "dimension"), dim_attr)])
-                .add_results(&[index_ty])
-                .build()?;
-            let idx: Value = block.append_operation(op).result(0)?.into();
-            let cast = OperationBuilder::new("arith.index_cast", gen.loc())
-                .add_operands(&[idx])
-                .add_results(&[i64_ty])
-                .build()?;
-            let r = block.append_operation(cast);
-            Ok((r.result(0)?.into(), i64_ty, block))
-        }
-        "load" => {
-            let (tile, _tty, block) = gen.generate_expr(&args[0], block)?;
-            let (lin, lin_ty, block) = gen.generate_expr(&args[1], block)?;
-            let dims = tile_dims(gen, &args[0])?;
-            let idx = delinearize(gen, block, lin, lin_ty, &dims)?;
-            let elem = elem_mlir(gen, &args[0])?;
-            let mut operands = vec![tile];
-            operands.extend(idx);
-            let op = OperationBuilder::new("memref.load", gen.loc())
-                .add_operands(&operands)
-                .add_results(&[elem])
-                .build()?;
-            let r = block.append_operation(op);
-            Ok((r.result(0)?.into(), elem, block))
-        }
-        "store" => {
-            let (tile, _tty, block) = gen.generate_expr(&args[0], block)?;
-            let (lin, lin_ty, block) = gen.generate_expr(&args[1], block)?;
-            let (val, _vty, block) = gen.generate_expr(&args[2], block)?;
-            let dims = tile_dims(gen, &args[0])?;
-            let idx = delinearize(gen, block, lin, lin_ty, &dims)?;
-            let mut operands = vec![val, tile];
-            operands.extend(idx);
-            let op = OperationBuilder::new("memref.store", gen.loc())
-                .add_operands(&operands)
-                .build()?;
-            block.append_operation(op);
-            unit(gen, block)
-        }
+        "extent" => raw_extent(gen, block, args),
+        "lane" | "lanes" => raw_lane(gen, block, prim),
+        "load" => raw_load(gen, block, args),
+        "store" => raw_store(gen, block, args),
         "barrier" => {
             let op = OperationBuilder::new("gpu.barrier", gen.loc()).build()?;
             block.append_operation(op);
-            unit(gen, block)
+            raw_unit(gen, block)
         }
-        "async_copy" => {
-            // Synchronous fallback: dst[i] = src[i]. The capability is declared
-            // (E6020 checked it); the engine is not driven yet -- when the nvgpu
-            // route lands this becomes nvgpu.device_async_copy.
-            let (dst, _dty, block) = gen.generate_expr(&args[0], block)?;
-            let (src, _sty, block) = gen.generate_expr(&args[1], block)?;
-            let (lin, lin_ty, block) = gen.generate_expr(&args[2], block)?;
-            let sdims = tile_dims(gen, &args[1])?;
-            let ddims = tile_dims(gen, &args[0])?;
-            let elem = elem_mlir(gen, &args[1])?;
-            let sidx = delinearize(gen, block, lin, lin_ty, &sdims)?;
-            let mut load_ops = vec![src];
-            load_ops.extend(sidx);
-            let load = OperationBuilder::new("memref.load", gen.loc())
-                .add_operands(&load_ops)
-                .add_results(&[elem])
-                .build()?;
-            let v: Value = block.append_operation(load).result(0)?.into();
-            let didx = delinearize(gen, block, lin, lin_ty, &ddims)?;
-            let mut store_ops = vec![v, dst];
-            store_ops.extend(didx);
-            let store = OperationBuilder::new("memref.store", gen.loc())
-                .add_operands(&store_ops)
-                .build()?;
-            block.append_operation(store);
-            unit(gen, block)
-        }
-        "async_wait" => unit(gen, block),
+        "async_copy" => raw_async_copy(gen, block, args),
+        "async_wait" => raw_unit(gen, block),
         other => Err(LowerError::from(format!(
             "raw::{other} has no lowering; the checker should have refused it"
         ))),
     }
+}
+
+/// What generating the code for an expression gives back: its value, the type of that value,
+/// and the block to continue in.
+type Lowered<'c> = (Value<'c, 'c>, Type<'c>, melior::ir::BlockRef<'c, 'c>);
+
+/// The tile's static dims, read off the AST type the checker validated.
+///
+/// # Errors
+///
+/// Returns an error if the type of `e` is not known, is not a tensor, or has a dimension that
+/// is not a whole number written in the source.
+fn raw_tile_dims(gen: &MeliorGenerator<'_>, e: &Expr) -> Result<Vec<u64>, LowerError> {
+    let ty = gen
+        .infer_ast_type(e)
+        .ok_or_else(|| LowerError::from("raw:: tile has no inferable type".to_string()))?;
+    let mut inner = &ty;
+    loop {
+        match inner {
+            syntax::Type::Tensor(_, dims, _) => {
+                let mut out = Vec::new();
+                for d in dims {
+                    let Some(n) = d.literal() else {
+                        return Err(LowerError::from(
+                            "raw:: tile has a non-static dim; the device path \
+                             refuses dynamic shared tiles (#353)"
+                                .to_string(),
+                        ));
+                    };
+                    // The message says all there is to say: the text is not a whole number.
+                    out.push(n.parse::<u64>().map_err(|_not_a_number| {
+                        LowerError::from("raw:: tile dim is not an integer".to_string())
+                    })?);
+                }
+                return Ok(out);
+            }
+            syntax::Type::Borrow { inner: b, .. }
+            | syntax::Type::Pointer(b, _, _)
+            | syntax::Type::Pinned(b, _)
+            | syntax::Type::Ref(b, _) => inner = b,
+            _ => {
+                return Err(LowerError::from(
+                    "raw:: tile argument is not tensor-typed".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+/// The MLIR type of one element of the tile `e`.
+///
+/// # Errors
+///
+/// Returns an error if the type of `e` is not known, is not a tensor, or has an element type
+/// that `raw::` cannot load and store.
+///
+/// # Panics
+///
+/// Panics if MLIR does not parse one of the element type names written here, which would be a
+/// compiler bug.
+fn raw_elem_type<'c>(gen: &MeliorGenerator<'c>, e: &Expr) -> Result<Type<'c>, LowerError> {
+    let ty = gen
+        .infer_ast_type(e)
+        .ok_or_else(|| LowerError::from("raw:: tile has no inferable type".to_string()))?;
+    let mut inner = &ty;
+    loop {
+        match inner {
+            syntax::Type::Tensor(el, _, _) => {
+                let s = match el {
+                    ElementType::F16 => "f16",
+                    ElementType::F32 => "f32",
+                    ElementType::F64 => "f64",
+                    ElementType::BF16 => "bf16",
+                    ElementType::I8 | ElementType::U8 => "i8",
+                    ElementType::I16 | ElementType::U16 => "i16",
+                    ElementType::I32 | ElementType::U32 => "i32",
+                    ElementType::I64 | ElementType::U64 | ElementType::USize => "i64",
+                    other => {
+                        return Err(LowerError::from(format!(
+                            "raw:: has no lowering for {other:?} tiles"
+                        )))
+                    }
+                };
+                return Ok(Type::parse(gen.context, s).unwrap());
+            }
+            syntax::Type::Borrow { inner: b, .. }
+            | syntax::Type::Pointer(b, _, _)
+            | syntax::Type::Pinned(b, _)
+            | syntax::Type::Ref(b, _) => inner = b,
+            _ => {
+                return Err(LowerError::from(
+                    "raw:: tile argument is not tensor-typed".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+/// A zero-result primitive still returns a value to the expression walk: the
+/// same index-0 dummy the block-expression lowering uses.
+///
+/// # Errors
+///
+/// Returns an error if MLIR refuses to build the constant.
+fn raw_unit<'c>(
+    gen: &MeliorGenerator<'c>,
+    b: melior::ir::BlockRef<'c, 'c>,
+) -> Result<Lowered<'c>, LowerError> {
+    let dummy = OperationBuilder::new("arith.constant", gen.loc())
+        .add_attributes(&[(
+            Identifier::new(gen.context, "value"),
+            IntegerAttribute::new(Type::index(gen.context), 0).into(),
+        )])
+        .add_results(&[Type::index(gen.context)])
+        .build()?;
+    let r = b.append_operation(dummy);
+    Ok((r.result(0)?.into(), gen.none_ty, b))
+}
+
+/// The `index` constant `v`.
+///
+/// # Errors
+///
+/// Returns an error if MLIR refuses to build the constant.
+///
+/// # Panics
+///
+/// Panics if `v` does not fit in an `i64`. `v` is a size taken from a tile's dimensions, and a
+/// tile that large cannot exist.
+fn raw_const_index<'c>(
+    gen: &MeliorGenerator<'c>,
+    b: melior::ir::BlockRef<'c, 'c>,
+    v: u64,
+) -> Result<Value<'c, 'c>, LowerError> {
+    let index_ty = Type::index(gen.context);
+    let v = i64::try_from(v).expect("a tile dimension fits in an i64");
+    let op = OperationBuilder::new("arith.constant", gen.loc())
+        .add_attributes(&[(
+            Identifier::new(gen.context, "value"),
+            IntegerAttribute::new(index_ty, v).into(),
+        )])
+        .add_results(&[index_ty])
+        .build()?;
+    Ok(b.append_operation(op).result(0)?.into())
+}
+
+/// Flat i64 index -> per-dim index values, row-major: `idx_k = (i / stride_k) % d_k`.
+///
+/// # Errors
+///
+/// Returns an error if MLIR refuses to build one of the operations.
+fn raw_delinearize<'c>(
+    gen: &MeliorGenerator<'c>,
+    b: melior::ir::BlockRef<'c, 'c>,
+    lin_in: Value<'c, 'c>,
+    lin_ty: Type<'c>,
+    dims: &[u64],
+) -> Result<Vec<Value<'c, 'c>>, LowerError> {
+    let index_ty = Type::index(gen.context);
+    // The index expression arrives as i64 from raw::extent/lane arithmetic,
+    // but a for-loop induction variable is already `index` on this path --
+    // an index->index cast is invalid IR, so cast only when needed.
+    let lin: Value<'_, '_> = if lin_ty == index_ty {
+        lin_in
+    } else {
+        let cast = OperationBuilder::new("arith.index_cast", gen.loc())
+            .add_operands(&[lin_in])
+            .add_results(&[index_ty])
+            .build()?;
+        b.append_operation(cast).result(0)?.into()
+    };
+    if dims.len() <= 1 {
+        return Ok(vec![lin]);
+    }
+    let mut out = Vec::new();
+    let mut stride: u64 = dims.iter().product();
+    for (k, d) in dims.iter().enumerate() {
+        stride /= d;
+        let sv = raw_const_index(gen, b, stride)?;
+        let div = OperationBuilder::new("arith.divui", gen.loc())
+            .add_operands(&[lin, sv])
+            .add_results(&[index_ty])
+            .build()?;
+        let q: Value<'_, '_> = b.append_operation(div).result(0)?.into();
+        let idx = if k == 0 {
+            // The leading digit needs no mod: the checked bound i < extent
+            // already caps it below dims[0].
+            q
+        } else {
+            let dv = raw_const_index(gen, b, *d)?;
+            let rem = OperationBuilder::new("arith.remui", gen.loc())
+                .add_operands(&[q, dv])
+                .add_results(&[index_ty])
+                .build()?;
+            b.append_operation(rem).result(0)?.into()
+        };
+        out.push(idx);
+    }
+    Ok(out)
+}
+
+/// `raw::extent(t)`: the number of elements in the tile, as an `i64` constant.
+///
+/// # Errors
+///
+/// Returns an error if the tile's dimensions are not known or MLIR refuses to build the
+/// constant.
+///
+/// # Panics
+///
+/// Panics if the number of elements does not fit in an `i64`. A tile that large cannot exist.
+fn raw_extent<'c>(
+    gen: &MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    args: &[Expr],
+) -> Result<Lowered<'c>, LowerError> {
+    let i64_ty = gen.i64_ty;
+    let dims = raw_tile_dims(gen, &args[0])?;
+    let n: u64 = dims.iter().product();
+    let n = i64::try_from(n).expect("the number of elements in a tile fits in an i64");
+    let op = OperationBuilder::new("arith.constant", gen.loc())
+        .add_attributes(&[(
+            Identifier::new(gen.context, "value"),
+            IntegerAttribute::new(i64_ty, n).into(),
+        )])
+        .add_results(&[i64_ty])
+        .build()?;
+    let r = block.append_operation(op);
+    Ok((r.result(0)?.into(), i64_ty, block))
+}
+
+/// `raw::lane()` and `raw::lanes()`: the number of the running thread, and how many threads
+/// there are, each as an `i64`. `prim` is `lane` or `lanes`.
+///
+/// # Errors
+///
+/// Returns an error if the `#gpu<dim x>` attribute does not parse or MLIR refuses to build an
+/// operation.
+fn raw_lane<'c>(
+    gen: &MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    prim: &str,
+) -> Result<Lowered<'c>, LowerError> {
+    let index_ty = Type::index(gen.context);
+    let i64_ty = gen.i64_ty;
+    // Thread identity, not a constant: correct under any launch geometry,
+    // and the 1x1x1 launches of today read 0 and 1 (#251). The host clone
+    // of the kernel body gets the same ops; the vx-to-llvm stage folds
+    // them to 0/1 there, because the CPU fallback runs one thread.
+    let op_name = if prim == "lane" {
+        "gpu.thread_id"
+    } else {
+        "gpu.block_dim"
+    };
+    let dim_attr = melior::ir::Attribute::parse(gen.context, "#gpu<dim x>")
+        .ok_or_else(|| LowerError::from("cannot parse #gpu<dim x>".to_string()))?;
+    let op = OperationBuilder::new(op_name, gen.loc())
+        .add_attributes(&[(Identifier::new(gen.context, "dimension"), dim_attr)])
+        .add_results(&[index_ty])
+        .build()?;
+    let idx: Value<'_, '_> = block.append_operation(op).result(0)?.into();
+    let cast = OperationBuilder::new("arith.index_cast", gen.loc())
+        .add_operands(&[idx])
+        .add_results(&[i64_ty])
+        .build()?;
+    let r = block.append_operation(cast);
+    Ok((r.result(0)?.into(), i64_ty, block))
+}
+
+/// `raw::load(t, i)`: reads element `i` of the tile `t`.
+///
+/// # Errors
+///
+/// Returns an error if an argument fails to generate code, the tile's dimensions or element
+/// type are not known, or MLIR refuses to build an operation.
+fn raw_load<'c>(
+    gen: &mut MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    args: &[Expr],
+) -> Result<Lowered<'c>, LowerError> {
+    let (tile, _tty, block) = gen.generate_expr(&args[0], block)?;
+    let (lin, lin_ty, block) = gen.generate_expr(&args[1], block)?;
+    let dims = raw_tile_dims(gen, &args[0])?;
+    let idx = raw_delinearize(gen, block, lin, lin_ty, &dims)?;
+    let elem = raw_elem_type(gen, &args[0])?;
+    let mut operands = vec![tile];
+    operands.extend(idx);
+    let op = OperationBuilder::new("memref.load", gen.loc())
+        .add_operands(&operands)
+        .add_results(&[elem])
+        .build()?;
+    let r = block.append_operation(op);
+    Ok((r.result(0)?.into(), elem, block))
+}
+
+/// `raw::store(t, i, v)`: writes `v` to element `i` of the tile `t`.
+///
+/// # Errors
+///
+/// Returns an error if an argument fails to generate code, the tile's dimensions are not
+/// known, or MLIR refuses to build an operation.
+fn raw_store<'c>(
+    gen: &mut MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    args: &[Expr],
+) -> Result<Lowered<'c>, LowerError> {
+    let (tile, _tty, block) = gen.generate_expr(&args[0], block)?;
+    let (lin, lin_ty, block) = gen.generate_expr(&args[1], block)?;
+    let (val, _vty, block) = gen.generate_expr(&args[2], block)?;
+    let dims = raw_tile_dims(gen, &args[0])?;
+    let idx = raw_delinearize(gen, block, lin, lin_ty, &dims)?;
+    let mut operands = vec![val, tile];
+    operands.extend(idx);
+    let op = OperationBuilder::new("memref.store", gen.loc())
+        .add_operands(&operands)
+        .build()?;
+    block.append_operation(op);
+    raw_unit(gen, block)
+}
+
+/// `raw::async_copy(dst, src, i)`: copies element `i` of the tile `src` to the tile `dst`.
+///
+/// # Errors
+///
+/// Returns an error if an argument fails to generate code, a tile's dimensions or element
+/// type are not known, or MLIR refuses to build an operation.
+fn raw_async_copy<'c>(
+    gen: &mut MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    args: &[Expr],
+) -> Result<Lowered<'c>, LowerError> {
+    // Synchronous fallback: dst[i] = src[i]. The capability is declared
+    // (E6020 checked it); the engine is not driven yet -- when the nvgpu
+    // route lands this becomes nvgpu.device_async_copy.
+    let (dst, _dty, block) = gen.generate_expr(&args[0], block)?;
+    let (src, _sty, block) = gen.generate_expr(&args[1], block)?;
+    let (lin, lin_ty, block) = gen.generate_expr(&args[2], block)?;
+    let sdims = raw_tile_dims(gen, &args[1])?;
+    let ddims = raw_tile_dims(gen, &args[0])?;
+    let elem = raw_elem_type(gen, &args[1])?;
+    let sidx = raw_delinearize(gen, block, lin, lin_ty, &sdims)?;
+    let mut load_ops = vec![src];
+    load_ops.extend(sidx);
+    let load = OperationBuilder::new("memref.load", gen.loc())
+        .add_operands(&load_ops)
+        .add_results(&[elem])
+        .build()?;
+    let v: Value<'_, '_> = block.append_operation(load).result(0)?.into();
+    let didx = raw_delinearize(gen, block, lin, lin_ty, &ddims)?;
+    let mut store_ops = vec![v, dst];
+    store_ops.extend(didx);
+    let store = OperationBuilder::new("memref.store", gen.loc())
+        .add_operands(&store_ops)
+        .build()?;
+    block.append_operation(store);
+    raw_unit(gen, block)
 }
 
 /// The memory space a memref type's text ends with, `1` in `memref<4xf32, 1>`; `None` for host
@@ -1691,6 +2239,15 @@ fn memref_space(ty: &str) -> Option<&str> {
 /// `memref.cast` from `from` to `to`, through a `memref.memory_space_cast` when the two are in
 /// different memory spaces: a placed tensor in a type with its address space, and the same
 /// buffer where a plain memref is wanted. A plain cast cannot change the space.
+///
+/// # Errors
+///
+/// Returns an error if the two types are in different memory spaces and `from` is not a
+/// `memref`, if the type in between does not parse, or if MLIR refuses to build a cast.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "callers are in other files; they pass the block by reference"
+)]
 pub(crate) fn cast_memref<'c>(
     gen: &MeliorGenerator<'c>,
     block: &melior::ir::BlockRef<'c, 'c>,
@@ -1742,6 +2299,11 @@ pub(crate) fn cast_memref<'c>(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use syntax::{Expr, NumberExpr, Span, Topology};

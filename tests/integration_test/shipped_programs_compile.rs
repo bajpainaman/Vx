@@ -55,7 +55,10 @@ fn vx_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    let mut entries: Vec<_> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.path())
+        .collect();
     entries.sort();
     for path in entries {
         if path.is_dir() {
@@ -124,7 +127,7 @@ fn every_shipped_example_and_benchmark_compiles() {
                 unexpected_failures.push(format!("  {rel}\n      {first}"));
             }
             (None, Some((_, why))) => {
-                unexpected_successes.push(format!("  {rel}\n      was listed as broken: {why}"))
+                unexpected_successes.push(format!("  {rel}\n      was listed as broken: {why}"));
             }
             _ => {}
         }
@@ -199,7 +202,7 @@ fn every_stdlib_module_checks_on_its_own() {
                 unexpected_failures.push(format!("  {rel}\n      {first}"));
             }
             (None, Some((_, why))) => {
-                unexpected_successes.push(format!("  {rel}\n      was listed as broken: {why}"))
+                unexpected_successes.push(format!("  {rel}\n      was listed as broken: {why}"));
             }
             _ => {}
         }

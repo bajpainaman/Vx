@@ -3,7 +3,12 @@
 //! One `impl` block on the per-function emitter; the dispatch that reaches these
 //! lives in `step`, next to the struct.
 
-use super::super::*;
+use std::fmt::Write as _;
+
+use super::super::{
+    alias_store_attrs, elem_from_mlir_scalar, elem_of_gid, memref_lead_dims_and_elem, mlir_scalar,
+    ptr_gid, tensor_memref_ty, FnEmit, HirInstruction, Lowered,
+};
 
 /// Is this field a plain scalar, rather than a pointer or a memref descriptor? Only a
 /// scalar slot may be written and read at a type other than the one it was declared with.
@@ -12,10 +17,15 @@ fn is_scalar_field(fty: &str) -> bool {
 }
 
 impl FnEmit<'_> {
-    // Store a scalar into a struct field (no result). `operand1` is the struct slot pointer,
-    // `operand2` the value, `imm` the field's byte offset. GEP to the field, then `llvm.store`;
-    // the field index comes from matching the offset against the layout, the value type from
-    // the stored register's tracked type.
+    /// Store a scalar into a struct field (no result). `operand1` is the struct slot pointer,
+    /// `operand2` the value, `imm` the field's byte offset. GEP to the field, then `llvm.store`;
+    /// the field index comes from matching the offset against the layout, the value type from
+    /// the stored register's tracked type.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the struct slot, its layout or the field at this offset is not tracked, or
+    /// when a tensor value does not have the rank of the field.
     pub(crate) fn op_field_store(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let gid = (*self
             .agg_of
@@ -45,77 +55,35 @@ impl FnEmit<'_> {
             .ok_or(crate::emitter_gap!())?
             .clone();
         let p = format!("%p{idx}");
-        self.body += &format!(
-            "  {p} = llvm.getelementptr {slot}[0, {field_idx}] : (!llvm.ptr) -> !llvm.ptr, {}\n",
+        let _ = writeln!(
+            self.body,
+            "  {p} = llvm.getelementptr {slot}[0, {field_idx}] : (!llvm.ptr) -> !llvm.ptr, {}",
             agg.struct_ty
         );
-        // A tensor value goes in as its descriptor. A rank the field does not have (a rank-0
-        // `Tensor<f32>()` for a `[?, ?]` field, which the checker admits) has no descriptor the
-        // field can hold, and no pass folds the cast, so the function declines.
-        let val = match self.mem_of.get(ins.operand2.0 as usize).cloned().flatten() {
-            Some(memty) => {
-                if memref_rank(&memty) != descriptor_rank(&fty) {
-                    return Err(crate::emitter_gap!());
-                }
-                // A row is a strided view whose descriptor carries an offset into its tensor. The
-                // field is read back as a plain memref, whose type says the offset is 0, so the
-                // offset would be lost and the read would land in row 0. Move the data pointer
-                // to the row first.
-                let (val, memty) = if memty.contains("strided<") {
-                    let (dims_x, et) =
-                        memref_lead_dims_and_elem(&memty).ok_or(crate::emitter_gap!())?;
-                    let plain = format!("memref<{dims_x}{et}>");
-                    let v = self.cast_memref_value(&format!("fv{idx}"), &val, &memty, &plain)?;
-                    (v, plain)
-                } else {
-                    (val, memty)
-                };
-                let d = format!("%fd{idx}");
-                self.body += &format!(
-                    "  {d} = builtin.unrealized_conversion_cast {val} : {memty} to {fty}\n"
-                );
-                d
-            }
-            None => val,
-        }; // A place-write store carries alias-scope metadata (M2b-2): it belongs to its own scope
-           // and does not alias its disjoint siblings' scopes. Direct field stores are unscoped.
+        let val = self.field_store_value(idx, ins, val, &fty)?;
+        // A place-write store carries alias-scope metadata (M2b-2): it belongs to its own scope
+        // and does not alias its disjoint siblings' scopes. Direct field stores are unscoped.
         let attrs = self
             .alias_scope_of
             .get(&idx)
             .map(|(own, sibs)| alias_store_attrs(*own, sibs))
             .unwrap_or_default();
-        // The value's own scalar type, not the slot's. They differ only for an enum payload,
-        // whose slot is sized for the widest variant and holds whichever one was built
-        // (Vx#570); a pointer is left to the declared type, which is what carries it.
-        // A struct stored into a payload slot sized for another variant is typed as itself too.
-        let value_agg = self
-            .agg_val_of
-            .get(ins.operand2.0 as usize)
-            .copied()
-            .flatten()
-            .and_then(|g| self.ctx.aggs.get(&g))
-            .map(|a| a.struct_ty.clone());
-        // A tensor goes in as its descriptor, which is a struct too, so only a value that is
-        // not a tensor takes its own scalar type in a struct-shaped slot.
-        let is_tensor = self
-            .mem_of
-            .get(ins.operand2.0 as usize)
-            .cloned()
-            .flatten()
-            .is_some();
-        let store_ty = match self.etypes.get(ins.operand2.0 as usize).cloned().flatten() {
-            Some(e) if is_scalar_field(&fty) || (fty.starts_with("!llvm.struct") && !is_tensor) => {
-                crate::mlir_ty::mlir_scalar(&e).unwrap_or(&fty).to_string()
-            }
-            _ => value_agg.unwrap_or_else(|| fty.clone()),
-        };
-        self.body += &format!("  llvm.store {val}, {p}{attrs} : {store_ty}, !llvm.ptr\n");
+        let store_ty = self.field_store_type(ins, &fty);
+        let _ = writeln!(
+            self.body,
+            "  llvm.store {val}, {p}{attrs} : {store_ty}, !llvm.ptr"
+        );
         Ok(())
     }
 
-    // Load a scalar struct field. `operand1` is the struct slot, `imm` the field's byte offset,
-    // and this instruction's own `type_idx` the field's scalar type. GEP to the field, then
-    // `llvm.load`.
+    /// Load a scalar struct field. `operand1` is the struct slot, `imm` the field's byte offset,
+    /// and this instruction's own `type_idx` the field's scalar type. GEP to the field, then
+    /// `llvm.load`.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the struct slot, its layout or the field at this offset is not tracked, or
+    /// when the result is a tensor type with no memref spelling.
     pub(crate) fn op_field_load(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let gid = (*self
             .agg_of
@@ -147,37 +115,13 @@ impl FnEmit<'_> {
             .ok_or(crate::emitter_gap!())?;
         let p = format!("%p{idx}");
         let n = format!("%v{idx}");
-        self.body += &format!(
-            "  {p} = llvm.getelementptr {slot}[0, {field_idx}] : (!llvm.ptr) -> !llvm.ptr, {}\n",
+        let _ = writeln!(
+            self.body,
+            "  {p} = llvm.getelementptr {slot}[0, {field_idx}] : (!llvm.ptr) -> !llvm.ptr, {}",
             agg.struct_ty
         );
-        // Read back at the type this instruction says it produces, for the same reason the
-        // store writes at the value's: an enum payload slot holds whichever variant was
-        // built, not the one the layout is named after.
-        let result_agg = self
-            .types
-            .get(ins.type_idx.0 as usize)
-            .and_then(|g| self.ctx.aggs.get(g))
-            .map(|a| a.struct_ty.clone());
-        let result_is_tensor = self
-            .types
-            .get(ins.type_idx.0 as usize)
-            .is_some_and(|g| self.ctx.tensors.contains_key(g));
-        let load_ty = match self
-            .types
-            .get(ins.type_idx.0 as usize)
-            .copied()
-            .and_then(elem_of_gid)
-        {
-            Some(e)
-                if is_scalar_field(&fty)
-                    || (fty.starts_with("!llvm.struct") && !result_is_tensor) =>
-            {
-                crate::mlir_ty::mlir_scalar(&e).unwrap_or(&fty).to_string()
-            }
-            _ => result_agg.unwrap_or_else(|| fty.clone()),
-        };
-        self.body += &format!("  {n} = llvm.load {p} : !llvm.ptr -> {load_ty}\n");
+        let load_ty = self.field_load_type(ins, &fty);
+        let _ = writeln!(self.body, "  {n} = llvm.load {p} : !llvm.ptr -> {load_ty}");
         self.names[idx] = n;
         // A tensor field comes out as its descriptor, cast back to the memref the result names.
         let gid_res = self.types.get(ins.type_idx.0 as usize).copied();
@@ -185,8 +129,10 @@ impl FnEmit<'_> {
             let memty = tensor_memref_ty(&elem, &shape).ok_or(crate::emitter_gap!())?;
             let d = self.names[idx].clone();
             let m = format!("%fm{idx}");
-            self.body +=
-                &format!("  {m} = builtin.unrealized_conversion_cast {d} : {fty} to {memty}\n");
+            let _ = writeln!(
+                self.body,
+                "  {m} = builtin.unrealized_conversion_cast {d} : {fty} to {memty}"
+            );
             self.names[idx] = m;
             self.mem_of[idx] = Some(memty);
             return Ok(());
@@ -214,9 +160,121 @@ impl FnEmit<'_> {
         Ok(())
     }
 
-    // The address of a by-value nested-aggregate field (`&outer.inner`): GEP to the field and
-    // yield the pointer, tracked as an aggregate slot (its layout GID from `type_idx`), so a
-    // chained field access or a method receiver addresses through it. (#242)
+    /// The value to store into a struct field whose declared type is `fty`: `val` itself, or for
+    /// a tensor the descriptor of `val`.
+    ///
+    /// A tensor value goes in as its descriptor. A rank the field does not have (a rank-0
+    /// `Tensor<f32>()` for a `[?, ?]` field, which the checker admits) has no descriptor the
+    /// field can hold, and no pass folds the cast, so the function declines.
+    ///
+    /// # Errors
+    ///
+    /// Declines when a tensor value does not have the rank of the field, or its memref type
+    /// cannot be read.
+    fn field_store_value(
+        &mut self,
+        idx: usize,
+        ins: &HirInstruction,
+        val: String,
+        fty: &str,
+    ) -> Lowered<String> {
+        let val = match self.mem_of.get(ins.operand2.0 as usize).cloned().flatten() {
+            Some(memty) => {
+                if memref_rank(&memty) != descriptor_rank(fty) {
+                    return Err(crate::emitter_gap!());
+                }
+                // A row is a strided view whose descriptor carries an offset into its tensor. The
+                // field is read back as a plain memref, whose type says the offset is 0, so the
+                // offset would be lost and the read would land in row 0. Move the data pointer
+                // to the row first.
+                let (val, memty) = if memty.contains("strided<") {
+                    let (dims_x, et) =
+                        memref_lead_dims_and_elem(&memty).ok_or(crate::emitter_gap!())?;
+                    let plain = format!("memref<{dims_x}{et}>");
+                    let v = self.cast_memref_value(&format!("fv{idx}"), &val, &memty, &plain)?;
+                    (v, plain)
+                } else {
+                    (val, memty)
+                };
+                let d = format!("%fd{idx}");
+                let _ = writeln!(
+                    self.body,
+                    "  {d} = builtin.unrealized_conversion_cast {val} : {memty} to {fty}"
+                );
+                d
+            }
+            None => val,
+        };
+        Ok(val)
+    }
+
+    /// The MLIR type a value is stored at in a struct field whose declared type is `fty`.
+    fn field_store_type(&self, ins: &HirInstruction, fty: &str) -> String {
+        // The value's own scalar type, not the slot's. They differ only for an enum payload,
+        // whose slot is sized for the widest variant and holds whichever one was built
+        // (Vx#570); a pointer is left to the declared type, which is what carries it.
+        // A struct stored into a payload slot sized for another variant is typed as itself too.
+        let value_agg = self
+            .agg_val_of
+            .get(ins.operand2.0 as usize)
+            .copied()
+            .flatten()
+            .and_then(|g| self.ctx.aggs.get(&g))
+            .map(|a| a.struct_ty.clone());
+        // A tensor goes in as its descriptor, which is a struct too, so only a value that is
+        // not a tensor takes its own scalar type in a struct-shaped slot.
+        let is_tensor = self
+            .mem_of
+            .get(ins.operand2.0 as usize)
+            .cloned()
+            .flatten()
+            .is_some();
+        match self.etypes.get(ins.operand2.0 as usize).cloned().flatten() {
+            Some(e) if is_scalar_field(fty) || (fty.starts_with("!llvm.struct") && !is_tensor) => {
+                crate::mlir_ty::mlir_scalar(&e).unwrap_or(fty).to_string()
+            }
+            _ => value_agg.unwrap_or_else(|| fty.to_string()),
+        }
+    }
+
+    /// The MLIR type a struct field whose declared type is `fty` is loaded at.
+    fn field_load_type(&self, ins: &HirInstruction, fty: &str) -> String {
+        // Read back at the type this instruction says it produces, for the same reason the
+        // store writes at the value's: an enum payload slot holds whichever variant was
+        // built, not the one the layout is named after.
+        let result_agg = self
+            .types
+            .get(ins.type_idx.0 as usize)
+            .and_then(|g| self.ctx.aggs.get(g))
+            .map(|a| a.struct_ty.clone());
+        let result_is_tensor = self
+            .types
+            .get(ins.type_idx.0 as usize)
+            .is_some_and(|g| self.ctx.tensors.contains_key(g));
+        match self
+            .types
+            .get(ins.type_idx.0 as usize)
+            .copied()
+            .and_then(elem_of_gid)
+        {
+            Some(e)
+                if is_scalar_field(fty)
+                    || (fty.starts_with("!llvm.struct") && !result_is_tensor) =>
+            {
+                crate::mlir_ty::mlir_scalar(&e).unwrap_or(fty).to_string()
+            }
+            _ => result_agg.unwrap_or_else(|| fty.to_string()),
+        }
+    }
+
+    /// The address of a by-value nested-aggregate field (`&outer.inner`): GEP to the field and
+    /// yield the pointer, tracked as an aggregate slot (its layout GID from `type_idx`), so a
+    /// chained field access or a method receiver addresses through it. (#242)
+    ///
+    /// # Errors
+    ///
+    /// Declines when the struct slot, its layout, the field at this offset or the result type is
+    /// not tracked.
     pub(crate) fn op_field_addr(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let parent_gid = (*self
             .agg_of
@@ -242,8 +300,9 @@ impl FnEmit<'_> {
             .get(ins.operand1.0 as usize)
             .ok_or(crate::emitter_gap!())?;
         let n = format!("%v{idx}");
-        self.body += &format!(
-            "  {n} = llvm.getelementptr {slot}[0, {field_idx}] : (!llvm.ptr) -> !llvm.ptr, {}\n",
+        let _ = writeln!(
+            self.body,
+            "  {n} = llvm.getelementptr {slot}[0, {field_idx}] : (!llvm.ptr) -> !llvm.ptr, {}",
             agg.struct_ty
         );
         self.names[idx] = n;
@@ -259,10 +318,15 @@ impl FnEmit<'_> {
         Ok(())
     }
 
-    // Index a raw pointer `p[i]` (`p : *mut T`): GEP the element, then either load it (a value
-    // read) or hand back the element pointer as a store place. `operand1` is the base pointer,
-    // `operand2` the (scalar) index, `type_idx` the pointee element type. The GEP's base
-    // element type sets the stride, so `p[i]` addresses `base + i * sizeof(T)`. (#242)
+    /// Index a raw pointer `p[i]` (`p : *mut T`): GEP the element, then either load it (a value
+    /// read) or hand back the element pointer as a store place. `operand1` is the base pointer,
+    /// `operand2` the (scalar) index, `type_idx` the pointee element type. The GEP's base
+    /// element type sets the stride, so `p[i]` addresses `base + i * sizeof(T)`. (#242)
+    ///
+    /// # Errors
+    ///
+    /// Declines when an operand or the result type is not tracked, or when the element is not a
+    /// pointer, a scalar or a modelled struct.
     pub(crate) fn op_ptr_index(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let base = self
             .names
@@ -301,8 +365,9 @@ impl FnEmit<'_> {
             .ok_or(crate::emitter_gap!())?
             .clone();
         let p = format!("%pg{idx}");
-        self.body += &format!(
-            "  {p} = llvm.getelementptr {base}[{iname}] : (!llvm.ptr, {imt}) -> !llvm.ptr, {et}\n"
+        let _ = writeln!(
+            self.body,
+            "  {p} = llvm.getelementptr {base}[{iname}] : (!llvm.ptr, {imt}) -> !llvm.ptr, {et}"
         );
         if ins.imm == 1 {
             // An element place: the following `PtrStore` writes through it.
@@ -311,7 +376,7 @@ impl FnEmit<'_> {
             self.pptr_elem[idx] = Some(et);
         } else {
             let n = format!("%v{idx}");
-            self.body += &format!("  {n} = llvm.load {p} : !llvm.ptr -> {et}\n");
+            let _ = writeln!(self.body, "  {n} = llvm.load {p} : !llvm.ptr -> {et}");
             self.names[idx] = n;
             self.etypes[idx] = scalar_e;
             self.agg_val_of[idx] = agg_gid;
@@ -324,9 +389,13 @@ impl FnEmit<'_> {
         Ok(())
     }
 
-    // Store into a raw-pointer place (no result): `operand1` is the `PtrIndex` place (the GEP'd
-    // element pointer), `operand2` the value, and the pointee element type comes from the
-    // place. (#242)
+    /// Store into a raw-pointer place (no result): `operand1` is the `PtrIndex` place (the GEP'd
+    /// element pointer), `operand2` the value, and the pointee element type comes from the
+    /// place. (#242)
+    ///
+    /// # Errors
+    ///
+    /// Declines when the place or the value is not tracked, or the place has no element type.
     pub(crate) fn op_ptr_store(&mut self, _idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let place = self
             .names
@@ -344,7 +413,7 @@ impl FnEmit<'_> {
             .get(ins.operand2.0 as usize)
             .ok_or(crate::emitter_gap!())?
             .clone();
-        self.body += &format!("  llvm.store {val}, {place} : {et}, !llvm.ptr\n");
+        let _ = writeln!(self.body, "  llvm.store {val}, {place} : {et}, !llvm.ptr");
         Ok(())
     }
 }

@@ -19,7 +19,7 @@ fn test_mlir_diagnostic_suppressed_by_default() -> Result<(), String> {
     let emit_diagnostics = false;
     context.attach_diagnostic_handler(move |diagnostic| {
         if emit_diagnostics {
-            *captured_clone.lock().unwrap() = format!("{}", diagnostic);
+            *captured_clone.lock().unwrap() = format!("{diagnostic}");
         }
         true
     });
@@ -59,7 +59,7 @@ fn test_mlir_diagnostic_emitted() -> Result<(), String> {
     let emit_diagnostics = true;
     context.attach_diagnostic_handler(move |diagnostic| {
         if emit_diagnostics {
-            *captured_clone.lock().unwrap() = format!("{}", diagnostic);
+            *captured_clone.lock().unwrap() = format!("{diagnostic}");
         }
         true
     });
@@ -102,7 +102,7 @@ fn test_mlir_diagnostic_parse_error() -> Result<(), String> {
         captured_clone
             .lock()
             .unwrap()
-            .push_str(&format!("{}", diagnostic));
+            .push_str(&format!("{diagnostic}"));
         true
     });
 
@@ -112,7 +112,7 @@ fn test_mlir_diagnostic_parse_error() -> Result<(), String> {
 
     let diag = captured.lock().unwrap();
     if !(diag.contains("custom op 'func.invalid_op' is unknown")) {
-        return Err(format!("Expected parse diagnostic, got: {}", diag));
+        return Err(format!("Expected parse diagnostic, got: {diag}"));
     }
 
     Ok(())
@@ -141,16 +141,16 @@ fn test_vx_valid_program_emits_remark() -> Result<(), String> {
         captured_clone
             .lock()
             .unwrap()
-            .push_str(&format!("{}", diagnostic));
+            .push_str(&format!("{diagnostic}"));
         true
     });
 
     // 1. Compile a valid Vx program
-    let input = r#"
+    let input = r"
 fn test_remark() -> f32 {
     return 1.0;
 }
-"#;
+";
     let mut lexer = vxc::lexer::Lexer::new(input);
     let tokens = lexer.tokenize();
     let mut parser = vxc::parser::Parser::new(&tokens, input);
@@ -193,7 +193,7 @@ fn test_remark() -> f32 {
 
     let diag = captured.lock().unwrap();
     if !(diag.contains("Lowering Vx to Standard dialects")) {
-        return Err(format!("Expected Vx lowering remark, got: {}", diag));
+        return Err(format!("Expected Vx lowering remark, got: {diag}"));
     }
 
     Ok(())

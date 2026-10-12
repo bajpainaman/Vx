@@ -45,7 +45,7 @@ use std::process::Command;
 /// A program whose assertion is false at run time and cannot be folded at compile
 /// time: `n` is a parameter, and the argument arrives through a tensor element,
 /// so the const-evaluator has no value for it.
-const FALSE_AT_RUNTIME: &str = r#"
+const FALSE_AT_RUNTIME: &str = r"
 fn checked(n: i32) -> i32 {
   assert(n < 5);
   return n * 10;
@@ -58,7 +58,7 @@ fn main() -> i32 {
   print(checked(big));
   return 0;
 }
-"#;
+";
 
 fn write_probe(stem: &str, source: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("vx_assert_{}", std::process::id()));
@@ -140,7 +140,7 @@ fn a_false_runtime_assert_aborts() {
 /// not termination's.)
 #[test]
 fn abort_is_callable_and_needs_no_unsafe() {
-    let src = r#"
+    let src = r"
 fn main() -> i32 {
   let mut t = Tensor<i32>([ 1 ]);
   t[0] = 3;
@@ -150,7 +150,7 @@ fn main() -> i32 {
   print(999);
   return 0;
 }
-"#;
+";
     let probe = write_probe("abort_builtin", src);
 
     // Both backends: terminates, and never reaches the print.
@@ -250,7 +250,7 @@ fn main() -> i32 {
 /// a bare `vxc file.vx`. The AST path is the one being asked, so only that path is run.
 #[test]
 fn ast_path_reads_a_narrow_enum_payload_as_its_own_type() {
-    let src = r#"
+    let src = r"
 enum Pick<T> {
   Narrow(i8),
   Wide(T),
@@ -273,7 +273,7 @@ fn main() -> i32 {
   print(Pick<i64>::Narrow(-3 as i8).narrow_or(0));
   return 0;
 }
-"#;
+";
     let probe = write_probe("narrow_enum_payload", src);
 
     let run = Command::new(env!("CARGO_BIN_EXE_vxc"))

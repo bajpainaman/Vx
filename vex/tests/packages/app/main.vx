@@ -1,0 +1,23 @@
+//===- main.vx - Vx Package Tool --------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The program `vex run` compiles in `tests/build_and_run_packages.rs`. It uses a function from
+// the `shapes` package, which itself uses the `numbers` package, and one from its own package.
+
+import shapes::area;
+import app::sides;
+
+fn main() -> i32 {
+  print!("area ");
+  print(area_of_two_squares(3));
+  print!("
+sides ");
+  print(sides_of_a_square());
+  print!("
+");
+  return 0;
+}

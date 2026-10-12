@@ -16,7 +16,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::{BorrowRecord, Expr, Statement, Type, TypeChecker};
 use crate::hir::env::RefProvenance;
 
 /// What a view borrows: each tensor it may point into, with the path inside it, and where
@@ -63,7 +63,7 @@ impl View {
     }
 }
 
-impl<'a> TypeChecker<'a> {
+impl TypeChecker<'_> {
     /// The view `expr` makes, when it makes one, and its value is a tensor: a field or index
     /// chain, `t.reshape(..)` without `PadMode::Pad`, a view variable, or an `if` or `match` whose value is one of
     /// these. A view of a view, or of a tensor reached through a reference, borrows the
@@ -163,6 +163,10 @@ impl<'a> TypeChecker<'a> {
     /// `let name = expr`: when `expr` is a view, record that `name` borrows each tensor it
     /// may point into, mutably when `name` is declared `mut`. A closure that uses a view
     /// borrows what the view borrows, for as long as the closure is used.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "callers are in other files; the arguments are the parts of one `let`"
+    )]
     pub(crate) fn bind_view(
         &mut self,
         name: &str,
@@ -207,7 +211,7 @@ impl<'a> TypeChecker<'a> {
                 Some(t) if Self::is_ref_type(t)
             );
             if is_mut && !through_reference && self.lookup(owner).is_some() {
-                self.changed_vars.insert(owner.to_string());
+                self.changed_vars.insert(owner.clone());
                 if !self.is_mutable(owner) {
                     self.report_read_only(owner, "a view of it cannot be declared `mut`", span);
                 }

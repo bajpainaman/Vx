@@ -13,11 +13,37 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::{
+    ArrayExpr, BorrowExpr, ElementType, EnumVariantExpr, Expr, ExprStmtStmt, FunctionCallExpr,
+    IdentifierExpr, LetDeclStmt, MethodCallExpr, NumberExpr, Placement, Span, Statement,
+    StructInitExpr, Type, TypeChecker, UnsafeBlockExpr, VecMacroExpr,
+};
 use crate::hir::expr::expected_numeric_elem;
 use std::collections::HashMap;
 
-impl<'a> TypeChecker<'a> {
+/// The parts of a tensor type: its element type, its dimensions and where it is placed.
+type TensorParts<'a> = (
+    &'a ElementType,
+    &'a Vec<crate::syntax::Dim>,
+    &'a Option<Placement>,
+);
+
+/// A struct's generic parameter names and its fields with their declared types.
+type StructGenericsAndFields = (Vec<String>, Vec<(crate::symbol::Symbol, Type)>);
+
+/// One payload argument of an enum variant expression, as the error messages name it.
+struct EnumPayloadArg<'a> {
+    /// The argument's position, counted from zero.
+    index: usize,
+    /// The enum's name without its type arguments.
+    enum_name: &'a str,
+    /// The variant the argument is passed to.
+    variant: &'a crate::symbol::Symbol,
+    /// Where the whole variant expression is in the source.
+    span: &'a Span,
+}
+
+impl TypeChecker<'_> {
     /// An enum expression's name read back as a type. The parser re-serializes the turbofish
     /// arguments into the name (`Option<*mut i8>`), so recovering them needs the type parser
     /// (Vx#415). `None` when the name carries no arguments.
@@ -57,141 +83,210 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Checks an enum variant expression such as `Option<i32>::Some(1)` and returns the enum's
+    /// type.
+    ///
+    /// # Panics
+    /// When `expr` is not an enum variant expression. The caller dispatches on the expression's
+    /// kind, so that is a bug in the checker.
     pub(crate) fn check_enumvariant_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
         match expr {
-            Expr::EnumVariant(EnumVariantExpr {
-                enum_name,
-                variant_name: variant,
-                payload,
-                span,
-            }) => {
-                let actual_enum_name = if let Some(idx) = enum_name.find('<') {
-                    &enum_name[..idx]
-                } else {
-                    enum_name.as_ref()
-                };
+            Expr::EnumVariant(variant_expr) => {
+                self.check_enum_variant_payload(variant_expr, consume);
 
-                if let Some(enum_decl) = self.env.enums.get(actual_enum_name) {
-                    if let Some((_, expected_payload)) =
-                        enum_decl.variants.iter().find(|(n, _)| n == variant)
-                    {
-                        if let Some(expr_payload) = payload {
-                            if let Some(exp_types) = expected_payload {
-                                if expr_payload.len() != exp_types.len() {
-                                    if !self.speculating {
-                                        self.errors.error_with_code(
-                                            crate::diagnostic::DiagnosticCode::E3009,
-                                            format!("Enum variant {}::{} expects {} payload arguments, got {}", actual_enum_name, variant, exp_types.len(), expr_payload.len()),
-                                            Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
-                                        );
-                                    }
-                                } else {
-                                    let mut mapping = HashMap::new();
-                                    let ty_args = self.enum_name_type_args(enum_name);
-                                    for (param, ty_arg) in
-                                        enum_decl.generics.iter().zip(ty_args.iter())
-                                    {
-                                        mapping.insert(param.name().into(), ty_arg.clone());
-                                    }
-
-                                    for (i, expr) in expr_payload.iter_mut().enumerate() {
-                                        // An untyped literal takes the payload's type:
-                                        // `Pair<i32, f64>::Of(1, 2.5)` holds an `f64`.
-                                        let expected_ty = exp_types[i].substitute(&mapping);
-                                        let expr_ty = if matches!(
-                                            expected_ty,
-                                            Type::Generic(..)
-                                                | Type::Scalar(ElementType::Generic(_))
-                                        ) {
-                                            self.check_expr_type_flag(expr, consume)
-                                        } else {
-                                            self.check_expr_expecting(
-                                                expr,
-                                                Some(expected_ty.clone()),
-                                                consume,
-                                            )
-                                        };
-                                        // A tensor payload has no lowering: the variant's slot is
-                                        // built with `llvm.insertvalue`, which takes primitives,
-                                        // and the AST path emitted the tag and dropped the tensor
-                                        // without saying so.
-                                        if Self::is_tensor_payload(&expected_ty) {
-                                            if !self.speculating {
-                                                self.errors.error_with_code(
-                                                    crate::diagnostic::DiagnosticCode::E3021,
-                                                    format!(
-                                                        "payload argument {} of {}::{} is {}; an \
-                                                         enum variant cannot carry a tensor",
-                                                        i + 1,
-                                                        actual_enum_name,
-                                                        variant,
-                                                        Self::short_type_name(&expected_ty)
-                                                    ),
-                                                    Some(
-                                                        crate::diagnostic::SourceSpan::from_ast_span(
-                                                            span,
-                                                        ),
-                                                    ),
-                                                );
-                                            }
-                                            continue;
-                                        }
-                                        if !self.is_assignable(&expected_ty, &expr_ty)
-                                            && !matches!(&expected_ty, Type::Generic(_, _))
-                                            && !self.speculating
-                                        {
-                                            self.errors.error_with_code(
-                                                crate::diagnostic::DiagnosticCode::E3008,
-                                                format!("Type mismatch in payload argument {} for {}::{}: expected {}, got {}", i + 1, actual_enum_name, variant, expected_ty, expr_ty),
-                                                Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
-                                            );
-                                        }
-                                    }
-                                }
-                            } else if !self.speculating {
-                                self.errors.error_with_code(
-                                    crate::diagnostic::DiagnosticCode::E3009,
-                                    format!(
-                                        "Enum variant {}::{} does not take a payload",
-                                        actual_enum_name, variant
-                                    ),
-                                    Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
-                                );
-                            }
-                        } else if expected_payload.is_some() && !self.speculating {
-                            self.errors.error_with_code(
-                                crate::diagnostic::DiagnosticCode::E3009,
-                                format!(
-                                    "Enum variant {}::{} expects a payload",
-                                    actual_enum_name, variant
-                                ),
-                                Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
-                            );
-                        }
-                    } else if !self.speculating {
-                        self.errors.error_with_code(
-                            crate::diagnostic::DiagnosticCode::E2004,
-                            format!(
-                                "Enum {} does not have variant {}",
-                                actual_enum_name, variant
-                            ),
-                            Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
-                        );
-                    }
-                } else if !self.speculating {
-                    self.errors.error_with_code(
-                        crate::diagnostic::DiagnosticCode::E2003,
-                        format!("Unknown enum {}", enum_name),
-                        Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
-                    );
-                }
-
+                let enum_name = &variant_expr.enum_name;
                 if let Some(ty) = self.enum_name_as_type(enum_name) {
                     return ty;
                 }
                 Type::Enum(enum_name.clone(), None)
             }
-            _ => panic!("Expected IndexAccess, got {:?}", expr),
+            _ => panic!("Expected IndexAccess, got {expr:?}"),
+        }
+    }
+
+    /// Reports what is wrong with an enum variant expression: an enum or a variant that does not
+    /// exist, a payload that is missing, not wanted or of the wrong length, and payload arguments
+    /// of the wrong type.
+    fn check_enum_variant_payload(&mut self, variant_expr: &mut EnumVariantExpr, consume: bool) {
+        let enum_name = &variant_expr.enum_name;
+        let variant = &variant_expr.variant_name;
+        let span = &variant_expr.span;
+        let actual_enum_name = Self::enum_base_name(enum_name);
+
+        let Some(enum_decl) = self.env.enums.get(actual_enum_name) else {
+            self.enum_variant_error(crate::diagnostic::DiagnosticCode::E2003, span, || {
+                format!("Unknown enum {enum_name}")
+            });
+            return;
+        };
+        let Some((_, expected_payload)) = enum_decl.variants.iter().find(|(n, _)| n == variant)
+        else {
+            self.enum_variant_error(crate::diagnostic::DiagnosticCode::E2004, span, || {
+                format!("Enum {actual_enum_name} does not have variant {variant}")
+            });
+            return;
+        };
+        self.check_enum_payload(
+            variant_expr,
+            enum_decl,
+            expected_payload.as_deref(),
+            consume,
+        );
+    }
+
+    /// An enum expression's name without its type arguments: `Option` for `Option<i32>`.
+    fn enum_base_name(enum_name: &str) -> &str {
+        if let Some(idx) = enum_name.find('<') {
+            &enum_name[..idx]
+        } else {
+            enum_name
+        }
+    }
+
+    /// Checks the payload of an enum variant expression against `expected_payload`: the payload
+    /// types the variant declares, or `None` for a variant that takes no payload.
+    fn check_enum_payload(
+        &mut self,
+        variant_expr: &mut EnumVariantExpr,
+        enum_decl: &crate::syntax::EnumDecl,
+        expected_payload: Option<&[Type]>,
+        consume: bool,
+    ) {
+        let EnumVariantExpr {
+            enum_name,
+            variant_name: variant,
+            payload,
+            span,
+        } = variant_expr;
+        let actual_enum_name = Self::enum_base_name(enum_name);
+        let Some(expr_payload) = payload else {
+            if expected_payload.is_some() {
+                self.enum_variant_error(crate::diagnostic::DiagnosticCode::E3009, span, || {
+                    format!("Enum variant {actual_enum_name}::{variant} expects a payload")
+                });
+            }
+            return;
+        };
+        let Some(exp_types) = expected_payload else {
+            self.enum_variant_error(crate::diagnostic::DiagnosticCode::E3009, span, || {
+                format!("Enum variant {actual_enum_name}::{variant} does not take a payload")
+            });
+            return;
+        };
+        if expr_payload.len() != exp_types.len() {
+            self.enum_variant_error(crate::diagnostic::DiagnosticCode::E3009, span, || {
+                format!(
+                    "Enum variant {}::{} expects {} payload arguments, got {}",
+                    actual_enum_name,
+                    variant,
+                    exp_types.len(),
+                    expr_payload.len()
+                )
+            });
+            return;
+        }
+
+        let mapping = self.enum_generic_mapping(enum_decl, enum_name);
+        for (i, expr) in expr_payload.iter_mut().enumerate() {
+            // An untyped literal takes the payload's type:
+            // `Pair<i32, f64>::Of(1, 2.5)` holds an `f64`.
+            let expected_ty = exp_types[i].substitute(&mapping);
+            let arg = EnumPayloadArg {
+                index: i,
+                enum_name: actual_enum_name,
+                variant,
+                span,
+            };
+            self.check_enum_payload_arg(expr, &expected_ty, &arg, consume);
+        }
+    }
+
+    /// Reports an error at an enum variant expression, unless the checker is only trying a
+    /// guess. The message is built only when it is reported.
+    fn enum_variant_error(
+        &mut self,
+        code: crate::diagnostic::DiagnosticCode,
+        span: &Span,
+        message: impl FnOnce() -> String,
+    ) {
+        if !self.speculating {
+            self.errors.error_with_code(
+                code,
+                message(),
+                Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+            );
+        }
+    }
+
+    /// The enum's generic parameters paired with the type arguments written in `enum_name`:
+    /// for `Option<i32>`, `T` maps to `i32`.
+    fn enum_generic_mapping(
+        &self,
+        enum_decl: &crate::syntax::EnumDecl,
+        enum_name: &str,
+    ) -> HashMap<crate::symbol::Symbol, Type> {
+        let mut mapping = HashMap::new();
+        let ty_args = self.enum_name_type_args(enum_name);
+        for (param, ty_arg) in enum_decl.generics.iter().zip(ty_args.iter()) {
+            mapping.insert(param.name().into(), ty_arg.clone());
+        }
+        mapping
+    }
+
+    /// Checks one payload argument of an enum variant against the type the variant declares for
+    /// it.
+    fn check_enum_payload_arg(
+        &mut self,
+        expr: &mut Expr,
+        expected_ty: &Type,
+        arg: &EnumPayloadArg<'_>,
+        consume: bool,
+    ) {
+        let expr_ty = if matches!(
+            expected_ty,
+            Type::Generic(..) | Type::Scalar(ElementType::Generic(_))
+        ) {
+            self.check_expr_type_flag(expr, consume)
+        } else {
+            self.check_expr_expecting(expr, Some(expected_ty.clone()), consume)
+        };
+        // A tensor payload has no lowering: the variant's slot is
+        // built with `llvm.insertvalue`, which takes primitives,
+        // and the AST path emitted the tag and dropped the tensor
+        // without saying so.
+        if Self::is_tensor_payload(expected_ty) {
+            if !self.speculating {
+                self.errors.error_with_code(
+                    crate::diagnostic::DiagnosticCode::E3021,
+                    format!(
+                        "payload argument {} of {}::{} is {}; an \
+                         enum variant cannot carry a tensor",
+                        arg.index + 1,
+                        arg.enum_name,
+                        arg.variant,
+                        Self::short_type_name(expected_ty)
+                    ),
+                    Some(crate::diagnostic::SourceSpan::from_ast_span(arg.span)),
+                );
+            }
+            return;
+        }
+        if !self.is_assignable(expected_ty, &expr_ty)
+            && !matches!(expected_ty, Type::Generic(_, _))
+            && !self.speculating
+        {
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E3008,
+                format!(
+                    "Type mismatch in payload argument {} for {}::{}: expected {}, got {}",
+                    arg.index + 1,
+                    arg.enum_name,
+                    arg.variant,
+                    expected_ty,
+                    expr_ty
+                ),
+                Some(crate::diagnostic::SourceSpan::from_ast_span(arg.span)),
+            );
         }
     }
 
@@ -247,9 +342,7 @@ impl<'a> TypeChecker<'a> {
     /// moves them (#335). The wrappers are peeled in a loop rather than once,
     /// so a borrow of a placed tensor (`&Ref<Tensor<f32, [?, ?]>, Memory::GPU_HBM>`,
     /// which is what a resident weight is) resolves too.
-    pub(crate) fn as_tensor_operand(
-        t: &Type,
-    ) -> Option<(&ElementType, &Vec<crate::syntax::Dim>, &Option<Placement>)> {
+    pub(crate) fn as_tensor_operand(t: &Type) -> Option<TensorParts<'_>> {
         let mut inner = t;
         loop {
             match inner {
@@ -401,9 +494,6 @@ impl<'a> TypeChecker<'a> {
         )
     }
 
-    /// A short human name for a type, for diagnostics that only need to say what KIND of thing
-    /// the programmer wrote. The `{:?}` rendering used elsewhere prints the whole AST of every
-    /// dimension expression, which buries the one word the reader needs.
     /// Whether a payload type is a tensor, through the wrappers that restate where it lives
     /// without changing how it is represented.
     fn is_tensor_payload(t: &Type) -> bool {
@@ -416,6 +506,9 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// A short human name for a type, for diagnostics that only need to say what KIND of thing
+    /// the programmer wrote. The `{:?}` rendering used elsewhere prints the whole AST of every
+    /// dimension expression, which buries the one word the reader needs.
     pub(crate) fn short_type_name(t: &Type) -> String {
         match t {
             Type::Scalar(e) => format!("a scalar {e:?}"),
@@ -441,6 +534,12 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Checks an array literal such as `[1, 2, 3]` and returns its tensor type, or
+    /// `Type::Unknown` after reporting why it has none.
+    ///
+    /// # Panics
+    /// When `expr` is not an array literal. The caller dispatches on the expression's kind, so
+    /// that is a bug in the checker.
     pub(crate) fn check_array_expr(&mut self, expr: &mut Expr) -> Type {
         match expr {
             Expr::Array(ArrayExpr { elements, span }) => {
@@ -464,112 +563,131 @@ impl<'a> TypeChecker<'a> {
                     );
                     return Type::Unknown;
                 }
-                // A NESTED literal is how a multi-dimensional initializer is written
-                // (`Tensor<f32>([[1.0, 2.0], [3.0, 4.0]])`), and those rows are consumed as a
-                // shape by `initializer_shape` rather than lowered through
-                // `tensor.from_elements`. So the restriction is on non-scalar VALUES -- a
-                // tensor variable -- not on nested literals, which stay legal.
-                let nested = matches!(elements.first(), Some(Expr::Array(_)));
-                // The element type comes from the first element that is not a bare number
-                // literal, so `[1.0, d]` takes `d`'s type. That element is checked first.
-                let lead = if nested {
-                    0
-                } else {
-                    elements
-                        .iter()
-                        .position(|e| !crate::hir::expr::is_untyped_numeric_literal(e))
-                        .unwrap_or(0)
-                };
-                let order = std::iter::once(lead).chain((0..elements.len()).filter(|&i| i != lead));
-                let mut elem_ty = ElementType::F32;
-                for i in order {
-                    let el = &mut elements[i];
-                    if i == lead {
-                        let first = self.check_expr_type(el);
-                        match (first, nested) {
-                            (Type::Scalar(e), false) => elem_ty = e,
-                            // A nested row reports `Tensor<e, [?, ?]>`; the initializer's element type
-                            // is that inner `e`, which is also more accurate than the `f32`
-                            // default this arm used to fall through to.
-                            (Type::Tensor(e, _, _), true) => elem_ty = e,
-                            (other, _) => {
-                                self.errors.error_with_code(
-                                    crate::diagnostic::DiagnosticCode::E3018,
-                                    format!(
-                                        "an array literal's elements must be scalars, but this \
-                                         one holds {}; an array of tensors has no lowering \
-                                         (`tensor.from_elements` takes scalar elements)",
-                                        Self::short_type_name(&other)
-                                    ),
-                                    Some(crate::diagnostic::SourceSpan::from_ast_span(&span)),
-                                );
-                                return Type::Unknown;
-                            }
-                        }
-                    } else if nested {
-                        // Every row of a nested initializer must itself be a literal row: a
-                        // mixed `[[1.0], x]` has no shape, and letting it through would put the
-                        // ragged case back on codegen.
-                        if !matches!(el, Expr::Array(_)) {
-                            self.errors.error_with_code(
-                                crate::diagnostic::DiagnosticCode::E3018,
-                                "a nested array literal's rows must all be literals; this one \
-                                 mixes a row with something else"
-                                    .to_string(),
-                                Some(crate::diagnostic::SourceSpan::from_ast_span(&span)),
-                            );
-                            return Type::Unknown;
-                        }
-                        self.check_expr_type(el);
-                    } else {
-                        let ty = self.check_expr_expecting(
-                            el,
-                            Some(Type::Scalar(elem_ty.clone())),
-                            true,
-                        );
-                        if let Type::Scalar(e) = &ty {
-                            if *e != elem_ty {
-                                self.errors.error_with_code(
-                                    crate::diagnostic::DiagnosticCode::E3018,
-                                    format!(
-                                        "this array literal's elements are {elem_ty}, but one is {e}; \
-                                         convert it with `as {elem_ty}`"
-                                    ),
-                                    Some(crate::diagnostic::SourceSpan::from_ast_span(&el.span())),
-                                );
-                            }
-                        }
-                    }
-                }
-                // A literal knows its shape: `[1, 2, 3]` is `Tensor<i32, [3]>`, and
-                // `[[1, 2], [3, 4]]` is `Tensor<i32, [2, 2]>`.
-                let nested = elements.iter().any(|el| matches!(el, Expr::Array(_)));
-                let shape = if nested {
-                    ArrayExpr::new(elements.clone(), span).initializer_shape()
-                } else {
-                    Some(vec![elements.len()])
-                };
-                let Some(shape) = shape else {
+                let Some(elem_ty) = self.check_array_elements(elements, span) else {
                     return Type::Unknown;
                 };
-                let dims = shape
-                    .iter()
-                    .map(|n| {
-                        crate::syntax::Dim::Static(Expr::Number(
-                            crate::syntax::expr::NumberExpr::new(
-                                n.to_string(),
-                                Some(ElementType::I32),
-                                span,
-                            ),
-                        ))
-                    })
-                    .collect();
-                Type::Tensor(elem_ty, dims, None)
+                Self::array_literal_type(elements, elem_ty, span)
             }
-            _ => panic!("Expected IndexAccess, got {:?}", expr),
+            _ => panic!("Expected IndexAccess, got {expr:?}"),
         }
     }
 
+    /// Checks every element of a non-empty array literal and returns the element type they
+    /// share, or `None` after reporting an element that cannot be in an array literal.
+    fn check_array_elements(&mut self, elements: &mut [Expr], span: Span) -> Option<ElementType> {
+        // A NESTED literal is how a multi-dimensional initializer is written
+        // (`Tensor<f32>([[1.0, 2.0], [3.0, 4.0]])`), and those rows are consumed as a
+        // shape by `initializer_shape` rather than lowered through
+        // `tensor.from_elements`. So the restriction is on non-scalar VALUES -- a
+        // tensor variable -- not on nested literals, which stay legal.
+        let nested = matches!(elements.first(), Some(Expr::Array(_)));
+        // The element type comes from the first element that is not a bare number
+        // literal, so `[1.0, d]` takes `d`'s type. That element is checked first.
+        let lead = if nested {
+            0
+        } else {
+            elements
+                .iter()
+                .position(|e| !crate::hir::expr::is_untyped_numeric_literal(e))
+                .unwrap_or(0)
+        };
+        let order = std::iter::once(lead).chain((0..elements.len()).filter(|&i| i != lead));
+        let mut elem_ty = ElementType::F32;
+        for i in order {
+            let el = &mut elements[i];
+            if i == lead {
+                let first = self.check_expr_type(el);
+                match (first, nested) {
+                    // A nested row reports `Tensor<e, [?, ?]>`; the initializer's element type
+                    // is that inner `e`, which is also more accurate than the `f32`
+                    // default this arm used to fall through to.
+                    (Type::Scalar(e), false) | (Type::Tensor(e, _, _), true) => elem_ty = e,
+                    (other, _) => {
+                        self.errors.error_with_code(
+                            crate::diagnostic::DiagnosticCode::E3018,
+                            format!(
+                                "an array literal's elements must be scalars, but this \
+                                 one holds {}; an array of tensors has no lowering \
+                                 (`tensor.from_elements` takes scalar elements)",
+                                Self::short_type_name(&other)
+                            ),
+                            Some(crate::diagnostic::SourceSpan::from_ast_span(&span)),
+                        );
+                        return None;
+                    }
+                }
+            } else if nested {
+                // Every row of a nested initializer must itself be a literal row: a
+                // mixed `[[1.0], x]` has no shape, and letting it through would put the
+                // ragged case back on codegen.
+                if !matches!(el, Expr::Array(_)) {
+                    self.errors.error_with_code(
+                        crate::diagnostic::DiagnosticCode::E3018,
+                        "a nested array literal's rows must all be literals; this one \
+                         mixes a row with something else"
+                            .to_string(),
+                        Some(crate::diagnostic::SourceSpan::from_ast_span(&span)),
+                    );
+                    return None;
+                }
+                self.check_expr_type(el);
+            } else {
+                self.check_later_array_element(el, &elem_ty);
+            }
+        }
+        Some(elem_ty)
+    }
+
+    /// Checks an element that comes after the one that set the array's element type, and
+    /// reports it when its type is a different scalar.
+    fn check_later_array_element(&mut self, el: &mut Expr, elem_ty: &ElementType) {
+        let ty = self.check_expr_expecting(el, Some(Type::Scalar(elem_ty.clone())), true);
+        if let Type::Scalar(e) = &ty {
+            if e != elem_ty {
+                self.errors.error_with_code(
+                    crate::diagnostic::DiagnosticCode::E3018,
+                    format!(
+                        "this array literal's elements are {elem_ty}, but one is {e}; \
+                         convert it with `as {elem_ty}`"
+                    ),
+                    Some(crate::diagnostic::SourceSpan::from_ast_span(&el.span())),
+                );
+            }
+        }
+    }
+
+    /// The tensor type of an array literal whose elements are `elem_ty`, or `Type::Unknown`
+    /// when its nested rows have no single shape.
+    fn array_literal_type(elements: &[Expr], elem_ty: ElementType, span: Span) -> Type {
+        // A literal knows its shape: `[1, 2, 3]` is `Tensor<i32, [3]>`, and
+        // `[[1, 2], [3, 4]]` is `Tensor<i32, [2, 2]>`.
+        let nested = elements.iter().any(|el| matches!(el, Expr::Array(_)));
+        let shape = if nested {
+            ArrayExpr::new(elements.to_vec(), span).initializer_shape()
+        } else {
+            Some(vec![elements.len()])
+        };
+        let Some(shape) = shape else {
+            return Type::Unknown;
+        };
+        let dims = shape
+            .iter()
+            .map(|n| {
+                crate::syntax::Dim::Static(Expr::Number(crate::syntax::expr::NumberExpr::new(
+                    n.to_string(),
+                    Some(ElementType::I32),
+                    span,
+                )))
+            })
+            .collect();
+        Type::Tensor(elem_ty, dims, None)
+    }
+
+    /// Checks a struct literal such as `Pair { a : 1, b : true }` and returns the struct's type.
+    ///
+    /// # Panics
+    /// When `expr` is not a struct literal. The caller dispatches on the expression's kind, so
+    /// that is a bug in the checker.
     pub(crate) fn check_structinit_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
         match expr {
             Expr::StructInit(StructInitExpr {
@@ -579,15 +697,7 @@ impl<'a> TypeChecker<'a> {
                 span: _,
             }) => {
                 let resolved_name = name.clone();
-                let mut base_name = resolved_name.clone();
-                let mut generic_args = Vec::new();
-
-                if let Type::GenericInstance(inner, args) = self.parse_ty_str(&resolved_name) {
-                    if let Type::Struct(s, _) = *inner {
-                        base_name = s;
-                    }
-                    generic_args = args;
-                }
+                let (base_name, mut generic_args) = self.struct_name_and_type_args(&resolved_name);
 
                 // Attach the struct's resolved GID so downstream consumers (the flat-HIR lowerer)
                 // reach its registry layout without re-resolving the name (#199). Resolved through the
@@ -603,183 +713,267 @@ impl<'a> TypeChecker<'a> {
                 };
                 *type_id = resolved_gid;
 
-                // The struct's generic parameter names + declared field types: a local AST struct (or
-                // a generated one) first, else an *imported* struct from the frozen registry's
-                // `structs` table (#219) — so constructing an imported struct type-checks with no AST.
-                // A local definition shadows a same-named import.
-                #[allow(clippy::type_complexity)]
-                let struct_info: Option<(
-                    Vec<String>,
-                    Vec<(crate::symbol::Symbol, Type)>,
-                )> = self
-                    .env
-                    .structs
-                    .get(base_name.as_ref())
-                    .map(|s| {
-                        (
-                            s.generics.iter().map(|g| g.name().to_string()).collect(),
-                            s.fields.clone(),
-                        )
-                    })
-                    .or_else(|| {
-                        self.mono
-                            .generated_structs
-                            .iter()
-                            .find(|s| s.name == base_name)
-                            .map(|s| {
-                                (
-                                    s.generics.iter().map(|g| g.name().to_string()).collect(),
-                                    s.fields.clone(),
-                                )
-                            })
-                    })
-                    .or_else(|| {
-                        // GID-keyed since #291: resolve the base name to its unique GID (the
-                        // instance-annotation `resolved_gid` when it was computed, else a fresh
-                        // bare-name resolution for a generic instance's base). An ambiguous name
-                        // declines to "unknown struct" rather than picking an arbitrary module's.
-                        let reg = &self.worker.global.registry;
-                        let gid =
-                            resolved_gid.or_else(|| reg.resolve_unique_nominal(&base_name))?;
-                        reg.structs.get(&gid).map(|sf| {
-                            (
-                                sf.generics.iter().map(|g| g.to_string()).collect(),
-                                sf.fields.clone(),
-                            )
-                        })
-                    });
+                let struct_info = self.struct_generics_and_fields(&base_name, resolved_gid);
 
                 if let Some((generic_names, struct_fields)) = struct_info {
                     // `Pair { a : 1i64, b : true }` with no type arguments written: they come from
                     // what the literal is expected to be, else from its field values, as in Rust.
                     // The fields are checked for real below, so the probe here is speculative.
                     if generic_args.is_empty() && !generic_names.is_empty() {
-                        let mut inferred: HashMap<crate::symbol::Symbol, Type> = HashMap::new();
-                        if let Some(Type::GenericInstance(b, a)) = self.expected_type.clone() {
-                            if matches!(*b, Type::Struct(ref n, _) if *n == base_name)
-                                && a.len() == generic_names.len()
-                            {
-                                for (g, t) in generic_names.iter().zip(a) {
-                                    inferred.insert(g.as_str().into(), t);
-                                }
-                            }
-                        }
-                        if inferred.len() < generic_names.len() {
-                            let saved = self.speculating;
-                            self.speculating = true;
-                            for (f_name, f_ty) in &struct_fields {
-                                if let Some((_, f_expr)) = fields.iter().find(|(n, _)| n == f_name)
-                                {
-                                    let mut probe = f_expr.clone();
-                                    let actual = self.check_expr_type_flag(&mut probe, false);
-                                    self.unify_types(f_ty, &actual, &mut inferred);
-                                }
-                            }
-                            self.speculating = saved;
-                        }
-                        if generic_names
-                            .iter()
-                            .all(|g| inferred.contains_key(g.as_str()))
-                        {
-                            generic_args = generic_names
+                        if let Some(inferred) = self.infer_struct_generic_args(
+                            &base_name,
+                            &generic_names,
+                            &struct_fields,
+                            fields,
+                        ) {
+                            generic_args = inferred;
+                            let spelled: Vec<String> = generic_args
                                 .iter()
-                                .map(|g| inferred[g.as_str()].clone())
+                                .map(std::string::ToString::to_string)
                                 .collect();
-                            let spelled: Vec<String> =
-                                generic_args.iter().map(|t| t.to_string()).collect();
                             *name = format!("{}<{}>", base_name, spelled.join(", ")).into();
                             *type_id = None;
                         }
                     }
-                    let mut mapping = std::collections::HashMap::new();
-                    for (i, param) in generic_names.iter().enumerate() {
-                        if i < generic_args.len() {
-                            mapping.insert(param.as_str().into(), generic_args[i].clone());
-                        }
-                    }
-
-                    // Check missing fields and type mismatch
-                    for (expected_name, raw_expected_type) in &struct_fields {
-                        let expected_type = &raw_expected_type.substitute(&mapping);
-                        let mut found = false;
-                        for (f_name, f_expr) in fields.iter_mut() {
-                            if f_name == expected_name {
-                                found = true;
-                                // The field's type is the expected type of what initializes it,
-                                // so `Counter { n : 0 }` writes a `u64` zero into a `u64` field
-                                // rather than an `i32` one the field then refuses.
-                                let f_type = self.check_expr_expecting(
-                                    f_expr,
-                                    Some(expected_type.clone()),
-                                    consume,
-                                );
-                                self.check_view_stored(
-                                    &format!("the field `{expected_name}`"),
-                                    f_expr,
-                                    &f_type,
-                                );
-                                if !self.is_assignable(expected_type, &f_type) && !self.speculating
-                                {
-                                    self.errors.push(format!(
-                                            "Type mismatch in struct initialization for field '{}'. Expected {}, got {}",
-                                            expected_name, expected_type, f_type
-                                        ));
-                                }
-                                break;
-                            }
-                        }
-                        if !found && !self.speculating {
-                            self.errors.push(format!(
-                                "Missing field '{}' in initialization of struct '{}'",
-                                expected_name, resolved_name
-                            ));
-                        }
-                    }
-                    // Check extra fields
-                    for (f_name, f_expr) in fields.iter_mut() {
-                        if !struct_fields.iter().any(|(n, _)| n == f_name) {
-                            if !self.speculating {
-                                self.errors.push(format!(
-                                    "Struct '{}' has no field '{}'",
-                                    resolved_name, f_name
-                                ));
-                            }
-                            self.check_expr_type_flag(f_expr, consume); // evaluate to find errors
-                        }
-                    }
+                    let expected_fields =
+                        Self::substituted_fields(&generic_names, &generic_args, &struct_fields);
+                    self.check_struct_init_fields(
+                        &resolved_name,
+                        &expected_fields,
+                        fields,
+                        consume,
+                    );
                 } else {
                     if !self.speculating {
-                        // Distinguish "no such struct" from "two imported modules both define it":
-                        // the latter used to resolve by coin flip before the bare name learned to
-                        // decline, and "unknown" would send the user hunting the wrong bug (#291).
-                        if self.worker.global.registry.is_ambiguous_nominal(&base_name) {
-                            self.errors.push(crate::registry::ambiguous_import_message(
-                                "Struct",
-                                &resolved_name,
-                            ));
-                        } else {
-                            self.errors
-                                .push(format!("Unknown struct {} (expr.rs:2175)", resolved_name));
-                        }
+                        self.report_unknown_struct(&base_name, &resolved_name);
                     }
                     for (_, f_expr) in fields.iter_mut() {
                         self.check_expr_type_flag(f_expr, consume);
                     }
                 }
 
-                if !generic_args.is_empty() {
-                    Type::GenericInstance(Box::new(Type::Struct(base_name, None)), generic_args)
-                } else {
+                if generic_args.is_empty() {
                     // The *returned* type keeps GID `None` (as before) so struct type-identity
                     // comparisons are unchanged; the resolved GID rides on the `type_id` field for
                     // the flat-HIR lowerer to consume (#199).
                     Type::Struct(resolved_name, None)
+                } else {
+                    Type::GenericInstance(Box::new(Type::Struct(base_name, None)), generic_args)
                 }
             }
-            _ => panic!("Expected IndexAccess, got {:?}", expr),
+            _ => panic!("Expected IndexAccess, got {expr:?}"),
         }
     }
 
+    /// The struct's own name and the type arguments written after it: `Pair<i32, f64>` gives
+    /// `Pair` and `[i32, f64]`. A name with no type arguments is returned as it is.
+    fn struct_name_and_type_args(
+        &self,
+        name: &crate::symbol::Symbol,
+    ) -> (crate::symbol::Symbol, Vec<Type>) {
+        let mut base_name = name.clone();
+        let mut generic_args = Vec::new();
+
+        if let Type::GenericInstance(inner, args) = self.parse_ty_str(name) {
+            if let Type::Struct(s, _) = *inner {
+                base_name = s;
+            }
+            generic_args = args;
+        }
+        (base_name, generic_args)
+    }
+
+    /// The struct's fields with each generic parameter replaced by its type argument.
+    fn substituted_fields(
+        generic_names: &[String],
+        generic_args: &[Type],
+        struct_fields: &[(crate::symbol::Symbol, Type)],
+    ) -> Vec<(crate::symbol::Symbol, Type)> {
+        let mut mapping = std::collections::HashMap::new();
+        for (i, param) in generic_names.iter().enumerate() {
+            if i < generic_args.len() {
+                mapping.insert(param.as_str().into(), generic_args[i].clone());
+            }
+        }
+        struct_fields
+            .iter()
+            .map(|(field, ty)| (field.clone(), ty.substitute(&mapping)))
+            .collect()
+    }
+
+    /// The struct's generic parameter names + declared field types: a local AST struct (or
+    /// a generated one) first, else an *imported* struct from the frozen registry's
+    /// `structs` table (#219) — so constructing an imported struct type-checks with no AST.
+    /// A local definition shadows a same-named import.
+    fn struct_generics_and_fields(
+        &self,
+        base_name: &crate::symbol::Symbol,
+        resolved_gid: Option<crate::gid::TypeId>,
+    ) -> Option<StructGenericsAndFields> {
+        self.env
+            .structs
+            .get(base_name.as_ref())
+            .map(|s| {
+                (
+                    s.generics.iter().map(|g| g.name().to_string()).collect(),
+                    s.fields.clone(),
+                )
+            })
+            .or_else(|| {
+                self.mono
+                    .generated_structs
+                    .iter()
+                    .find(|s| s.name == *base_name)
+                    .map(|s| {
+                        (
+                            s.generics.iter().map(|g| g.name().to_string()).collect(),
+                            s.fields.clone(),
+                        )
+                    })
+            })
+            .or_else(|| {
+                // GID-keyed since #291: resolve the base name to its unique GID (the
+                // instance-annotation `resolved_gid` when it was computed, else a fresh
+                // bare-name resolution for a generic instance's base). An ambiguous name
+                // declines to "unknown struct" rather than picking an arbitrary module's.
+                let reg = &self.worker.global.registry;
+                let gid = resolved_gid.or_else(|| reg.resolve_unique_nominal(base_name))?;
+                reg.structs.get(&gid).map(|sf| {
+                    (
+                        sf.generics
+                            .iter()
+                            .map(std::string::ToString::to_string)
+                            .collect(),
+                        sf.fields.clone(),
+                    )
+                })
+            })
+    }
+
+    /// Works out the type arguments of a generic struct literal that does not write them: from
+    /// the type the literal is expected to have, else from the values given to its fields.
+    /// `None` when some type parameter is still unknown after both.
+    fn infer_struct_generic_args(
+        &mut self,
+        base_name: &crate::symbol::Symbol,
+        generic_names: &[String],
+        struct_fields: &[(crate::symbol::Symbol, Type)],
+        fields: &[(crate::symbol::Symbol, Expr)],
+    ) -> Option<Vec<Type>> {
+        let mut inferred: HashMap<crate::symbol::Symbol, Type> = HashMap::new();
+        if let Some(Type::GenericInstance(b, a)) = self.expected_type.clone() {
+            if matches!(*b, Type::Struct(ref n, _) if n == base_name)
+                && a.len() == generic_names.len()
+            {
+                for (g, t) in generic_names.iter().zip(a) {
+                    inferred.insert(g.as_str().into(), t);
+                }
+            }
+        }
+        if inferred.len() < generic_names.len() {
+            let saved = self.speculating;
+            self.speculating = true;
+            for (f_name, f_ty) in struct_fields {
+                if let Some((_, f_expr)) = fields.iter().find(|(n, _)| n == f_name) {
+                    let mut probe = f_expr.clone();
+                    let actual = self.check_expr_type_flag(&mut probe, false);
+                    self.unify_types(f_ty, &actual, &mut inferred);
+                }
+            }
+            self.speculating = saved;
+        }
+        if generic_names
+            .iter()
+            .all(|g| inferred.contains_key(g.as_str()))
+        {
+            Some(
+                generic_names
+                    .iter()
+                    .map(|g| inferred[g.as_str()].clone())
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Checks the values in a struct literal against the struct's fields: every declared field
+    /// must be given a value of its type, and no other field may be named.
+    fn check_struct_init_fields(
+        &mut self,
+        resolved_name: &crate::symbol::Symbol,
+        expected_fields: &[(crate::symbol::Symbol, Type)],
+        fields: &mut [(crate::symbol::Symbol, Expr)],
+        consume: bool,
+    ) {
+        // Check missing fields and type mismatch
+        for (expected_name, expected_type) in expected_fields {
+            let mut found = false;
+            for (f_name, f_expr) in fields.iter_mut() {
+                if f_name == expected_name {
+                    found = true;
+                    // The field's type is the expected type of what initializes it,
+                    // so `Counter { n : 0 }` writes a `u64` zero into a `u64` field
+                    // rather than an `i32` one the field then refuses.
+                    let f_type =
+                        self.check_expr_expecting(f_expr, Some(expected_type.clone()), consume);
+                    self.check_view_stored(
+                        &format!("the field `{expected_name}`"),
+                        f_expr,
+                        &f_type,
+                    );
+                    if !self.is_assignable(expected_type, &f_type) && !self.speculating {
+                        self.errors.push(format!(
+                            "Type mismatch in struct initialization for field '{expected_name}'. Expected {expected_type}, got {f_type}"
+                        ));
+                    }
+                    break;
+                }
+            }
+            if !found && !self.speculating {
+                self.errors.push(format!(
+                    "Missing field '{expected_name}' in initialization of struct '{resolved_name}'"
+                ));
+            }
+        }
+        // Check extra fields
+        for (f_name, f_expr) in fields.iter_mut() {
+            if !expected_fields.iter().any(|(n, _)| n == f_name) {
+                if !self.speculating {
+                    self.errors
+                        .push(format!("Struct '{resolved_name}' has no field '{f_name}'"));
+                }
+                self.check_expr_type_flag(f_expr, consume); // evaluate to find errors
+            }
+        }
+    }
+
+    /// Reports a struct literal whose struct is not known.
+    fn report_unknown_struct(
+        &mut self,
+        base_name: &crate::symbol::Symbol,
+        resolved_name: &crate::symbol::Symbol,
+    ) {
+        // Distinguish "no such struct" from "two imported modules both define it":
+        // the latter used to resolve by coin flip before the bare name learned to
+        // decline, and "unknown" would send the user hunting the wrong bug (#291).
+        if self.worker.global.registry.is_ambiguous_nominal(base_name) {
+            self.errors.push(crate::registry::ambiguous_import_message(
+                "Struct",
+                resolved_name,
+            ));
+        } else {
+            self.errors
+                .push(format!("Unknown struct {resolved_name} (expr.rs:2175)"));
+        }
+    }
+
+    /// Rewrites a `vec![...]` expression into a block that makes a `Vec` and pushes each element,
+    /// then checks that block and returns its type.
+    ///
+    /// # Panics
+    /// When `expr` is not a `vec![...]` expression. The caller dispatches on the expression's
+    /// kind, so that is a bug in the checker.
     pub(crate) fn check_vecmacro_expr(&mut self, expr: &mut Expr) -> Type {
         match expr {
             Expr::VecMacro(VecMacroExpr { elements, span }) => {
@@ -793,7 +987,7 @@ impl<'a> TypeChecker<'a> {
                 self.next_id += 1;
 
                 let new_call = Expr::FunctionCall(FunctionCallExpr::new(
-                    format!("Vec<{}>::new", element_type).into(),
+                    format!("Vec<{element_type}>::new").into(),
                     None,
                     vec![],
                     *span,
@@ -838,7 +1032,7 @@ impl<'a> TypeChecker<'a> {
                 *expr = block;
                 self.check_expr_type(expr)
             }
-            _ => panic!("Expected IndexAccess, got {:?}", expr),
+            _ => panic!("Expected IndexAccess, got {expr:?}"),
         }
     }
 }

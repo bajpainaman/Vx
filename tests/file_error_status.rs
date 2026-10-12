@@ -56,7 +56,7 @@ fn file_error_without_a_native_code_keeps_the_code_absent() -> Result<(), String
     expect_equal(error.raw_os_error(), None, "synthetic raw OS code")?;
     let (mut code, mut has_code) = (99, true);
     // This is the shared error path used by both fallible file calls.
-    let status = unsafe { vx_file_store_error(&error, &mut code, &mut has_code) };
+    let status = unsafe { vx_file_store_error(&error, &raw mut code, &raw mut has_code) };
     expect_equal(
         (status, code, has_code),
         (4, 0, false),
@@ -93,7 +93,7 @@ fn fallible_file_calls_clear_every_available_output_on_invalid_arguments() -> Re
 
         {
             let (mut code, mut has_code) = (99, true);
-            let status = call(std::ptr::null_mut(), &mut code, &mut has_code);
+            let status = call(std::ptr::null_mut(), &raw mut code, &raw mut has_code);
             expect_equal(
                 (status, code, has_code),
                 (-1, 0, false),
@@ -102,7 +102,7 @@ fn fallible_file_calls_clear_every_available_output_on_invalid_arguments() -> Re
         }
         {
             let (mut count, mut has_code) = (99, true);
-            let status = call(&mut count, std::ptr::null_mut(), &mut has_code);
+            let status = call(&raw mut count, std::ptr::null_mut(), &raw mut has_code);
             expect_equal(
                 (status, count, has_code),
                 (-1, 0, false),
@@ -111,7 +111,7 @@ fn fallible_file_calls_clear_every_available_output_on_invalid_arguments() -> Re
         }
         {
             let (mut count, mut code) = (99, 99);
-            let status = call(&mut count, &mut code, std::ptr::null_mut());
+            let status = call(&raw mut count, &raw mut code, std::ptr::null_mut());
             expect_equal((status, count, code), (-1, 0, 0), "null code flag output")?;
         }
     }
@@ -135,9 +135,9 @@ fn fallible_file_calls_reject_null_handles_and_nonempty_null_buffers() -> Result
                     std::ptr::null_mut(),
                     byte.as_ptr(),
                     1,
-                    &mut count,
-                    &mut code,
-                    &mut has_code,
+                    &raw mut count,
+                    &raw mut code,
+                    &raw mut has_code,
                 )
             }
         } else {
@@ -146,9 +146,9 @@ fn fallible_file_calls_reject_null_handles_and_nonempty_null_buffers() -> Result
                     std::ptr::null_mut(),
                     byte.as_mut_ptr(),
                     1,
-                    &mut count,
-                    &mut code,
-                    &mut has_code,
+                    &raw mut count,
+                    &raw mut code,
+                    &raw mut has_code,
                 )
             }
         };
@@ -165,9 +165,9 @@ fn fallible_file_calls_reject_null_handles_and_nonempty_null_buffers() -> Result
                     file,
                     std::ptr::null(),
                     1,
-                    &mut count,
-                    &mut code,
-                    &mut has_code,
+                    &raw mut count,
+                    &raw mut code,
+                    &raw mut has_code,
                 )
             }
         } else {
@@ -176,9 +176,9 @@ fn fallible_file_calls_reject_null_handles_and_nonempty_null_buffers() -> Result
                     file,
                     std::ptr::null_mut(),
                     1,
-                    &mut count,
-                    &mut code,
-                    &mut has_code,
+                    &raw mut count,
+                    &raw mut code,
+                    &raw mut has_code,
                 )
             }
         };
@@ -219,9 +219,9 @@ fn fallible_file_calls_reject_oversized_lengths_before_io() -> Result<(), String
             file,
             byte.as_mut_ptr(),
             oversized,
-            &mut count,
-            &mut code,
-            &mut has_code,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
         )
     };
     expect_equal(
@@ -236,9 +236,9 @@ fn fallible_file_calls_reject_oversized_lengths_before_io() -> Result<(), String
             file,
             byte.as_mut_ptr(),
             1,
-            &mut count,
-            &mut code,
-            &mut has_code,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
         )
     };
     expect_equal(
@@ -253,9 +253,9 @@ fn fallible_file_calls_reject_oversized_lengths_before_io() -> Result<(), String
             file,
             b"X".as_ptr(),
             oversized,
-            &mut count,
-            &mut code,
-            &mut has_code,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
         )
     };
     vx_file_drop(file);
@@ -309,9 +309,9 @@ fn fallible_file_read_classifies_a_real_would_block_failure() -> Result<(), Stri
             file,
             byte.as_mut_ptr(),
             byte.len() as u64,
-            &mut count,
-            &mut code,
-            &mut has_code,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
         )
     };
     vx_file_drop(file);
@@ -331,8 +331,16 @@ fn fallible_file_transfer_reports_successful_byte_counts() -> Result<(), String>
     let mut count = 99;
     let mut code = 99;
     let mut has_code = true;
-    let written =
-        unsafe { vx_file_try_write(file, b"R".as_ptr(), 1, &mut count, &mut code, &mut has_code) };
+    let written = unsafe {
+        vx_file_try_write(
+            file,
+            b"R".as_ptr(),
+            1,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
+        )
+    };
     if written != 0 || count != 1 || code != 0 || has_code {
         vx_file_drop(file);
         return Err(format!(
@@ -347,9 +355,9 @@ fn fallible_file_transfer_reports_successful_byte_counts() -> Result<(), String>
             file,
             byte.as_mut_ptr(),
             1,
-            &mut count,
-            &mut code,
-            &mut has_code,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
         )
     };
     vx_file_drop(file);
@@ -374,9 +382,9 @@ fn fallible_file_read_accepts_uninitialized_writable_memory() -> Result<(), Stri
             file,
             byte.as_mut_ptr(),
             1,
-            &mut count,
-            &mut code,
-            &mut has_code,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
         )
     };
     vx_file_drop(file);
@@ -404,9 +412,9 @@ fn fallible_file_read_reports_a_short_success_before_eof() -> Result<(), String>
             file,
             buffer.as_mut_ptr(),
             buffer.len() as u64,
-            &mut count,
-            &mut code,
-            &mut has_code,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
         )
     };
     if (status, count, code, has_code, &buffer[..2]) != (0, 2, 0, false, &b"AB"[..]) {
@@ -422,9 +430,9 @@ fn fallible_file_read_reports_a_short_success_before_eof() -> Result<(), String>
             file,
             buffer.as_mut_ptr(),
             buffer.len() as u64,
-            &mut count,
-            &mut code,
-            &mut has_code,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
         )
     };
     vx_file_drop(file);
@@ -459,9 +467,9 @@ fn fallible_file_write_reports_a_short_success() -> Result<(), String> {
             file,
             buffer.as_ptr(),
             buffer.len() as u64,
-            &mut count,
-            &mut code,
-            &mut has_code,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
         )
     };
     vx_file_drop(file);
@@ -499,9 +507,9 @@ fn fallible_file_read_separates_eof_from_an_os_error() -> Result<(), String> {
             file,
             byte.as_mut_ptr(),
             1,
-            &mut count,
-            &mut code,
-            &mut has_code,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
         )
     };
     if eof != 0 || count != 0 || code != 0 || has_code {
@@ -516,9 +524,9 @@ fn fallible_file_read_separates_eof_from_an_os_error() -> Result<(), String> {
             file,
             std::ptr::null_mut(),
             0,
-            &mut count,
-            &mut code,
-            &mut has_code,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
         )
     };
     vx_file_drop(file);
@@ -550,9 +558,9 @@ fn fallible_file_read_separates_eof_from_an_os_error() -> Result<(), String> {
             file,
             byte.as_mut_ptr(),
             1,
-            &mut count,
-            &mut code,
-            &mut has_code,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
         )
     };
     vx_file_drop(file);
@@ -580,8 +588,16 @@ fn fallible_file_write_preserves_the_os_error() -> Result<(), String> {
     let mut count = 99;
     let mut code = 99;
     let mut has_code = true;
-    let failure =
-        unsafe { vx_file_try_write(file, b"W".as_ptr(), 1, &mut count, &mut code, &mut has_code) };
+    let failure = unsafe {
+        vx_file_try_write(
+            file,
+            b"W".as_ptr(),
+            1,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
+        )
+    };
     if failure != 12 || count != 0 || !has_code || Some(code) != expected.raw_os_error() {
         vx_file_drop(file);
         return Err(format!("write failure returned status {failure}, count {count}, native code {code}; expected kind {:?} and code {:?}", expected.kind(), expected.raw_os_error()));
@@ -592,9 +608,9 @@ fn fallible_file_write_preserves_the_os_error() -> Result<(), String> {
             file,
             std::ptr::null(),
             0,
-            &mut count,
-            &mut code,
-            &mut has_code,
+            &raw mut count,
+            &raw mut code,
+            &raw mut has_code,
         )
     };
     vx_file_drop(file);

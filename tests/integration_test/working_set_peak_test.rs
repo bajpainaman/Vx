@@ -305,7 +305,7 @@ fn the_working_set_is_the_peak_of_what_coexists() {
                 wrong.push(format!(
                     "{}: expected {} bytes over {} tile(s), got {} over {}\n{program}",
                     case.what, expected, case.tiles, bytes, tiles
-                ))
+                ));
             }
             Some(_) => {}
         }

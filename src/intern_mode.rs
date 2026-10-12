@@ -180,9 +180,12 @@ impl Drop for QuietGuard {
 /// instrumentation site reports 0.0 for the phase and attributes its time to nothing, silently.
 /// These make that a compile error instead.
 pub const CODEGEN_LOWER: &str = "  codegen:lower";
+/// The phase name for building the emit context and walking every function's signature.
 pub const CODEGEN_SETUP: &str = "  codegen:setup";
+/// The phase name for writing the MLIR text of every function.
 pub const CODEGEN_EMIT: &str = "  codegen:emit";
 
+/// Every phase name a compile can report a time for, in pipeline order.
 pub const PHASES: [&str; 22] = [
     "parse",
     "macro_expand",
@@ -236,12 +239,16 @@ pub fn timed<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
 /// — a stretch between two points inside a function whose value is produced later.
 pub fn record(name: &str, elapsed: std::time::Duration) {
     if let Some(i) = phase_index(name) {
-        PHASE_NANOS[i].fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        // A duration too long for 64 bits of nanoseconds (over 500 years) is counted as the most
+        // that fits.
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        PHASE_NANOS[i].fetch_add(nanos, Ordering::Relaxed);
     }
 }
 
 /// Drain the accumulated per-phase times, in pipeline order. Resets the counters, so successive
 /// calls report successive runs -- which is what a repetition-based harness wants.
+#[must_use]
 pub fn take_phases() -> Vec<(&'static str, std::time::Duration)> {
     PHASES
         .iter()
@@ -257,14 +264,24 @@ pub fn take_phases() -> Vec<(&'static str, std::time::Duration)> {
 /// run without scraping the human report.
 ///
 /// Its caller writes these to stderr, keeping stdout for the MLIR a compile prints.
+#[must_use]
 pub fn phases_csv() -> String {
+    use std::fmt::Write as _;
     take_phases()
         .into_iter()
-        .map(|(n, d)| format!("phase,{n},{:.4}\n", d.as_secs_f64() * 1e3))
-        .collect()
+        .fold(String::new(), |mut out, (n, d)| {
+            // Writing into a `String` cannot fail.
+            let _ = writeln!(out, "phase,{n},{:.4}", d.as_secs_f64() * 1e3);
+            out
+        })
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 

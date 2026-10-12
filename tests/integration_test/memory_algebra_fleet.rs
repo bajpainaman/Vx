@@ -95,7 +95,7 @@ fn bellman_ford(
             spaces.iter().filter_map(move |v| {
                 graph
                     .direct_edge_weight(u, v)
-                    .map(|w| (u.clone(), v.clone(), w as u64))
+                    .map(|w| (u.clone(), v.clone(), u64::from(w)))
             })
         })
         .collect();
@@ -150,10 +150,9 @@ fn fleet_routes_exist_iff_reachable_and_are_cost_minimal() {
                 match (&got, want) {
                     (Some((cost, route)), Some(best)) => {
                         assert_eq!(
-                            *cost as u64, best,
-                            "{path}: {:?} -> {:?}: router returned cost {cost}, but the cheapest \
-                             declared route costs {best}",
-                            src, dst
+                            u64::from(*cost), best,
+                            "{path}: {src:?} -> {dst:?}: router returned cost {cost}, but the cheapest \
+                             declared route costs {best}"
                         );
                         // The returned path must actually be the thing that costs that much.
                         assert_eq!(
@@ -165,30 +164,27 @@ fn fleet_routes_exist_iff_reachable_and_are_cost_minimal() {
                         let walked: u64 = route
                             .windows(2)
                             .map(|w| {
-                                graph.direct_edge_weight(&w[0], &w[1]).unwrap_or_else(|| {
+                                u64::from(graph.direct_edge_weight(&w[0], &w[1]).unwrap_or_else(|| {
                                     panic!(
                                         "{path}: route {:?} -> {:?} contains hop {:?} -> {:?}, \
                                          which is not a declared edge",
                                         src, dst, w[0], w[1]
                                     )
-                                }) as u64
+                                }))
                             })
                             .sum();
                         assert_eq!(
                             walked, best,
-                            "{path}: {:?} -> {:?}: the returned route walks to {walked} but was \
-                             reported as {best}",
-                            src, dst
+                            "{path}: {src:?} -> {dst:?}: the returned route walks to {walked} but was \
+                             reported as {best}"
                         );
                     }
                     (None, Some(best)) if src != dst => panic!(
-                        "{path}: {:?} -> {:?} is reachable at cost {best} but the router found no \
-                         route",
-                        src, dst
+                        "{path}: {src:?} -> {dst:?} is reachable at cost {best} but the router found no \
+                         route"
                     ),
                     (Some(_), None) => panic!(
-                        "{path}: {:?} -> {:?} has no declared route but the router synthesized one",
-                        src, dst
+                        "{path}: {src:?} -> {dst:?} has no declared route but the router synthesized one"
                     ),
                     _ => {}
                 }
@@ -199,9 +195,7 @@ fn fleet_routes_exist_iff_reachable_and_are_cost_minimal() {
                     assert_eq!(
                         graph.can_transfer(src, dst),
                         got.is_some(),
-                        "{path}: can_transfer and transfer_path disagree for {:?} -> {:?}",
-                        src,
-                        dst
+                        "{path}: can_transfer and transfer_path disagree for {src:?} -> {dst:?}"
                     );
                 }
             }
@@ -343,9 +337,7 @@ fn fleet_sibling_moves_meet_at_the_nearest_common_ancestor() {
                 assert_eq!(
                     Some(cost),
                     back,
-                    "{path}: {:?} -> {:?} and its reverse disagree",
-                    a,
-                    b
+                    "{path}: {a:?} -> {b:?} and its reverse disagree"
                 );
             }
         }
@@ -387,9 +379,8 @@ fn fleet_files_declare_reachable_hierarchies() {
                 });
             assert!(
                 reachable,
-                "{path}: memory space {:?} is unreachable from the host, so no program can place \
-                 anything in it",
-                space
+                "{path}: memory space {space:?} is unreachable from the host, so no program can place \
+                 anything in it"
             );
         }
 

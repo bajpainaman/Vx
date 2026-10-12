@@ -13,7 +13,7 @@
 //! normal case rather than the exceptional one: a truncated message, a length
 //! field longer than the bytes present, a rank that would index past a fixed
 //! array. Removing the rank bound turns the last of those into a
-//! stack-buffer-overflow that AddressSanitizer catches, which is why the check
+//! stack-buffer-overflow that `AddressSanitizer` catches, which is why the check
 //! is there and why this runs where a sanitizer can reach it.
 
 use std::path::PathBuf;

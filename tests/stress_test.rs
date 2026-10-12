@@ -17,13 +17,13 @@ fn test_stress_broad_ast_core_saturation() -> Result<(), String> {
     // To ensure the types exist, we will first create a basic type definition
     // or just use builtins. We will use `i32` builtins.
     for i in 0..num_functions {
-        let mut func = FunctionBuilder::new(&format!("compute_{}", i));
+        let mut func = FunctionBuilder::new(&format!("compute_{i}"));
         func.add_arg("a", "i32");
         func.add_arg("b", "i32");
         func.set_return_type("i32");
 
         // Return a * b + i
-        func.add_statement(&format!("return a * b + {};", i));
+        func.add_statement(&format!("return a * b + {i};"));
         module.add_function(func);
     }
 
@@ -40,7 +40,7 @@ fn test_stress_broad_ast_core_saturation() -> Result<(), String> {
     let mut parser = Parser::new(&tokens, &input);
     let mut ast = parser
         .parse()
-        .map_err(|e| format!("Failed to parse the massive AST: {:?}", e))?;
+        .map_err(|e| format!("Failed to parse the massive AST: {e:?}"))?;
     if ast.functions.len() != num_functions {
         return Err("Should have parsed 1000 functions".into());
     }
@@ -76,15 +76,15 @@ fn test_stress_deep_control_flow_nesting() -> Result<(), String> {
     let depth = 50;
 
     for i in 0..depth {
-        func.add_statement(&format!("let mut i_{} = 0;", i));
+        func.add_statement(&format!("let mut i_{i} = 0;"));
         func.add_statement("loop {");
-        func.add_statement(&format!("if i_{} == 2 {{ break; }}", i));
+        func.add_statement(&format!("if i_{i} == 2 {{ break; }}"));
     }
 
     func.add_statement("sum = sum + 1;");
 
     for i in (0..depth).rev() {
-        func.add_statement(&format!("i_{} = i_{} + 1;", i, i));
+        func.add_statement(&format!("i_{i} = i_{i} + 1;"));
         func.add_statement("}"); // Close loop
     }
 
@@ -102,7 +102,7 @@ fn test_stress_deep_control_flow_nesting() -> Result<(), String> {
     let mut parser = Parser::new(&tokens, &input);
     let mut ast = parser
         .parse()
-        .map_err(|e| format!("Failed to parse deeply nested control flow: {:?}", e))?;
+        .map_err(|e| format!("Failed to parse deeply nested control flow: {e:?}"))?;
 
     // 3. Semantic Analysis
     let global_session = std::sync::Arc::new(vxc::session::GlobalSession::new(1));
@@ -129,7 +129,7 @@ fn test_stress_massive_struct_definitions() -> Result<(), String> {
     let num_structs = 500;
 
     for i in 0..num_structs {
-        let mut st = StructBuilder::new(&format!("ModelLayer{}", i));
+        let mut st = StructBuilder::new(&format!("ModelLayer{i}"));
         st.add_field("weights", "Tensor<f32, [?, ?]>");
         st.add_field("bias", "Tensor<f32, [?, ?]>");
         module.add_struct(st);
@@ -141,9 +141,9 @@ fn test_stress_massive_struct_definitions() -> Result<(), String> {
     let mut parser = Parser::new(&tokens, &input);
     let ast = parser
         .parse()
-        .map_err(|e| format!("Failed to parse massive struct definitions: {:?}", e))?;
+        .map_err(|e| format!("Failed to parse massive struct definitions: {e:?}"))?;
     if ast.structs.len() != num_structs {
-        return Err(format!("Should have parsed {} structs", num_structs));
+        return Err(format!("Should have parsed {num_structs} structs"));
     }
     Ok(())
 }

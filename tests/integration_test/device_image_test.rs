@@ -264,7 +264,7 @@ fn a_user_supplied_lowering_is_emitted_instead_of_the_builtin_copy() {
 /// It used to be refused, and the refusal was right at the time: this path typed the SMEM
 /// tile as a dynamic memref (`?x?`), a dynamic shared tile cannot become a `.shared`
 /// global, and the image it produced carried shared-typed instructions against LOCAL
-/// storage -- measured on an A100 as CUDA_ERROR_ILLEGAL_ADDRESS. A3 fixed the cause
+/// storage -- measured on an A100 as `CUDA_ERROR_ILLEGAL_ADDRESS`. A3 fixed the cause
 /// rather than the symptom: when the source tensor's dims are literals, the transfer's
 /// result type is now static here too, so the alloca is static and promotes to real
 /// `.shared` storage exactly as on the flat path.

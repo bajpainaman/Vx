@@ -205,7 +205,7 @@ fn a_placed_tensor_can_be_read_home_from_a_worker() {
     let prog = tmp.join("readback.vx");
     std::fs::write(
         &prog,
-        r#"Memory CPU_DRAM {}
+        r"Memory CPU_DRAM {}
 Memory GPU_HBM {
   within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s, managed: cached
 }
@@ -230,7 +230,7 @@ fn main() -> i32 {
   print(home[0][0]);
   return 0;
 }
-"#,
+",
     )
     .expect("failed to write the program");
 
@@ -353,7 +353,7 @@ fn a_handoff_between_two_workers_moves_the_data() {
     let prog = tmp.join("handoff.vx");
     std::fs::write(
         &prog,
-        r#"Memory CPU_DRAM {}
+        r"Memory CPU_DRAM {}
 Memory HBM_A {
   within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s, managed: cached
 }
@@ -384,7 +384,7 @@ fn main() -> i32 {
   print(home[0][0]);
   return 0;
 }
-"#,
+",
     )
     .expect("failed to write the program");
 

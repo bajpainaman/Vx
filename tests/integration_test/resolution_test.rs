@@ -242,7 +242,7 @@ fn qualified_self_recursion_resolves_via_local_table() {
     }
 }
 
-/// Cross-module *mutual* recursion: A::Node references B::Other and vice-versa; each qualified
+/// Cross-module *mutual* recursion: `A::Node` references `B::Other` and vice-versa; each qualified
 /// reference resolves to its *defining* module's GID (no infinite loop — resolution never follows
 /// the definitions).
 #[test]

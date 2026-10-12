@@ -1,8 +1,13 @@
+/// Parses declarations: functions, structs, enums, traits, impl blocks and imports.
 pub mod decl;
+/// Parses expressions.
 pub mod expr;
+/// Expands macro calls into ordinary syntax.
 pub mod macro_expand;
+/// Parses statements.
 pub mod stmt;
 mod tuple_match;
+/// Parses types, topologies and memory spaces.
 pub mod types;
 pub use macro_expand::MacroExpander;
 
@@ -21,24 +26,46 @@ pub use macro_expand::MacroExpander;
 //
 //===----------------------------------------------------------------------===//
 use crate::lexer::{Token, TokenType};
-use crate::syntax::*;
+use crate::syntax::{
+    ArrayExpr, AsCastExpr, AssertStmt, AssignStmt, BinaryOp, BinaryOpExpr, BorrowExpr, BreakStmt,
+    ClosureExpr, CompoundAssignStmt, ComptimeBlockExpr, ContinueStmt, Delimiter, DereferenceExpr,
+    Dim, ElementType, EnumVariantExpr, Expr, ExprStmtStmt, ForLoopStmt, Function, FunctionCallExpr,
+    GradExpr, IdentifierExpr, IfExpr, IndexAccessExpr, IndirectCallExpr, JvpExpr, LetDeclStmt,
+    LogicalOp, LogicalOpExpr, LoopStmt, MacroCallExpr, MacroCallStmt, MatchArm, MatchExpr,
+    MemberAccessExpr, MemorySpace, MemorySpaceExpr, MethodCallExpr, NumberExpr, Pattern, Placement,
+    RangeExpr, RelationalOp, RelationalOpExpr, ReturnStmt, SizeOfExpr, Span, SpawnOnExpr,
+    Statement, StringLiteralExpr, StructInitExpr, TokenTree, Topology, TopologyExpr, TransferExpr,
+    TransferPredicateExpr, Type, UnaryOp, UnaryOpExpr, UnsafeBlockExpr, VjpExpr,
+};
 
+/// Why the parser could not read the program.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParserError<'a> {
+    /// The parser needed one kind of token and found another.
     UnexpectedToken {
+        /// A message that says what the parser needed here.
         expected: String,
+        /// The token that was in the program at this place.
         found: crate::lexer::Token<'a>,
     },
+    /// Any other error, with its own message.
     Custom {
+        /// What is wrong.
         message: String,
+        /// The token the error points at.
         token: crate::lexer::Token<'a>,
     },
+    /// The program ended while the parser still needed a token.
     EndOfFile {
+        /// A message that says what the parser needed here.
         expected: String,
     },
 }
 
-impl<'a> ParserError<'a> {
+impl ParserError<'_> {
+    /// The error as text for the user. `source` is the program text, used to show the line the
+    /// error is on.
+    #[must_use]
     pub fn format(&self, source: &str) -> String {
         match self {
             ParserError::UnexpectedToken { expected, found } => {
@@ -60,7 +87,7 @@ impl<'a> ParserError<'a> {
                 message,
             ),
             ParserError::EndOfFile { expected } => {
-                format!("Unexpected end of file. {}", expected)
+                format!("Unexpected end of file. {expected}")
             }
         }
     }
@@ -68,6 +95,7 @@ impl<'a> ParserError<'a> {
 
 pub(crate) type ParseResult<'a, T> = Result<T, ParserError<'a>>;
 
+/// Turns the tokens of one source file into its syntax tree.
 pub struct Parser<'a> {
     tokens: &'a [Token<'a>],
     pos: usize,
@@ -92,6 +120,12 @@ pub struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
+    /// Parse the text of one function. A leading `pub` is ignored.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `source` is not a function that parses.
+    #[must_use]
     pub fn parse_fn_from_str(source: &'a str) -> Function {
         let cleaned_source = source.trim().trim_start_matches("pub ");
         let mut lexer = crate::lexer::Lexer::new(cleaned_source);
@@ -102,6 +136,8 @@ impl<'a> Parser<'a> {
             .map_err(|e| e.format(cleaned_source))
             .expect("Failed to parse function source")
     }
+    /// A parser at the first of `tokens`. `source` is the text the tokens were read from.
+    #[must_use]
     pub fn new(tokens: &'a [Token<'a>], source: &'a str) -> Self {
         Self {
             tokens,
@@ -121,6 +157,10 @@ impl<'a> Parser<'a> {
     pub(crate) const MAX_TUPLE: usize = 6;
 
     /// The struct `(a, b, ..)` stands for: `Tuple2` for a pair, and so on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `arity` is less than 2 or more than `MAX_TUPLE`.
     pub(crate) fn tuple_struct(&mut self, arity: usize) -> ParseResult<'a, String> {
         if !(2..=Self::MAX_TUPLE).contains(&arity) {
             return Err(self.error(&format!(
@@ -133,6 +173,10 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse one statement onto `out`, with whatever a desugaring added before and after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the next tokens are not a statement.
     pub(crate) fn parse_statement_into(
         &mut self,
         out: &mut Vec<crate::syntax::Statement>,
@@ -145,10 +189,17 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// The next token, without consuming it.
     pub(crate) fn peek(&self) -> &'a Token<'a> {
         self.peek_n(0)
     }
 
+    /// The token `offset` places after the next one, without consuming it. Past the end of the
+    /// tokens this is the last token.
+    ///
+    /// # Panics
+    ///
+    /// Panics when there are no tokens at all. The lexer always ends with an end-of-file token.
     pub(crate) fn peek_n(&self, offset: usize) -> &'a Token<'a> {
         let index = self.pos + offset;
         if index < self.tokens.len() {
@@ -158,6 +209,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Consume the next token and return it. The last token is never consumed.
     pub(crate) fn advance(&mut self) -> &'a Token<'a> {
         let token = &self.tokens[self.pos];
         if self.pos < self.tokens.len() - 1 {
@@ -166,11 +218,12 @@ impl<'a> Parser<'a> {
         token
     }
 
+    /// Whether the next token is of this kind.
     pub(crate) fn check(&self, kind: &TokenType<'a>) -> bool {
         &self.peek().kind == kind
     }
 
-    #[allow(dead_code)]
+    /// Consume the next token when it is of this kind. Returns whether it was consumed.
     pub(crate) fn match_token(&mut self, kind: &TokenType<'a>) -> bool {
         if self.check(kind) {
             self.advance();
@@ -180,7 +233,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    #[allow(dead_code)]
+    /// Consume the next token, which must be of this kind, and return it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error with the message `msg` when the next token is of another kind or the
+    /// program has ended.
     pub(crate) fn consume(
         &mut self,
         kind: &TokenType<'a>,
@@ -200,6 +258,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// An error with the message `msg` that points at the next token.
     pub(crate) fn error(&self, msg: &str) -> ParserError<'a> {
         let token = self.peek();
         ParserError::Custom {
@@ -208,6 +267,11 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// An error with the message `msg` that points at `token`.
+    #[allow(
+        clippy::unused_self,
+        reason = "callers are in other files; they call this as a method, like `error`"
+    )]
     pub(crate) fn error_at(&self, token: &Token<'a>, msg: &str) -> ParserError<'a> {
         ParserError::Custom {
             message: msg.to_string(),
@@ -215,6 +279,11 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse one token, or one bracketed group of tokens with everything inside it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the program ends before a token, or before a group is closed.
     pub(crate) fn parse_token_tree(&mut self) -> ParseResult<'a, TokenTree> {
         let peek = self.peek();
         match &peek.kind {
@@ -255,6 +324,11 @@ impl<'a> Parser<'a> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
@@ -271,14 +345,14 @@ mod tests {
             .unwrap_err();
         match &err {
             ParserError::UnexpectedToken { expected, found } => {
-                assert!(expected.contains("("));
+                assert!(expected.contains('('));
                 assert_eq!(found.kind, crate::lexer::TokenTypeBase::Fn);
             }
-            _ => panic!("Expected UnexpectedToken error, got {:?}", err),
+            _ => panic!("Expected UnexpectedToken error, got {err:?}"),
         }
 
         let formatted = err.format(input);
-        assert!(formatted.contains("("));
+        assert!(formatted.contains('('));
         assert!(formatted.contains("fn foo +"));
     }
 
@@ -294,14 +368,14 @@ mod tests {
             .unwrap_err();
         match &err {
             ParserError::EndOfFile { expected } => {
-                assert!(expected.contains("("));
+                assert!(expected.contains('('));
             }
-            _ => panic!("Expected EndOfFile error, got {:?}", err),
+            _ => panic!("Expected EndOfFile error, got {err:?}"),
         }
 
         let formatted = err.format(input);
         assert!(formatted.contains("Unexpected end of file"));
-        assert!(formatted.contains("("));
+        assert!(formatted.contains('('));
     }
 
     fn parse_type(input: &str) -> crate::syntax::Type {
@@ -653,7 +727,7 @@ mod tests {
                 panic!("Expected Number expression in NPU index");
             }
         } else {
-            panic!("Expected NPU topology, got {:?}", top);
+            panic!("Expected NPU topology, got {top:?}");
         }
     }
 
@@ -667,7 +741,7 @@ mod tests {
                 panic!("Expected Number expression in AccCore index");
             }
         } else {
-            panic!("Expected AccCore topology, got {:?}", top);
+            panic!("Expected AccCore topology, got {top:?}");
         }
     }
 
@@ -690,7 +764,7 @@ mod tests {
         let mut parser = Parser::new(&tokens, input);
         let err = parser.parse_topology().unwrap_err();
         let msg = err.format(input);
-        assert!(msg.contains("Expected index for NPU"), "Got: {}", msg);
+        assert!(msg.contains("Expected index for NPU"), "Got: {msg}");
     }
 
     #[test]
@@ -767,7 +841,7 @@ mod tests {
             assert_eq!(*inner, Type::Scalar(ElementType::I32));
             assert_eq!(top, Topology::gpu(0));
         } else {
-            panic!("Expected Pinned type, got {:?}", ty);
+            panic!("Expected Pinned type, got {ty:?}");
         }
     }
 
@@ -778,7 +852,7 @@ mod tests {
             assert_eq!(*inner, Type::Scalar(ElementType::F32));
             assert_eq!(mem, MemorySpace::NPUHBM);
         } else {
-            panic!("Expected Ref type, got {:?}", ty);
+            panic!("Expected Ref type, got {ty:?}");
         }
     }
 
@@ -792,15 +866,15 @@ mod tests {
             if let Expr::Number(n) = *start {
                 assert_eq!(n.value, "0".into());
             } else {
-                panic!("Expected Number for slice start, got {:?}", start);
+                panic!("Expected Number for slice start, got {start:?}");
             }
             if let Expr::Number(n) = *end {
                 assert_eq!(n.value, "4".into());
             } else {
-                panic!("Expected Number for slice end, got {:?}", end);
+                panic!("Expected Number for slice end, got {end:?}");
             }
         } else {
-            panic!("Expected Topology::Slice, got {:?}", top);
+            panic!("Expected Topology::Slice, got {top:?}");
         }
     }
 }

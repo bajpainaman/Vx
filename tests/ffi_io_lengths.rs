@@ -5,8 +5,18 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-// Exercise the same FFI macros that the Rust core uses.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+//! Checks that the standard stream, TCP and UDP FFI calls reject bad lengths and null
+//! pointers, and still move bytes when the arguments are valid.
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "these tests expand the same raw-pointer FFI macros as the runtime library"
+)]
+#![allow(unsafe_code, reason = "these tests call the C ABI the runtime exports")]
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 
 include!("../stdlib/rust_core/src/ffi/macros.rs");
 
@@ -25,6 +35,9 @@ macro_rules! check_eq {
 }
 
 mod stdio {
+    // The expanded functions call `buffer_len`, which the include above puts at the crate root.
+    use super::buffer_len;
+
     instantiate_stdio_ffi!();
 
     #[test]
@@ -47,6 +60,8 @@ mod stdio {
 }
 
 mod tcp {
+    use super::buffer_len;
+
     instantiate_tcp_stream_ffi!();
 
     #[test]
@@ -85,6 +100,8 @@ mod tcp {
 }
 
 mod udp {
+    use super::buffer_len;
+
     instantiate_udp_socket_ffi!();
 
     #[test]

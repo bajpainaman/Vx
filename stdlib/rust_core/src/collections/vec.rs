@@ -41,8 +41,10 @@ instantiate_vec_ffi!(f64, f64);
 const VX_VEC_ALIGN: usize = 16;
 
 /// Build the allocation `Layout` for `bytes` at the fixed vector alignment.
-/// Panics (aborts the process) if the size overflows the address space — the
-/// same failure the hand-rolled Vx code would have hit as silent UB.
+///
+/// # Panics
+/// Panics if the size overflows the address space — the same failure the
+/// hand-rolled Vx code would have hit as silent UB.
 #[inline]
 fn vx_vec_layout(bytes: usize) -> Layout {
     Layout::from_size_align(bytes, VX_VEC_ALIGN)
@@ -52,6 +54,9 @@ fn vx_vec_layout(bytes: usize) -> Layout {
 /// Convert an element count / element size pair coming across the C ABI (as
 /// `i64`, since that is what Vx's `sizeof<T>()` yields) into a byte count,
 /// rejecting negatives and multiplication overflow deterministically.
+///
+/// # Panics
+/// Panics if either number is negative or if their product overflows `usize`.
 #[inline]
 fn vx_vec_bytes(cap: i64, elem_size: i64) -> usize {
     let cap = usize::try_from(cap).expect("vx_vec: negative capacity");
@@ -64,12 +69,17 @@ fn vx_vec_bytes(cap: i64, elem_size: i64) -> usize {
 ///
 /// Returns null for a zero-byte request; `vx_vec_grow`/`vx_vec_free` treat null
 /// as "no live allocation", so an empty `Vec` never owns memory.
+///
+/// # Panics
+/// Panics if `cap` or `elem_size` is negative, if the size in bytes overflows, or
+/// if the allocation fails.
 #[no_mangle]
 pub extern "C" fn vx_vec_alloc(elem_size: i64, cap: i64) -> *mut u8 {
     let bytes = vx_vec_bytes(cap, elem_size);
     if bytes == 0 {
         return std::ptr::null_mut();
     }
+    // SAFETY: `bytes` is not zero here, which is all `alloc` asks of the layout.
     let ptr = unsafe { alloc(vx_vec_layout(bytes)) };
     assert!(!ptr.is_null(), "vx_vec: allocation of {bytes} bytes failed");
     ptr
@@ -82,6 +92,10 @@ pub extern "C" fn vx_vec_alloc(elem_size: i64, cap: i64) -> *mut u8 {
 /// `ptr`/`old_cap` must describe the buffer's current allocation (as produced by
 /// a previous `vx_vec_alloc`/`vx_vec_grow`); a null `ptr` or non-positive
 /// `old_cap` is treated as a fresh allocation.
+///
+/// # Panics
+/// Panics if a capacity or `elem_size` is negative, if a size in bytes overflows,
+/// or if the allocation fails.
 #[no_mangle]
 pub extern "C" fn vx_vec_grow(ptr: *mut u8, old_cap: i64, new_cap: i64, elem_size: i64) -> *mut u8 {
     let new_bytes = vx_vec_bytes(new_cap, elem_size);
@@ -89,9 +103,12 @@ pub extern "C" fn vx_vec_grow(ptr: *mut u8, old_cap: i64, new_cap: i64, elem_siz
         return ptr;
     }
     let new_ptr = if ptr.is_null() || old_cap <= 0 {
+        // SAFETY: `new_bytes` is not zero here, which is all `alloc` asks of the layout.
         unsafe { alloc(vx_vec_layout(new_bytes)) }
     } else {
         let old_bytes = vx_vec_bytes(old_cap, elem_size);
+        // SAFETY: the caller passes the buffer and the capacity it was allocated with, so
+        // the old layout matches, and `new_bytes` is not zero.
         unsafe { realloc(ptr, vx_vec_layout(old_bytes), new_bytes) }
     };
     assert!(
@@ -111,6 +128,8 @@ pub extern "C" fn vx_vec_free(ptr: *mut u8, cap: i64, elem_size: i64) -> i32 {
     }
     let bytes = vx_vec_bytes(cap, elem_size);
     if bytes > 0 {
+        // SAFETY: the caller passes the buffer and the capacity it was allocated with, so
+        // the layout matches the one used to allocate it.
         unsafe { dealloc(ptr, vx_vec_layout(bytes)) };
     }
     0
@@ -130,6 +149,11 @@ pub extern "C" fn vx_vec_bounds_check(index: i64, len: i64) -> i32 {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 
@@ -165,8 +189,12 @@ mod tests {
     /// Exercise the full alloc → grow → typed store/load → free cycle the Vx
     /// `Vec<i32>` performs, and confirm the buffer is usable and 16-aligned.
     #[test]
+    #[allow(
+        clippy::cast_ptr_alignment,
+        reason = "the allocator returns 16-byte aligned buffers, and the test asserts it"
+    )]
     fn byte_alloc_grow_and_store_i32() {
-        let elem = std::mem::size_of::<i32>() as i64;
+        let elem = i64::try_from(std::mem::size_of::<i32>()).unwrap();
 
         // with_capacity(2)
         let mut cap: i64 = 2;
@@ -176,7 +204,7 @@ mod tests {
 
         // Fill and grow the way push() does, checking data survives realloc.
         for i in 0..10i32 {
-            let len = i as i64;
+            let len = i64::from(i);
             if len == cap {
                 let new_cap = cap * 2;
                 data = vx_vec_grow(data, cap, new_cap, elem);
@@ -184,10 +212,12 @@ mod tests {
                 assert_eq!(data as usize % VX_VEC_ALIGN, 0);
                 cap = new_cap;
             }
-            unsafe { *(data as *mut i32).offset(i as isize) = i * 7 };
+            // SAFETY: `i` is below `cap`, so the element is inside the buffer.
+            unsafe { *data.cast::<i32>().offset(i as isize) = i * 7 };
         }
         for i in 0..10i32 {
-            let got = unsafe { *(data as *const i32).offset(i as isize) };
+            // SAFETY: the loop above wrote all ten elements, so this one is initialized.
+            let got = unsafe { *data.cast::<i32>().offset(i as isize) };
             assert_eq!(got, i * 7);
         }
         assert_eq!(vx_vec_free(data, cap, elem), 0);
@@ -197,7 +227,7 @@ mod tests {
     /// behave like a fresh allocation.
     #[test]
     fn byte_alloc_zero_capacity_is_null() {
-        let elem = std::mem::size_of::<f64>() as i64;
+        let elem = i64::try_from(std::mem::size_of::<f64>()).unwrap();
         let empty = vx_vec_alloc(elem, 0);
         assert!(empty.is_null());
         // free of null / zero-cap is a no-op.

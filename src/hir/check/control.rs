@@ -13,9 +13,42 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::{
+    decl, ArrayExpr, ComptimeBlockExpr, ElementType, Expr, ExprStmtStmt, IdentifierExpr,
+    LetDeclStmt, MatchExpr, MemberAccessExpr, NumberExpr, Pattern, RangeExpr, ReturnStmt, Span,
+    Statement, StringLiteralExpr, StructInitExpr, Type, TypeChecker, UnsafeBlockExpr, Value,
+};
 use crate::hir::check_state::ComptimeEvalFlow;
+use crate::syntax::expr::{ClosureExpr, IfExpr, MatchArm};
 use std::collections::HashMap;
+
+/// The value a `match` looks at, and how the `match` itself is used.
+struct MatchedValue<'a> {
+    /// The expression being matched.
+    expr: &'a Expr,
+    /// Its type.
+    ty: &'a Type,
+    /// Whether it is a variable or what a reference points at, which matching only reads.
+    place: bool,
+    /// Whether nothing uses the value of the `match`.
+    unused: bool,
+    /// Whether the value of each arm is moved out of it.
+    consume: bool,
+}
+
+/// What the arms of a `match` checked so far have shown.
+struct ArmsSeen {
+    /// The type of the first arm that ends in a value.
+    match_ty: Option<Type>,
+    /// The enum variants the arms name.
+    covered: Vec<crate::symbol::Symbol>,
+    /// Whether an arm matches every value: `_`, or a name.
+    has_wildcard: bool,
+    /// The moved variables at the end of the arms that reach the code after the `match`.
+    joined: Option<Vec<std::collections::HashSet<String>>>,
+    /// Whether every arm leaves early, so the code after the `match` is never reached.
+    every_arm_ends: bool,
+}
 
 /// What running a `comptime` block produced.
 enum ComptimeFold {
@@ -28,7 +61,7 @@ enum ComptimeFold {
     Refused,
 }
 
-impl<'a> TypeChecker<'a> {
+impl TypeChecker<'_> {
     /// The constant environment as one map, the innermost scope winning.
     pub(crate) fn consteval_snapshot(&self) -> HashMap<crate::symbol::Symbol, Value> {
         let mut env = HashMap::new();
@@ -57,7 +90,7 @@ impl<'a> TypeChecker<'a> {
         // At the block's last expression; at the `comptime` keyword when there is none, or when
         // it has no position of its own, as a number literal does.
         let span = ret
-            .map(|r| r.span())
+            .map(crate::syntax::expr::Expr::span)
             .filter(|span| *span != Span::default())
             .unwrap_or(block_span);
 
@@ -65,9 +98,8 @@ impl<'a> TypeChecker<'a> {
         if let Some(name) = interpretation.escaping_write {
             self.report_comptime_block_failure(
                 &format!(
-                    "it writes to '{}', which is declared outside it -- the block disappears, \
-                     so the write would have to disappear with it",
-                    name
+                    "it writes to '{name}', which is declared outside it -- the block disappears, \
+                     so the write would have to disappear with it"
                 ),
                 &span,
             );
@@ -129,15 +161,14 @@ impl<'a> TypeChecker<'a> {
             self.report_comptime_block_failure("its value cannot be worked out", span);
             return ComptimeFold::Refused;
         };
-        match Self::value_to_expr(&value, span) {
-            Some(expr) => ComptimeFold::Folded(Box::new(expr)),
-            None => {
-                self.report_comptime_block_failure(
-                    "its value is not one that can be written as a constant",
-                    span,
-                );
-                ComptimeFold::Refused
-            }
+        if let Some(expr) = Self::value_to_expr(&value, span) {
+            ComptimeFold::Folded(Box::new(expr))
+        } else {
+            self.report_comptime_block_failure(
+                "its value is not one that can be written as a constant",
+                span,
+            );
+            ComptimeFold::Refused
         }
     }
 
@@ -149,7 +180,7 @@ impl<'a> TypeChecker<'a> {
         }
         self.errors.error_with_code(
             crate::diagnostic::DiagnosticCode::E3033,
-            format!("this `comptime` block cannot be evaluated: {}", why),
+            format!("this `comptime` block cannot be evaluated: {why}"),
             Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
         );
     }
@@ -207,6 +238,12 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Type check a `comptime` block, run it, and replace it with the value it worked out.
+    /// Returns the type of that value.
+    ///
+    /// # Panics
+    ///
+    /// If `expr` is not a `comptime` block.
     pub(crate) fn check_comptimeblock_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
         let unused = std::mem::replace(&mut self.value_unused, false);
         match expr {
@@ -265,7 +302,7 @@ impl<'a> TypeChecker<'a> {
                                 n.ty = Some(elem.clone());
                             }
                         }
-                        *expr = *value
+                        *expr = *value;
                     }
                     // It ran and produced nothing, so nothing is left to emit.
                     ComptimeFold::NoValue => {
@@ -273,7 +310,7 @@ impl<'a> TypeChecker<'a> {
                             stmts: Vec::new(),
                             ret: None,
                             span: block_span,
-                        })
+                        });
                     }
                     // Left as written: either the error above stops the build, or this is a
                     // closure body, which folds at its call rather than here.
@@ -282,7 +319,7 @@ impl<'a> TypeChecker<'a> {
                 ret_ty
             }
 
-            _ => panic!("Expected IndexAccess, got {:?}", expr),
+            _ => panic!("Expected IndexAccess, got {expr:?}"),
         }
     }
 
@@ -341,45 +378,23 @@ impl<'a> TypeChecker<'a> {
         })
     }
 
-    pub(crate) fn check_if_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
-        let unused = std::mem::replace(&mut self.value_unused, false);
-        let if_expr = match expr {
-            Expr::If(e) => e,
-            _ => panic!("Expected IndexAccess, got {:?}", expr),
-        };
-
-        let cond_ty = self.check_expr_type(&mut if_expr.cond);
-        if cond_ty != Type::Scalar(ElementType::Bool) {
-            self.errors
-                .push("Condition in if expression must be of type bool (i1)".to_string());
-        }
-
-        if if_expr.is_comptime {
-            let tmp_env = self.consteval_snapshot();
-            if let Some(Value::Bool(b)) = self.eval_expr(&if_expr.cond, &tmp_env) {
-                if b {
-                    if_expr.else_block = None;
-                } else {
-                    if_expr.then_block.clear();
-                }
+    /// Decide a `comptime if` while compiling: only the branch its condition selects is kept.
+    fn fold_comptime_if(&mut self, if_expr: &mut IfExpr) {
+        let tmp_env = self.consteval_snapshot();
+        if let Some(Value::Bool(b)) = self.eval_expr(&if_expr.cond, &tmp_env) {
+            if b {
+                if_expr.else_block = None;
             } else {
-                self.errors
-                    .push("Cannot statically evaluate comptime if condition".to_string());
+                if_expr.then_block.clear();
             }
+        } else {
+            self.errors
+                .push("Cannot statically evaluate comptime if condition".to_string());
         }
+    }
 
-        // Each branch starts from the moves made before the `if`. Afterwards a variable is
-        // moved if a branch that reaches the code after the `if` moved it; a branch that
-        // returns or breaks does not count.
-        let marks_before = self.moved_snapshot();
-        // The prover's facts follow the paths: the `then` branch knows the condition and the
-        // `else` branch its negation, and what a branch learns ends with it.
-        let facts_before = self.consteval.constraints.len();
-        let cond_fact = (!if_expr.is_comptime && crate::hir::prover::is_modelled(&if_expr.cond))
-            .then(|| (*if_expr.cond).clone());
-        if let Some(c) = &cond_fact {
-            self.consteval.constraints.push(c.clone());
-        }
+    /// Type check the `then` branch of an `if`, in a scope of its own. Returns its type.
+    fn check_then_branch(&mut self, if_expr: &mut IfExpr, unused: bool, consume: bool) -> Type {
         self.push_releasing_scope();
         let mut then_ty = Type::Struct("void".into(), None);
         if !self.speculating && !if_expr.then_block.is_empty() {
@@ -387,60 +402,72 @@ impl<'a> TypeChecker<'a> {
             then_ty = self.check_expr_block(&mut if_expr.then_block, None, consume);
         }
         self.pop_scope();
-        let then_facts = self.consteval.constraints.split_off(facts_before);
-        if let Some(c) = &cond_fact {
-            self.consteval
-                .constraints
-                .push(crate::hir::prover::negate(c));
-        }
-        let marks_after_then = self.branch_end(&if_expr.then_block);
-        self.restore_moved(marks_before.clone());
-        let mut marks_after_else = Some(marks_before.clone());
+        then_ty
+    }
 
+    /// Type check a non-empty `else` branch, in a scope of its own. Returns its type, and the
+    /// moves at its end as [`Self::branch_end`] gives them.
+    fn check_else_branch(
+        &mut self,
+        else_b: &mut Vec<Statement>,
+        unused: bool,
+        consume: bool,
+    ) -> (Type, Option<Vec<std::collections::HashSet<String>>>) {
         let mut else_ty = Type::Struct("void".into(), None);
-        if let Some(else_b) = if_expr.else_block.as_mut() {
-            if !else_b.is_empty() {
-                self.push_releasing_scope();
-                if !self.speculating {
-                    self.value_unused = unused;
-                    else_ty = self.check_expr_block(else_b, None, consume);
-                }
-                self.pop_scope();
-                marks_after_else = self.branch_end(else_b);
-
-                // A branch that never finishes, `todo()`, has no value: the other branch decides.
-                if crate::syntax::is_never_ty(&then_ty) {
-                    then_ty = else_ty.clone();
-                } else if crate::syntax::is_never_ty(&else_ty) {
-                    else_ty = then_ty.clone();
-                }
-                if !if_expr.is_comptime && then_ty != else_ty {
-                    self.errors.error_with_code(
-                        crate::diagnostic::DiagnosticCode::E3007,
-                        format!(
-                            "If expression branches have incompatible types: {:?} and {:?}",
-                            then_ty, else_ty
-                        ),
-                        Some(crate::diagnostic::SourceSpan::from_ast_span(&if_expr.span)),
-                    );
-                }
-            }
-        } else if !if_expr.is_comptime {
-            // After the error the `if` keeps its `then` branch's type, so that one mistake
-            // gives one error.
-            if !unused {
-                self.errors.error_with_code(
-                    crate::diagnostic::DiagnosticCode::E3048,
-                    "this `if` has no `else`, so it has no value when its condition is false; \
-                     add an `else`, or use the `if` as a statement"
-                        .to_string(),
-                    Some(crate::diagnostic::SourceSpan::from_ast_span(&if_expr.span)),
-                );
-            } else {
-                then_ty = Type::Struct("void".into(), None);
-            }
+        self.push_releasing_scope();
+        if !self.speculating {
+            self.value_unused = unused;
+            else_ty = self.check_expr_block(else_b, None, consume);
         }
-        let else_facts = self.consteval.constraints.split_off(facts_before);
+        self.pop_scope();
+        let marks_after_else = self.branch_end(else_b);
+        (else_ty, marks_after_else)
+    }
+
+    /// Make the two branches of an `if` agree on one type, and report an error when they
+    /// cannot.
+    fn reconcile_branch_types(&mut self, if_expr: &IfExpr, then_ty: &mut Type, else_ty: &mut Type) {
+        // A branch that never finishes, `todo()`, has no value: the other branch decides.
+        if crate::syntax::is_never_ty(then_ty) {
+            *then_ty = else_ty.clone();
+        } else if crate::syntax::is_never_ty(else_ty) {
+            *else_ty = then_ty.clone();
+        }
+        if !if_expr.is_comptime && then_ty != else_ty {
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E3007,
+                format!(
+                    "If expression branches have incompatible types: {then_ty:?} and {else_ty:?}"
+                ),
+                Some(crate::diagnostic::SourceSpan::from_ast_span(&if_expr.span)),
+            );
+        }
+    }
+
+    /// An `if` with no `else`: it has no value, which is an error unless nothing uses the value.
+    fn check_if_without_else(&mut self, if_expr: &IfExpr, unused: bool, then_ty: &mut Type) {
+        // After the error the `if` keeps its `then` branch's type, so that one mistake
+        // gives one error.
+        if unused {
+            *then_ty = Type::Struct("void".into(), None);
+        } else {
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E3048,
+                "this `if` has no `else`, so it has no value when its condition is false; \
+                 add an `else`, or use the `if` as a statement"
+                    .to_string(),
+                Some(crate::diagnostic::SourceSpan::from_ast_span(&if_expr.span)),
+            );
+        }
+    }
+
+    /// Keep, for the code after an `if`, the facts the prover may still use there.
+    fn keep_facts_after_if(
+        &mut self,
+        if_expr: &IfExpr,
+        then_facts: Vec<Expr>,
+        else_facts: Vec<Expr>,
+    ) {
         // When one branch ends early, the code after the `if` is reached only through the other,
         // so what that branch knew at its end still holds. When both end early, it is not reached.
         let then_ends = self.branch_ends_early(&if_expr.then_block);
@@ -457,6 +484,64 @@ impl<'a> TypeChecker<'a> {
                 .push(crate::hir::prover::unreachable_fact()),
             (false, false) => {}
         }
+    }
+
+    /// Type check an `if`: its condition, both branches, and which variables are moved after
+    /// it. Returns the type of the value the `if` produces.
+    ///
+    /// # Panics
+    ///
+    /// If `expr` is not an `if`.
+    pub(crate) fn check_if_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
+        let unused = std::mem::replace(&mut self.value_unused, false);
+        let Expr::If(if_expr) = expr else {
+            panic!("Expected IndexAccess, got {expr:?}");
+        };
+
+        let cond_ty = self.check_expr_type(&mut if_expr.cond);
+        if cond_ty != Type::Scalar(ElementType::Bool) {
+            self.errors
+                .push("Condition in if expression must be of type bool (i1)".to_string());
+        }
+
+        if if_expr.is_comptime {
+            self.fold_comptime_if(if_expr);
+        }
+
+        // Each branch starts from the moves made before the `if`. Afterwards a variable is
+        // moved if a branch that reaches the code after the `if` moved it; a branch that
+        // returns or breaks does not count.
+        let marks_before = self.moved_snapshot();
+        // The prover's facts follow the paths: the `then` branch knows the condition and the
+        // `else` branch its negation, and what a branch learns ends with it.
+        let facts_before = self.consteval.constraints.len();
+        let cond_fact = (!if_expr.is_comptime && crate::hir::prover::is_modelled(&if_expr.cond))
+            .then(|| (*if_expr.cond).clone());
+        if let Some(c) = &cond_fact {
+            self.consteval.constraints.push(c.clone());
+        }
+        let mut then_ty = self.check_then_branch(if_expr, unused, consume);
+        let then_facts = self.consteval.constraints.split_off(facts_before);
+        if let Some(c) = &cond_fact {
+            self.consteval
+                .constraints
+                .push(crate::hir::prover::negate(c));
+        }
+        let marks_after_then = self.branch_end(&if_expr.then_block);
+        self.restore_moved(marks_before.clone());
+        let mut marks_after_else = Some(marks_before.clone());
+
+        let mut else_ty = Type::Struct("void".into(), None);
+        if let Some(else_b) = if_expr.else_block.as_mut() {
+            if !else_b.is_empty() {
+                (else_ty, marks_after_else) = self.check_else_branch(else_b, unused, consume);
+                self.reconcile_branch_types(if_expr, &mut then_ty, &mut else_ty);
+            }
+        } else if !if_expr.is_comptime {
+            self.check_if_without_else(if_expr, unused, &mut then_ty);
+        }
+        let else_facts = self.consteval.constraints.split_off(facts_before);
+        self.keep_facts_after_if(if_expr, then_facts, else_facts);
         let joined = match (marks_after_then, marks_after_else) {
             (Some(a), Some(b)) => Self::union_moved(a, b),
             (Some(a), None) | (None, Some(a)) => a,
@@ -468,14 +553,18 @@ impl<'a> TypeChecker<'a> {
         if if_expr.is_comptime {
             if if_expr.then_block.is_empty() {
                 return else_ty;
-            } else {
-                return then_ty;
             }
+            return then_ty;
         }
 
         then_ty
     }
 
+    /// Type check an `unsafe` block. Returns the type of the value it produces.
+    ///
+    /// # Panics
+    ///
+    /// If `expr` is not an `unsafe` block.
     pub(crate) fn check_unsafeblock_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
         let unused = std::mem::replace(&mut self.value_unused, false);
         match expr {
@@ -516,10 +605,15 @@ impl<'a> TypeChecker<'a> {
                 self.in_unsafe_block = prev_unsafe;
                 ret_ty
             }
-            _ => panic!("Expected IndexAccess, got {:?}", expr),
+            _ => panic!("Expected IndexAccess, got {expr:?}"),
         }
     }
 
+    /// Type check a range such as `0..n`. Returns the type of its two ends.
+    ///
+    /// # Panics
+    ///
+    /// If `expr` is not a range.
     pub(crate) fn check_range_expr(&mut self, expr: &mut Expr) -> Type {
         match expr {
             Expr::Range(RangeExpr {
@@ -532,13 +626,12 @@ impl<'a> TypeChecker<'a> {
                 let (start_ty, end_ty) = self.check_operand_pair(start, end, true);
                 if start_ty != end_ty {
                     self.errors.push(format!(
-                        "Range start and end types must match, got {:?} and {:?}",
-                        start_ty, end_ty
+                        "Range start and end types must match, got {start_ty:?} and {end_ty:?}"
                     ));
                 }
                 start_ty
             }
-            _ => panic!("Expected IndexAccess, got {:?}", expr),
+            _ => panic!("Expected IndexAccess, got {expr:?}"),
         }
     }
 
@@ -575,9 +668,8 @@ impl<'a> TypeChecker<'a> {
         let Pattern::Literal(Expr::Number(n)) = pattern else {
             return;
         };
-        let elem = match expr_ty {
-            Type::Scalar(e) => e,
-            _ => return,
+        let Type::Scalar(elem) = expr_ty else {
+            return;
         };
         if elem.accepts_integer_literal(n.value.as_ref()) == Some(false) {
             self.errors.error_with_code(
@@ -684,6 +776,122 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Type check one arm of a `match`, and add what it shows to `seen`.
+    fn check_match_arm(&mut self, arm: &mut MatchArm, on: &MatchedValue<'_>, seen: &mut ArmsSeen) {
+        match &arm.pattern {
+            Pattern::Wildcard | Pattern::Identifier(_) => seen.has_wildcard = true,
+            Pattern::EnumVariant(_, variant, _) => seen.covered.push(variant.clone()),
+            Pattern::Literal(_) => {}
+        }
+        // `_ => {}` and an empty enum variant arm are there to make the match cover
+        // every case, so they stay quiet. Every arm the compiler writes is one of them.
+        if arm.body.is_empty()
+            && !matches!(arm.pattern, Pattern::Wildcard | Pattern::EnumVariant(..))
+            && !self.speculating
+        {
+            self.errors.warn(
+                crate::diagnostic::DiagnosticCode::W1008,
+                "this match arm's body is empty, so this case does nothing",
+                Some(crate::diagnostic::SourceSpan::from_ast_span(&arm.span)),
+            );
+        }
+        self.push_scope();
+        self.check_literal_pattern_range(&arm.pattern, on.ty);
+        self.bind_pattern_variables(&arm.pattern, on.ty);
+        if on.place && !self.speculating && self.pattern_moves(&arm.pattern) {
+            // Moved before the arm's own names exist, which may hide it.
+            self.pop_scope();
+            self.match_moves(on.expr);
+            self.push_scope();
+            self.bind_pattern_variables(&arm.pattern, on.ty);
+        }
+
+        let arm_ty = if self.speculating {
+            Type::Struct("void".into(), None)
+        } else {
+            self.value_unused = on.unused;
+            self.check_expr_block(&mut arm.body, None, on.consume)
+        };
+        self.pop_scope();
+        seen.every_arm_ends &= self.branch_ends_early(&arm.body);
+        if let Some(after) = self.branch_end(&arm.body) {
+            seen.joined = Some(match seen.joined.take() {
+                Some(j) => Self::union_moved(j, after),
+                None => after,
+            });
+        }
+
+        // An arm contributes to the match's value type only if its block
+        // ends in a tail expression (a non-semicolon `ExprStmt`). Arms that
+        // end in `return`/`break`/`continue`, or in a statement like `assert`,
+        // diverge or yield unit and do not constrain the match value — this is
+        // what lets `Option::unwrap` (Some arm `return v`, None arm asserts)
+        // type-check as `-> T`.
+        let yields_value = matches!(
+            arm.body.last(),
+            Some(Statement::ExprStmt(ExprStmtStmt {
+                has_semi: false,
+                ..
+            }))
+        );
+        if yields_value && seen.match_ty.is_none() {
+            seen.match_ty = Some(arm_ty);
+        }
+    }
+
+    /// Report a `match` with no arm that matches every value, when it leaves a value uncovered.
+    ///
+    /// An enum scrutinee can be enumerated, so a missing variant is a fact
+    /// about the match wherever it sits: the uncovered value falls through, and if
+    /// every written arm returns, the function falls off its end carrying whatever
+    /// was in the return slot. A scrutinee that cannot be enumerated has no such
+    /// fact, so asking it for a wildcard stays limited to value position, where the
+    /// fall-through edge would otherwise have no value to carry.
+    fn report_uncovered_match(
+        &mut self,
+        expr_ty: &Type,
+        covered: &[crate::symbol::Symbol],
+        produces_value: bool,
+    ) {
+        match self.enum_variants_of(expr_ty) {
+            Some(all) => {
+                let missing: Vec<String> = all
+                    .iter()
+                    .filter(|v| !covered.contains(v))
+                    .map(std::string::ToString::to_string)
+                    .collect();
+                if !missing.is_empty() {
+                    self.errors.error_with_code(
+                        crate::diagnostic::DiagnosticCode::E3020,
+                        format!(
+                            "this `match` does not cover {}; add an arm for each, \
+                             or a `_` arm",
+                            missing.join(", ")
+                        ),
+                        None,
+                    );
+                }
+            }
+            None => {
+                if produces_value {
+                    self.errors.error_with_code(
+                        crate::diagnostic::DiagnosticCode::E3020,
+                        "this `match` produces a value but has no arm matching every \
+                         value; add a `_` arm so every path yields one"
+                            .to_string(),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Type check a `match`: each arm, which variables the arms move, and whether the arms
+    /// cover every value. Returns the type of the value the `match` produces.
+    ///
+    /// # Panics
+    ///
+    /// If `expr` is not a `match`.
     pub(crate) fn check_match_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
         let unused = std::mem::replace(&mut self.value_unused, false);
         match expr {
@@ -701,127 +909,42 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     self.check_expr_type(match_expr)
                 };
+                let on = MatchedValue {
+                    expr: match_expr,
+                    ty: &expr_ty,
+                    place,
+                    unused,
+                    consume,
+                };
 
-                let mut match_ty: Option<Type> = None;
-                let mut covered: Vec<crate::symbol::Symbol> = Vec::new();
-                let mut has_wildcard = false;
+                let mut seen = ArmsSeen {
+                    match_ty: None,
+                    covered: Vec::new(),
+                    has_wildcard: false,
+                    joined: None,
+                    every_arm_ends: !arms.is_empty(),
+                };
                 // Each arm starts from the moves made before the `match`; afterwards a
                 // variable is moved if an arm that reaches the following code moved it.
                 let marks_before = self.moved_snapshot();
-                let mut joined: Option<Vec<std::collections::HashSet<String>>> = None;
                 // What an arm learns ends with it: the prover does not model the patterns, so
                 // it cannot say which arm the code after the `match` came through.
                 let facts_before = self.consteval.constraints.len();
-                let mut every_arm_ends = !arms.is_empty();
                 for arm in arms {
                     self.consteval.constraints.truncate(facts_before);
                     self.restore_moved(marks_before.clone());
-                    match &arm.pattern {
-                        Pattern::Wildcard | Pattern::Identifier(_) => has_wildcard = true,
-                        Pattern::EnumVariant(_, variant, _) => covered.push(variant.clone()),
-                        _ => {}
-                    }
-                    // `_ => {}` and an empty enum variant arm are there to make the match cover
-                    // every case, so they stay quiet. Every arm the compiler writes is one of them.
-                    if arm.body.is_empty()
-                        && !matches!(arm.pattern, Pattern::Wildcard | Pattern::EnumVariant(..))
-                        && !self.speculating
-                    {
-                        self.errors.warn(
-                            crate::diagnostic::DiagnosticCode::W1008,
-                            "this match arm's body is empty, so this case does nothing",
-                            Some(crate::diagnostic::SourceSpan::from_ast_span(&arm.span)),
-                        );
-                    }
-                    self.push_scope();
-                    self.check_literal_pattern_range(&arm.pattern, &expr_ty);
-                    self.bind_pattern_variables(&arm.pattern, &expr_ty);
-                    if place && !self.speculating && self.pattern_moves(&arm.pattern) {
-                        // Moved before the arm's own names exist, which may hide it.
-                        self.pop_scope();
-                        self.match_moves(match_expr);
-                        self.push_scope();
-                        self.bind_pattern_variables(&arm.pattern, &expr_ty);
-                    }
-
-                    let arm_ty = if !self.speculating {
-                        self.value_unused = unused;
-                        self.check_expr_block(&mut arm.body, None, consume)
-                    } else {
-                        Type::Struct("void".into(), None)
-                    };
-                    self.pop_scope();
-                    every_arm_ends &= self.branch_ends_early(&arm.body);
-                    if let Some(after) = self.branch_end(&arm.body) {
-                        joined = Some(match joined.take() {
-                            Some(j) => Self::union_moved(j, after),
-                            None => after,
-                        });
-                    }
-
-                    // An arm contributes to the match's value type only if its block
-                    // ends in a tail expression (a non-semicolon `ExprStmt`). Arms that
-                    // end in `return`/`break`/`continue`, or in a statement like `assert`,
-                    // diverge or yield unit and do not constrain the match value — this is
-                    // what lets `Option::unwrap` (Some arm `return v`, None arm asserts)
-                    // type-check as `-> T`.
-                    let yields_value = matches!(
-                        arm.body.last(),
-                        Some(Statement::ExprStmt(ExprStmtStmt {
-                            has_semi: false,
-                            ..
-                        }))
-                    );
-                    if yields_value && match_ty.is_none() {
-                        match_ty = Some(arm_ty);
-                    }
+                    self.check_match_arm(arm, &on, &mut seen);
                 }
-                self.restore_moved(joined.unwrap_or(marks_before));
+                self.restore_moved(seen.joined.unwrap_or(marks_before));
                 self.consteval.constraints.truncate(facts_before);
-                if every_arm_ends {
+                if seen.every_arm_ends {
                     self.consteval
                         .constraints
                         .push(crate::hir::prover::unreachable_fact());
                 }
 
-                // Coverage. An enum scrutinee can be enumerated, so a missing variant is a fact
-                // about the match wherever it sits: the uncovered value falls through, and if
-                // every written arm returns, the function falls off its end carrying whatever
-                // was in the return slot. A scrutinee that cannot be enumerated has no such
-                // fact, so asking it for a wildcard stays limited to value position, where the
-                // fall-through edge would otherwise have no value to carry.
-                if !has_wildcard && !self.speculating {
-                    match self.enum_variants_of(&expr_ty) {
-                        Some(all) => {
-                            let missing: Vec<String> = all
-                                .iter()
-                                .filter(|v| !covered.contains(v))
-                                .map(|v| v.to_string())
-                                .collect();
-                            if !missing.is_empty() {
-                                self.errors.error_with_code(
-                                    crate::diagnostic::DiagnosticCode::E3020,
-                                    format!(
-                                        "this `match` does not cover {}; add an arm for each, \
-                                         or a `_` arm",
-                                        missing.join(", ")
-                                    ),
-                                    None,
-                                );
-                            }
-                        }
-                        None => {
-                            if match_ty.is_some() {
-                                self.errors.error_with_code(
-                                    crate::diagnostic::DiagnosticCode::E3020,
-                                    "this `match` produces a value but has no arm matching every \
-                                     value; add a `_` arm so every path yields one"
-                                        .to_string(),
-                                    None,
-                                );
-                            }
-                        }
-                    }
+                if !seen.has_wildcard && !self.speculating {
+                    self.report_uncovered_match(&expr_ty, &seen.covered, seen.match_ty.is_some());
                 }
 
                 // When no arm yields a value the match sits in diverging/statement
@@ -829,10 +952,10 @@ impl<'a> TypeChecker<'a> {
                 // type so an implicit `return match { ... }` type-checks; fall back to the
                 // historical placeholder when there is no expected return type. A match
                 // whose value nothing uses is a statement, and has no value at all.
-                if unused && match_ty.is_none() {
+                if unused && seen.match_ty.is_none() {
                     return Type::Struct("void".into(), None);
                 }
-                match_ty.unwrap_or_else(|| {
+                seen.match_ty.unwrap_or_else(|| {
                     self.current_return_type.clone().unwrap_or(Type::Tensor(
                         ElementType::F32,
                         vec![],
@@ -840,69 +963,163 @@ impl<'a> TypeChecker<'a> {
                     ))
                 })
             }
-            _ => panic!("Expected IndexAccess, got {:?}", expr),
+            _ => panic!("Expected IndexAccess, got {expr:?}"),
         }
     }
 
+    /// Type check the body of the closure `e` as a function of its own. Returns the checked
+    /// body and the type it returns.
+    fn check_closure_body(&mut self, e: &ClosureExpr) -> (Box<Expr>, Type) {
+        let closure_depth = self.scopes.len();
+        self.mono.closure_depths.push(closure_depth);
+        self.mono.closure_captures_stack.push(HashMap::new());
+
+        let old_ret = self.current_return_type.take();
+        self.current_return_type = Some(Type::Unknown);
+
+        self.push_scope();
+        for (name, ty) in &e.params {
+            self.insert(name.to_string(), ty.clone());
+        }
+        let mut b = e.body.clone();
+        // A closure is a function, so its body starts a fresh compile-time context.
+        // `comptime` directly inside `comptime` is the thing being refused; a lambda
+        // whose body is a `comptime` block, written inside another one, is two
+        // separate functions and is ordinary.
+        let outer_comptime = std::mem::take(&mut self.consteval.comptime_depth);
+        self.consteval.closure_body_depth += 1;
+        // A `return` in the body leaves the closure, not the function around it.
+        self.drops_enter_function(Vec::new(), &[]);
+        let expr_ret_ty = self.check_expr_type(&mut b);
+        self.drops_exit_function();
+        self.consteval.closure_body_depth -= 1;
+        self.consteval.comptime_depth = outer_comptime;
+
+        let mut ret_ty = expr_ret_ty;
+        if let Some(inferred) = &self.current_return_type {
+            if *inferred != Type::Unknown {
+                ret_ty = inferred.clone();
+            }
+        }
+
+        self.pop_scope();
+        self.current_return_type = old_ret;
+        (b, ret_ty)
+    }
+
+    /// The outer variables that the closure just checked uses, sorted by name. A captured
+    /// struct or tensor is moved into the closure.
+    fn take_closure_captures(&mut self) -> Vec<(crate::symbol::Symbol, Type)> {
+        let captured_vars_map = self.mono.closure_captures_stack.pop().unwrap_or_default();
+        self.mono.closure_depths.pop();
+
+        let mut captured_vars: Vec<(crate::symbol::Symbol, Type)> =
+            captured_vars_map.into_iter().collect();
+        captured_vars.sort_by(|a, b| a.0.cmp(&b.0)); // Stable layout
+
+        if !self.speculating {
+            // Consume captured variables in the outer scope if they are linear
+            for (name, ty) in &captured_vars {
+                if matches!(ty, Type::Struct(_, _) | Type::Tensor(_, _, _)) {
+                    self.consume(name.as_ref());
+                }
+            }
+        }
+        captured_vars
+    }
+
+    /// The parameters of the function generated for a closure: a pointer to the struct that
+    /// holds the captured variables, then the closure's own parameters.
+    fn closure_call_params(
+        struct_name: &str,
+        params: &[(crate::symbol::Symbol, Type)],
+    ) -> Vec<(crate::symbol::Symbol, Type)> {
+        let mut env_params: Vec<(crate::symbol::Symbol, Type)> = vec![(
+            "_env".to_string().into(),
+            Type::Pointer(Box::new(Type::Struct(struct_name.into(), None)), None, true), // &mut env
+        )];
+
+        for (name, ty) in params {
+            env_params.push((name.clone(), ty.clone()));
+        }
+        env_params
+    }
+
+    /// The body of the function generated for a closure: a `let` that reads each captured
+    /// variable out of the struct, then a `return` of the closure's own body.
+    fn closure_call_fn_body(
+        struct_name: &str,
+        captured_vars: &[(crate::symbol::Symbol, Type)],
+        body: Expr,
+        span: Span,
+    ) -> Vec<Statement> {
+        let mut body_stmts = Vec::new();
+        for (cap_name, cap_ty) in captured_vars {
+            let env_access = Expr::MemberAccess(MemberAccessExpr {
+                base: Box::new(Expr::Identifier(IdentifierExpr::new(
+                    "_env".to_string().into(),
+                    span,
+                ))),
+                member: cap_name.clone(),
+                struct_name: Some(struct_name.into()),
+                span,
+            });
+            body_stmts.push(Statement::LetDecl(LetDeclStmt {
+                name: cap_name.clone(),
+                is_mut: true,
+                ty_ann: Some(cap_ty.clone()),
+                expr: env_access,
+                span,
+            }));
+        }
+
+        body_stmts.push(Statement::Return(ReturnStmt {
+            expr: Some(body),
+            span,
+        }));
+        body_stmts
+    }
+
+    /// The struct literal that replaces a closure: each captured variable, stored in the field
+    /// that has its name.
+    fn closure_env_init(
+        struct_name: &str,
+        captured_vars: &[(crate::symbol::Symbol, Type)],
+        span: Span,
+    ) -> Expr {
+        let mut fields = Vec::new();
+        for (cap_name, _) in captured_vars {
+            fields.push((
+                cap_name.clone(),
+                Expr::Identifier(IdentifierExpr::new(cap_name.clone(), span)),
+            ));
+        }
+
+        Expr::StructInit(StructInitExpr {
+            name: struct_name.into(),
+            fields,
+            type_id: None,
+            span,
+        })
+    }
+
+    /// Type check a closure and replace it with the value that holds what it captures: a
+    /// generated struct with one field for each captured variable. The closure's body becomes
+    /// a generated function that takes that struct.
+    ///
+    /// # Panics
+    ///
+    /// If `expr` is not a closure.
     pub(crate) fn check_closure_expr(&mut self, expr: &mut Expr, _consume: bool) -> Type {
         match expr {
             Expr::Closure(e) => {
                 let struct_name = format!("Closure_{}", self.next_id);
-                let func_name = format!("{}_call", struct_name);
+                let func_name = format!("{struct_name}_call");
                 self.next_id += 1;
 
                 let cloned_params = e.params.clone();
-
-                let closure_depth = self.scopes.len();
-                self.mono.closure_depths.push(closure_depth);
-                self.mono.closure_captures_stack.push(HashMap::new());
-
-                let old_ret = self.current_return_type.take();
-                self.current_return_type = Some(Type::Unknown);
-
-                self.push_scope();
-                for (name, ty) in &cloned_params {
-                    self.insert(name.to_string(), ty.clone());
-                }
-                let mut b = e.body.clone();
-                // A closure is a function, so its body starts a fresh compile-time context.
-                // `comptime` directly inside `comptime` is the thing being refused; a lambda
-                // whose body is a `comptime` block, written inside another one, is two
-                // separate functions and is ordinary.
-                let outer_comptime = std::mem::take(&mut self.consteval.comptime_depth);
-                self.consteval.closure_body_depth += 1;
-                // A `return` in the body leaves the closure, not the function around it.
-                self.drops_enter_function(Vec::new(), &[]);
-                let expr_ret_ty = self.check_expr_type(&mut b);
-                self.drops_exit_function();
-                self.consteval.closure_body_depth -= 1;
-                self.consteval.comptime_depth = outer_comptime;
-
-                let mut ret_ty = expr_ret_ty;
-                if let Some(inferred) = &self.current_return_type {
-                    if *inferred != Type::Unknown {
-                        ret_ty = inferred.clone();
-                    }
-                }
-
-                self.pop_scope();
-                self.current_return_type = old_ret;
-
-                let captured_vars_map = self.mono.closure_captures_stack.pop().unwrap_or_default();
-                self.mono.closure_depths.pop();
-
-                let mut captured_vars: Vec<(crate::symbol::Symbol, Type)> =
-                    captured_vars_map.into_iter().collect();
-                captured_vars.sort_by(|a, b| a.0.cmp(&b.0)); // Stable layout
-
-                if !self.speculating {
-                    // Consume captured variables in the outer scope if they are linear
-                    for (name, ty) in &captured_vars {
-                        if matches!(ty, Type::Struct(_, _) | Type::Tensor(_, _, _)) {
-                            self.consume(name.as_ref());
-                        }
-                    }
-                }
+                let (b, ret_ty) = self.check_closure_body(e);
+                let captured_vars = self.take_closure_captures();
 
                 // Create StructDecl for the environment
                 let struct_decl = decl::StructDecl {
@@ -914,75 +1131,24 @@ impl<'a> TypeChecker<'a> {
                 self.mono.generated_structs.push(struct_decl);
 
                 // Create the Function for calling the closure
-                let mut env_params: Vec<(crate::symbol::Symbol, Type)> = vec![(
-                    "_env".to_string().into(),
-                    Type::Pointer(
-                        Box::new(Type::Struct(struct_name.clone().into(), None)),
-                        None,
-                        true,
-                    ), // &mut env
-                )];
-
-                for (name, ty) in &cloned_params {
-                    env_params.push((name.clone(), ty.clone()));
-                }
-
-                let mut body_stmts = Vec::new();
-                for (cap_name, cap_ty) in &captured_vars {
-                    let env_access = Expr::MemberAccess(MemberAccessExpr {
-                        base: Box::new(Expr::Identifier(IdentifierExpr::new(
-                            "_env".to_string().into(),
-                            e.span,
-                        ))),
-                        member: cap_name.clone(),
-                        struct_name: Some(struct_name.clone().into()),
-                        span: e.span,
-                    });
-                    body_stmts.push(Statement::LetDecl(LetDeclStmt {
-                        name: cap_name.clone(),
-                        is_mut: true,
-                        ty_ann: Some(cap_ty.clone()),
-                        expr: env_access,
-                        span: e.span,
-                    }));
-                }
-
-                body_stmts.push(Statement::Return(ReturnStmt {
-                    expr: Some(*b),
-                    span: e.span,
-                }));
-
                 let call_func = decl::Function {
                     is_unsafe: false,
-                    name: func_name.clone().into(),
+                    name: func_name.into(),
                     generics: vec![],
-                    params: env_params,
+                    params: Self::closure_call_params(&struct_name, &cloned_params),
                     mut_params: Vec::new(),
                     topology: self.active_topology.clone(),
                     return_type: ret_ty.clone(),
                     requires: vec![],
                     ensures: vec![],
                     where_transfers: vec![],
-                    body: body_stmts,
+                    body: Self::closure_call_fn_body(&struct_name, &captured_vars, *b, e.span),
                     doc_comment: None,
                 };
 
                 self.mono.functions.push((call_func, 0));
 
-                let mut fields = Vec::new();
-                for (cap_name, _) in &captured_vars {
-                    fields.push((
-                        cap_name.clone(),
-                        Expr::Identifier(IdentifierExpr::new(cap_name.clone(), e.span)),
-                    ));
-                }
-
-                *expr = Expr::StructInit(StructInitExpr {
-                    name: struct_name.clone().into(),
-                    fields,
-                    type_id: None,
-                    span: e.span,
-                });
+                *expr = Self::closure_env_init(&struct_name, &captured_vars, e.span);
 
                 // Record the closure's call signature so a later `unify_types` can recover it:
                 // `Struct("Closure_N")` erases the args/ret, but matching it against a
@@ -995,7 +1161,7 @@ impl<'a> TypeChecker<'a> {
 
                 Type::Struct(struct_name.into(), None)
             }
-            _ => panic!("Expected IndexAccess, got {:?}", expr),
+            _ => panic!("Expected IndexAccess, got {expr:?}"),
         }
     }
 }

@@ -10,7 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::*;
+use super::{
+    Dim, EnumDecl, Expr, Function, ImplBlock, Placement, Program, Statement, StructDecl, SymbolMap,
+    SymbolTable, Topology, TopologyKind, TraitDecl, Type,
+};
 use crate::gid::TypeId;
 
 use crate::symbol::Symbol;
@@ -19,7 +22,7 @@ use std::collections::HashMap;
 /// Everything the name-resolution walk needs to attach a GID to a nominal type: the *current*
 /// module's symbol table (local defs), the full cross-module symbol map, and this module's import
 /// index. Bundled into one reference so the recursive `resolve_names` walk threads a single value
-/// and cross-module lookup is centralized in [`ResolutionScope::resolve_nominal`] rather than
+/// and cross-module lookup is centralized in `ResolutionScope::resolve_nominal` rather than
 /// bolted onto each AST arm.
 pub struct ResolutionScope<'a> {
     current: Option<&'a SymbolTable>,
@@ -48,7 +51,7 @@ struct ImportIndex {
 
 fn join_path(segs: &[Symbol]) -> String {
     segs.iter()
-        .map(|s| s.as_ref())
+        .map(std::convert::AsRef::as_ref)
         .collect::<Vec<_>>()
         .join("::")
 }
@@ -142,7 +145,9 @@ impl<'a> ResolutionScope<'a> {
 }
 
 impl Type {
-    pub fn resolve_names(&mut self, scope: &ResolutionScope) {
+    /// Attaches to each struct or enum named inside this type the id of its definition, when
+    /// `scope` can find one.
+    pub fn resolve_names(&mut self, scope: &ResolutionScope<'_>) {
         match self {
             Type::Struct(name, id) | Type::Enum(name, id) => {
                 if let Some(tid) = scope.resolve_nominal(name) {
@@ -153,8 +158,13 @@ impl Type {
             // classified as such from the in-scope generic list (`parser/types.rs`). It is not a
             // nominal type, so it must NOT bind to a same-named struct/enum (that would conflate a
             // type variable with a concrete type). Its `id` is unused downstream (every consumer
-            // binds it to `_`); leave it None.
-            Type::Generic(..) => {}
+            // binds it to `_`); leave it None. The other kinds here name nothing to resolve.
+            Type::Generic(..)
+            | Type::Const(_)
+            | Type::Matrix
+            | Type::Scalar(_)
+            | Type::Simd(_, _)
+            | Type::Unknown => {}
             Type::Tensor(_, dims, top) => {
                 for dim in dims.iter_mut().filter_map(|d| match d {
                     Dim::Static(e) => Some(e),
@@ -189,21 +199,12 @@ impl Type {
                     ty.resolve_names(scope);
                 }
             }
-            Type::Function(arg_tys, ret_ty, _) => {
+            Type::Function(arg_tys, ret_ty, _) | Type::Closure(arg_tys, ret_ty) => {
                 for t in arg_tys {
                     t.resolve_names(scope);
                 }
                 ret_ty.resolve_names(scope);
             }
-            Type::Closure(arg_tys, ret_ty) => {
-                for t in arg_tys {
-                    t.resolve_names(scope);
-                }
-                ret_ty.resolve_names(scope);
-            }
-            Type::Const(_) => {}
-            Type::Matrix | Type::Scalar(_) | Type::Simd(_, _) => {}
-            Type::Unknown => {}
         }
     }
 }
@@ -212,14 +213,15 @@ impl Placement {
     /// Resolve the names inside the device, then fill in whichever projection the source did not
     /// write. This is the pass with program-wide scope, so it is the first point at which
     /// `Topology SmemDev { memory: Memory::SMEM }` can say what `Topology::SmemDev` holds.
-    pub fn resolve_names(&mut self, scope: &ResolutionScope) {
+    pub fn resolve_names(&mut self, scope: &ResolutionScope<'_>) {
         self.topology.resolve_names(scope);
         self.complete(&scope.topologies);
     }
 }
 
 impl Topology {
-    pub fn resolve_names(&mut self, scope: &ResolutionScope) {
+    /// Resolves the names in the expressions this topology is written with, such as a device index.
+    pub fn resolve_names(&mut self, scope: &ResolutionScope<'_>) {
         match self {
             Topology::NPU(e) | Topology::AccCore(e) => e.resolve_names(scope),
             Topology::Slice(t, e1, e2) => {
@@ -233,7 +235,9 @@ impl Topology {
 }
 
 impl Expr {
-    pub fn resolve_names(&mut self, scope: &ResolutionScope) {
+    /// Resolves the names in every type and topology inside this expression. Only the kinds of
+    /// expression listed here are walked; the rest are left as they are.
+    pub fn resolve_names(&mut self, scope: &ResolutionScope<'_>) {
         match self {
             Expr::Transfer(e) => e.expr.resolve_names(scope),
             Expr::MemberAccess(e) => e.base.resolve_names(scope),
@@ -270,20 +274,10 @@ impl Expr {
                 }
             }
             Expr::UnsafeBlock(e) => {
-                for s in &mut e.stmts {
-                    s.resolve_names(scope);
-                }
-                if let Some(r) = &mut e.ret {
-                    r.resolve_names(scope);
-                }
+                resolve_names_in_block(&mut e.stmts, e.ret.as_deref_mut(), scope);
             }
             Expr::ComptimeBlock(e) => {
-                for s in &mut e.stmts {
-                    s.resolve_names(scope);
-                }
-                if let Some(r) = &mut e.ret {
-                    r.resolve_names(scope);
-                }
+                resolve_names_in_block(&mut e.stmts, e.ret.as_deref_mut(), scope);
             }
             Expr::If(e) => {
                 e.cond.resolve_names(scope);
@@ -299,20 +293,35 @@ impl Expr {
             Expr::Topology(e) => e.top.resolve_names(scope),
             Expr::SpawnOn(e) => {
                 e.top.resolve_names(scope);
-                for s in &mut e.stmts {
-                    s.resolve_names(scope);
-                }
-                if let Some(r) = &mut e.ret {
-                    r.resolve_names(scope);
-                }
+                resolve_names_in_block(&mut e.stmts, e.ret.as_deref_mut(), scope);
             }
             _ => {}
         }
     }
 }
 
+/// Resolves the names in the statements of a block and then in the expression at its end, if it
+/// has one.
+fn resolve_names_in_block(
+    stmts: &mut [Statement],
+    ret: Option<&mut Expr>,
+    scope: &ResolutionScope<'_>,
+) {
+    for s in stmts {
+        s.resolve_names(scope);
+    }
+    if let Some(r) = ret {
+        r.resolve_names(scope);
+    }
+}
+
 impl Statement {
-    pub fn resolve_names(&mut self, scope: &ResolutionScope) {
+    /// Resolves the names in every type and expression inside this statement.
+    ///
+    /// # Panics
+    ///
+    /// If the statement is a macro call. Macros must be expanded before this pass.
+    pub fn resolve_names(&mut self, scope: &ResolutionScope<'_>) {
         match self {
             Statement::LetDecl(e) => {
                 if let Some(t) = &mut e.ty_ann {
@@ -346,17 +355,18 @@ impl Statement {
                     s.resolve_names(scope);
                 }
             }
-            Statement::Break(_) => {}
-            Statement::Continue(_) => {}
-            Statement::Drop(_) => {}
+            Statement::Break(_)
+            | Statement::Continue(_)
+            | Statement::Drop(_)
+            | Statement::Error(_) => {}
             Statement::MacroCall(_) => panic!("Macros should be expanded before name resolution"),
-            Statement::Error(_) => {}
         }
     }
 }
 
 impl Function {
-    pub fn resolve_names(&mut self, scope: &ResolutionScope) {
+    /// Resolves the names in the parameter types, the return type and the body.
+    pub fn resolve_names(&mut self, scope: &ResolutionScope<'_>) {
         for (_, ty) in &mut self.params {
             ty.resolve_names(scope);
         }
@@ -368,7 +378,8 @@ impl Function {
 }
 
 impl StructDecl {
-    pub fn resolve_names(&mut self, scope: &ResolutionScope) {
+    /// Resolves the names in the type of each field.
+    pub fn resolve_names(&mut self, scope: &ResolutionScope<'_>) {
         for (_, ty) in &mut self.fields {
             ty.resolve_names(scope);
         }
@@ -376,7 +387,8 @@ impl StructDecl {
 }
 
 impl EnumDecl {
-    pub fn resolve_names(&mut self, scope: &ResolutionScope) {
+    /// Resolves the names in the types each variant carries.
+    pub fn resolve_names(&mut self, scope: &ResolutionScope<'_>) {
         // Resolve nominal GIDs inside variant payloads (`Node(Tree, i32)`), so the frozen registry
         // sees enum by-value dependencies (recursive-layout / cross-module cycle detection) and the
         // flat type stream carries the payload identity. Previously a no-op — fine for the AST
@@ -392,7 +404,8 @@ impl EnumDecl {
 }
 
 impl TraitDecl {
-    pub fn resolve_names(&mut self, scope: &ResolutionScope) {
+    /// Resolves the names in the parameter types and the return type of each method.
+    pub fn resolve_names(&mut self, scope: &ResolutionScope<'_>) {
         for method in &mut self.methods {
             for (_, p_ty) in &mut method.params {
                 p_ty.resolve_names(scope);
@@ -403,7 +416,8 @@ impl TraitDecl {
 }
 
 impl ImplBlock {
-    pub fn resolve_names(&mut self, scope: &ResolutionScope) {
+    /// Resolves the names in the type the block is for, in the types it binds and in its methods.
+    pub fn resolve_names(&mut self, scope: &ResolutionScope<'_>) {
         self.target_type.resolve_names(scope);
         for (_, bound) in &mut self.assoc_bindings {
             bound.resolve_names(scope);

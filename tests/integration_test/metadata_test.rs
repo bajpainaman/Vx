@@ -23,9 +23,9 @@ fn test_zero_copy_metadata_serialization() -> Result<(), String> {
 
     // 1. Generate a large synthetic dictionary of 10,000 TypeIds (320 KB)
     let mut original_dict = Vec::new();
-    for i in 0..10000 {
+    for i in 0..10000u64 {
         original_dict.push(TypeId {
-            words: [i as u64, (i * 2) as u64, (i * 3) as u64, (i * 4) as u64],
+            words: [i, i * 2, i * 3, i * 4],
         });
     }
 

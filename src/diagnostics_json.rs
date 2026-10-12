@@ -133,6 +133,7 @@ pub const SCHEMA_VERSION: &str = "vx-diagnostics-v1";
 /// Escape a string for a JSON string literal (RFC 8259): the two mandatory escapes, the standard
 /// short forms, and `\u00XX` for the remaining control characters.
 fn esc(s: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
         match c {
@@ -143,7 +144,10 @@ fn esc(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\u{08}' => out.push_str("\\b"),
             '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => {
+                // Writing into a `String` cannot fail.
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }
@@ -169,7 +173,7 @@ fn diagnostic_json(d: &Diagnostic) -> String {
         DiagnosticLevel::Error => "error",
         DiagnosticLevel::Warning => "warning",
     };
-    let code = d.code.map(|c| format!("{:?}", c));
+    let code = d.code.map(|c| format!("{c:?}"));
     let mut fields = vec![
         format!("\"level\": \"{}\"", level),
         format!("\"code\": {}", opt_str(code.as_deref())),
@@ -188,7 +192,7 @@ fn diagnostic_json(d: &Diagnostic) -> String {
     {
         // Signed margin: negative is the amount by which the placement overflows. Computed here
         // rather than stored so it cannot disagree with the two operands.
-        let margin = *available_bytes as i128 - *required_bytes as i128;
+        let margin = i128::from(*available_bytes) - i128::from(*required_bytes);
         fields.push(format!(
             "\"capacity\": {{\"space\": \"{}\", \"required_bytes\": {}, \"available_bytes\": {}, \
              \"margin_bytes\": {}, \"tiles\": {}}}",
@@ -243,23 +247,7 @@ fn route_json(r: &StagingRoute) -> String {
         Some(crate::syntax::Crossing::Streamed) => "\"bottleneck\"",
         None => "null",
     };
-    // Derived traffic (#353). Present or explicitly absent-with-a-reason; never a
-    // silent zero, which a consumer could not tell from a real count of nothing.
-    let (traffic, traffic_source, traffic_exact) = match &r.traffic {
-        Some(t) => (
-            format!(
-                "[{}]",
-                t.per_space
-                    .iter()
-                    .map(space_traffic_json)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            format!("\"{}\"", t.source.as_str()),
-            if t.exact { "true" } else { "false" }.to_string(),
-        ),
-        None => ("null".to_string(), "null".to_string(), "null".to_string()),
-    };
+    let (traffic, traffic_source, traffic_exact) = route_traffic_json(r);
     let traffic_absent_reason = match &r.traffic_absent_reason {
         Some(why) => format!("\"{}\"", esc(why)),
         None => "null".to_string(),
@@ -284,6 +272,27 @@ fn route_json(r: &StagingRoute) -> String {
     )
 }
 
+/// The `traffic`, `traffic_source` and `traffic_exact` values of a route record, in that order.
+fn route_traffic_json(r: &StagingRoute) -> (String, String, String) {
+    // Derived traffic (#353). Present or explicitly absent-with-a-reason; never a
+    // silent zero, which a consumer could not tell from a real count of nothing.
+    match &r.traffic {
+        Some(t) => (
+            format!(
+                "[{}]",
+                t.per_space
+                    .iter()
+                    .map(space_traffic_json)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            format!("\"{}\"", t.source.as_str()),
+            if t.exact { "true" } else { "false" }.to_string(),
+        ),
+        None => ("null".to_string(), "null".to_string(), "null".to_string()),
+    }
+}
+
 /// One space's read/written pair. Shared by the transfer-route records and the spawn-region
 /// records so a consumer parses one shape, not two that happen to look alike today.
 fn space_traffic_json(st: &crate::report::SpaceTraffic) -> String {
@@ -298,6 +307,10 @@ fn space_traffic_json(st: &crate::report::SpaceTraffic) -> String {
 fn resident_set_json(r: &ResidentSet) -> String {
     // Utilization is derived here rather than stored so it cannot disagree with its operands.
     // Rounded to 4 dp: enough to distinguish campaign cells, short enough to read.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a ratio rounded to 4 decimal places does not need all 64 bits of each byte count"
+    )]
     let util = if r.capacity_bytes == 0 {
         0.0
     } else {
@@ -373,6 +386,10 @@ fn spawn_region_json(s: &SpawnRegionTraffic) -> String {
 /// Render one compile's admission verdict. `file` is the program compiled and `machine` the
 /// `--machine` model it was admitted against, so a harvested record identifies its own
 /// (config, SKU) cell without the caller having to correlate it back to the invocation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "callers are in other files; each argument is one section of the report"
+)]
 pub fn render(
     diagnostics: &DiagnosticsVec,
     routes: &[StagingRoute],
@@ -414,38 +431,37 @@ pub fn render(
     format!(
         "{{\n  \"schema\": \"{}\",\n  \"file\": \"{}\",\n  \"machine\": {},\n  \"verdict\": \
          \"{}\",\n  \"error_count\": {},\n  \"warning_count\": {},\n  \"diagnostics\": \
-         [{}{}{}],\n  \"routes\": [{}{}{}],\n  \"resident_sets\": [{}{}{}],\n  \
-         \"spawn_regions\": [{}{}{}]\n}}",
+         [{}],\n  \"routes\": [{}],\n  \"resident_sets\": [{}],\n  \
+         \"spawn_regions\": [{}]\n}}",
         SCHEMA_VERSION,
         esc(file),
         opt_str(machine),
         verdict,
         error_count,
         warning_count,
-        if diags.is_empty() { "" } else { "\n    " },
-        diags,
-        if diags.is_empty() { "" } else { "\n  " },
-        if routes_json.is_empty() { "" } else { "\n    " },
-        routes_json,
-        if routes_json.is_empty() { "" } else { "\n  " },
-        if residents_json.is_empty() {
-            ""
-        } else {
-            "\n    "
-        },
-        residents_json,
-        if residents_json.is_empty() {
-            ""
-        } else {
-            "\n  "
-        },
-        if spawn_json.is_empty() { "" } else { "\n    " },
-        spawn_json,
-        if spawn_json.is_empty() { "" } else { "\n  " },
+        array_body(&diags),
+        array_body(&routes_json),
+        array_body(&residents_json),
+        array_body(&spawn_json),
     )
 }
 
+/// What goes between the brackets of a top-level array in the report: `records` on lines of
+/// their own, or nothing when there are no records.
+fn array_body(records: &str) -> String {
+    if records.is_empty() {
+        String::new()
+    } else {
+        format!("\n    {records}\n  ")
+    }
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use crate::diagnostic::DiagnosticCode;
@@ -467,8 +483,8 @@ mod tests {
             .error_with_code(DiagnosticCode::E6009, "tile too big", None)
             .facts = Some(DiagnosticFacts::Capacity {
             space: "SMEM".to_string(),
-            required_bytes: 4194304,
-            available_bytes: 1048576,
+            required_bytes: 4_194_304,
+            available_bytes: 1_048_576,
             tiles: None,
         });
         let out = render(&diags, &[], &[], &[], "prog.vx", Some("fleet/h100.vx"));
@@ -505,11 +521,10 @@ mod tests {
         assert!(out.contains("\"machine\": null"), "{out}");
     }
 
-    /// An admitted program's evidence is its routes: the staging chain and per-edge costs.
-    #[test]
-    fn accept_record_carries_route_and_edge_costs() {
+    /// A route from host memory through `HBM3e` to `SMEM` that moves 16384 bytes.
+    fn example_route() -> StagingRoute {
         use crate::syntax::MemorySpace;
-        let route = StagingRoute {
+        StagingRoute {
             path: vec![
                 MemorySpace::CPUDRAM,
                 MemorySpace::Custom("HBM3e".into()),
@@ -539,10 +554,15 @@ mod tests {
                 exact: true,
             }),
             traffic_absent_reason: None,
-        };
+        }
+    }
+
+    /// An admitted program's evidence is its routes: the staging chain and per-edge costs.
+    #[test]
+    fn accept_record_carries_route_and_edge_costs() {
         let out = render(
             &DiagnosticsVec::default(),
-            &[route],
+            &[example_route()],
             &[],
             &[],
             "prog.vx",

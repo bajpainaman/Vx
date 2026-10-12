@@ -11,6 +11,12 @@
 // statically compiled Rust standard library, ensuring safe data boundary crossings.
 //
 //===----------------------------------------------------------------------===//
+
+//! The functions that compiled Vx programs call across the C ABI.
+
+/// Bindings that let a Vx program run a language model through `llama.cpp`.
 pub mod llama;
+/// Macros that generate the C ABI functions for each standard library type.
 pub mod macros;
+/// Runtime support that generated code calls: memory, tensors and printing.
 pub mod rt;

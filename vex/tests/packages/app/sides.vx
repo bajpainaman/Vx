@@ -1,0 +1,12 @@
+//===- sides.vx - Vx Package Tool -------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A second file of the `app` package, imported by its `main.vx` as `app::sides`.
+
+fn sides_of_a_square() -> i64 {
+  return 4;
+}

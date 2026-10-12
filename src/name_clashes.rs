@@ -39,7 +39,7 @@ const NAMES_THE_COMPILER_USES: &[&str] = &[
 
 fn module_name(path: &[Symbol]) -> Symbol {
     path.iter()
-        .map(|s| s.as_ref())
+        .map(std::convert::AsRef::as_ref)
         .collect::<Vec<_>>()
         .join("::")
         .as_str()
@@ -63,6 +63,15 @@ fn renamed(module: &Symbol, name: &Symbol) -> String {
 /// Which modules need re-parsing, and with what. `roots` are the modules nobody imports (the
 /// program, `--machine` and `--host` files); one of them keeps its plain name when it declares
 /// the clashing name.
+///
+/// # Errors
+///
+/// Returns a message when a module other than the standard library declares one of the names
+/// the compiler looks up by spelling, such as `Option`.
+///
+/// # Panics
+///
+/// Only if a set that was just counted as having one element turns out to be empty.
 pub fn plan(programs: &[Program], roots: &[Symbol]) -> Result<Plan, String> {
     // Sorted, so the copy that keeps its name does not depend on the order modules loaded in.
     let mut declarers: BTreeMap<&Symbol, Vec<&Symbol>> = BTreeMap::new();
@@ -173,12 +182,40 @@ fn is_trivia<S, C>(kind: &TokenTypeBase<S, C>) -> bool {
     )
 }
 
+/// Whether an identifier is something other than a use of a top-level name: a field or method
+/// (after `.` or `::`), an enum variant, a method declaration or a struct field. `prev_kind` and
+/// `next_kind` are the tokens on each side of it, and `scope` is the innermost bracket it is in.
+fn keeps_its_spelling<S, C>(
+    prev_kind: Option<&TokenTypeBase<S, C>>,
+    next_kind: Option<&TokenTypeBase<S, C>>,
+    scope: Option<Scope>,
+) -> bool {
+    let member = matches!(
+        prev_kind,
+        Some(TokenTypeBase::Dot | TokenTypeBase::DoubleColon)
+    );
+    let variant = scope == Some(Scope::EnumBody);
+    let method = scope == Some(Scope::ItemBody) && matches!(prev_kind, Some(TokenTypeBase::Fn));
+    let field = scope == Some(Scope::Block)
+        && matches!(next_kind, Some(TokenTypeBase::Colon))
+        && matches!(
+            prev_kind,
+            Some(TokenTypeBase::LeftBrace | TokenTypeBase::Comma)
+        );
+    member || variant || method || field
+}
+
 /// Apply one module's renames to its tokens. Only a use of a top-level name is renamed: a field
 /// or method (after `.` or `::`), a variant, a method declaration, a struct field and an import
 /// path keep their spelling.
-pub fn rename_tokens<'a>(
+///
+/// # Errors
+///
+/// Returns a message when the module uses a name that it sees two declarations of through its
+/// imports.
+pub fn rename_tokens<'a, S: std::hash::BuildHasher>(
     tokens: &mut [Token<'a>],
-    renames: &'a HashMap<Symbol, Rename>,
+    renames: &'a HashMap<Symbol, Rename, S>,
 ) -> Result<(), String> {
     let mut scopes: Vec<Scope> = Vec::new();
     let mut next_brace: Option<Scope> = None;
@@ -194,7 +231,7 @@ pub fn rename_tokens<'a>(
             TokenTypeBase::Semicolon => in_import = false,
             TokenTypeBase::Enum if top_level => next_brace = Some(Scope::EnumBody),
             TokenTypeBase::Impl | TokenTypeBase::Trait if top_level => {
-                next_brace = Some(Scope::ItemBody)
+                next_brace = Some(Scope::ItemBody);
             }
             TokenTypeBase::LeftBrace => scopes.push(next_brace.take().unwrap_or(Scope::Block)),
             TokenTypeBase::LeftParen | TokenTypeBase::LeftBracket => scopes.push(Scope::Paren),
@@ -212,20 +249,7 @@ pub fn rename_tokens<'a>(
                     .map(|t| &t.kind)
                     .find(|k| !is_trivia(k));
                 let scope = scopes.last().copied();
-                let member = matches!(
-                    prev_kind,
-                    Some(TokenTypeBase::Dot | TokenTypeBase::DoubleColon)
-                );
-                let variant = scope == Some(Scope::EnumBody);
-                let method =
-                    scope == Some(Scope::ItemBody) && matches!(prev_kind, Some(TokenTypeBase::Fn));
-                let field = scope == Some(Scope::Block)
-                    && matches!(next_kind, Some(TokenTypeBase::Colon))
-                    && matches!(
-                        prev_kind,
-                        Some(TokenTypeBase::LeftBrace | TokenTypeBase::Comma)
-                    );
-                if !(member || variant || method || field) {
+                if !keeps_its_spelling(prev_kind, next_kind, scope) {
                     match rename {
                         Rename::To(new) => tokens[i].kind = TokenTypeBase::Identifier(new),
                         Rename::Ambiguous(from) => {

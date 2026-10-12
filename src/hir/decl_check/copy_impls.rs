@@ -10,7 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::{Type, TypeChecker};
 
 impl TypeChecker<'_> {
     /// Refuse `impl Copy for X` when one of `X`'s fields is a type that moves (E3031).
@@ -43,13 +43,13 @@ impl TypeChecker<'_> {
             let mut held: Vec<(String, Type)> = Vec::new();
             if let Some(decl) = self.env.structs.get(name.as_ref()) {
                 for (field, ty) in &decl.fields {
-                    held.push((format!("field '{}'", field), ty.clone()));
+                    held.push((format!("field '{field}'"), ty.clone()));
                 }
             }
             if let Some(decl) = self.env.enums.get(name.as_ref()) {
                 for (variant, payload) in &decl.variants {
                     for ty in payload.iter().flatten() {
-                        held.push((format!("variant '{}'", variant), ty.clone()));
+                        held.push((format!("variant '{variant}'"), ty.clone()));
                     }
                 }
             }
@@ -58,9 +58,8 @@ impl TypeChecker<'_> {
                     self.errors.error_with_code(
                         crate::diagnostic::DiagnosticCode::E3031,
                         format!(
-                            "'{}' cannot be `Copy`: its {} has type {}, which is moved rather \
-                             than copied",
-                            name, what, ty
+                            "'{name}' cannot be `Copy`: its {what} has type {ty}, which is moved rather \
+                             than copied"
                         ),
                         None,
                     );

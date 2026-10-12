@@ -72,13 +72,13 @@ fn graph_library_parallel_resolution_is_deterministic() {
 }
 
 /// Stress: hammer the parallel resolution over the graph library from many threads at once (the
-/// payload TSan instruments), asserting the minted symbol count never diverges under contention.
+/// payload `TSan` instruments), asserting the minted symbol count never diverges under contention.
 #[test]
 fn graph_library_parallel_resolution_stress() {
     let modules = graph_modules();
     let baseline: usize = {
         let map = build_symbol_map(&modules);
-        map.values().map(|t| t.len()).sum()
+        map.values().map(std::collections::HashMap::len).sum()
     };
     assert!(baseline > 0, "expected at least the Graph symbol");
 
@@ -86,7 +86,7 @@ fn graph_library_parallel_resolution_stress() {
         let mut mods = modules.clone();
         let map = build_symbol_map(&mods);
         mods.par_iter_mut().for_each(|m| m.resolve_names(&map, &[]));
-        let n: usize = map.values().map(|t| t.len()).sum();
+        let n: usize = map.values().map(std::collections::HashMap::len).sum();
         assert_eq!(n, baseline, "symbol count diverged under contention");
     });
 }

@@ -24,9 +24,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 /// Every function without an error is compiled, so each of them counts as used, and so does
 /// everything it calls. A function with an error is used if a used function calls it. The calls
 /// come from what the type checker recorded for each function it checked.
-pub fn used_functions_with_errors<'a>(
+pub fn used_functions_with_errors<'a, S: std::hash::BuildHasher>(
     checked: impl IntoIterator<Item = &'a FnCapacitySummary>,
-    with_errors: &HashSet<String>,
+    with_errors: &HashSet<String, S>,
 ) -> BTreeSet<String> {
     // What each function with an error calls, and a list of calls still to follow.
     let mut calls_from_error_functions: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -55,6 +55,7 @@ pub fn used_functions_with_errors<'a>(
 
 /// The errors found in an imported function, with the function and module named in each, since
 /// the line numbers refer to the module's file, not the program's.
+#[must_use]
 pub fn errors_to_report(found: Vec<Diagnostic>, module: &str, function: &str) -> Vec<Diagnostic> {
     found
         .into_iter()

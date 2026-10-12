@@ -12,21 +12,29 @@
 
 use std::borrow::Cow;
 
+/// A range of positions in the source text, for a diagnostic that has no line and column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
+    /// Where the range starts.
     pub start: usize,
+    /// Where the range ends.
     pub end: usize,
 }
 
 /// Source-level location for diagnostics with line/column information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSpan {
+    /// The line the text is on.
     pub line: usize,
+    /// The column the text starts at.
     pub column: usize,
+    /// How many characters the text covers.
     pub length: usize,
 }
 
 impl SourceSpan {
+    /// Makes a location from a line, a column and a length.
+    #[must_use]
     pub fn new(line: usize, column: usize, length: usize) -> Self {
         Self {
             line,
@@ -36,6 +44,7 @@ impl SourceSpan {
     }
 
     /// Convert from the AST-level Span (which has the same fields).
+    #[must_use]
     pub fn from_ast_span(span: &crate::syntax::Span) -> Self {
         Self {
             line: span.line,
@@ -584,28 +593,36 @@ pub enum DiagnosticCode {
 
 impl std::fmt::Display for DiagnosticCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
+/// How serious a diagnostic is.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DiagnosticLevel {
+    /// The program still compiles.
     Warning,
+    /// The program does not compile.
     Error,
 }
 
 /// A secondary note attached to a diagnostic, providing additional context.
 #[derive(Debug, Clone)]
 pub struct Note {
+    /// The text of the note.
     pub message: Cow<'static, str>,
+    /// The source location the note points at, if it has one.
     pub span: Option<SourceSpan>,
 }
 
 /// A suggested text edit that can fix the diagnostic.
 #[derive(Debug, Clone)]
 pub struct FixIt {
+    /// What the edit does, in words.
     pub message: Cow<'static, str>,
+    /// The source text to replace.
     pub span: SourceSpan,
+    /// The new text. Empty means "remove the old text".
     pub replacement: Cow<'static, str>,
 }
 
@@ -617,21 +634,33 @@ pub enum DiagnosticFacts {
     /// A capacity verdict: one tile against a space (E6009), or a function's whole working set
     /// against it (E6010 / W1028). `tiles` is `None` for the single-tile case.
     Capacity {
+        /// The name of the memory space.
         space: String,
+        /// How many bytes the tile or the function needs.
         required_bytes: u64,
+        /// How many bytes the space has.
         available_bytes: u64,
+        /// How many tiles the function's working set has.
         tiles: Option<usize>,
     },
 }
 
+/// One warning or error, with everything needed to print it.
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
+    /// Whether this is a warning or an error.
     pub level: DiagnosticLevel,
+    /// The stable code, such as `W1001`, if the diagnostic has one.
     pub code: Option<DiagnosticCode>,
+    /// The main text of the diagnostic.
     pub message: Cow<'static, str>,
+    /// A range of source positions, printed only when `source_span` is `None`.
     pub span: Option<Span>,
+    /// The line and column the diagnostic points at.
     pub source_span: Option<SourceSpan>,
+    /// Extra notes, printed after the message.
     pub notes: Vec<Note>,
+    /// Suggested edits, printed after the notes.
     pub fix_its: Vec<FixIt>,
     /// Structured fields for `--diagnostics-json`; `None` for diagnostics with no campaign-
     /// relevant numbers. Never affects the rendered text.
@@ -639,6 +668,7 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
+    /// Makes an error with this message and no code, location, notes or fix-its.
     pub fn error(msg: impl Into<Cow<'static, str>>) -> Self {
         Self {
             level: DiagnosticLevel::Error,
@@ -652,6 +682,7 @@ impl Diagnostic {
         }
     }
 
+    /// Makes a warning with this message and no code, location, notes or fix-its.
     pub fn warning(msg: impl Into<Cow<'static, str>>) -> Self {
         Self {
             level: DiagnosticLevel::Warning,
@@ -665,21 +696,29 @@ impl Diagnostic {
         }
     }
 
+    /// Sets the range of source positions.
+    #[must_use]
     pub fn with_span(mut self, span: Span) -> Self {
         self.span = Some(span);
         self
     }
 
+    /// Sets the line and column the diagnostic points at.
+    #[must_use]
     pub fn with_source_span(mut self, span: SourceSpan) -> Self {
         self.source_span = Some(span);
         self
     }
 
+    /// Sets the diagnostic code.
+    #[must_use]
     pub fn with_code(mut self, code: DiagnosticCode) -> Self {
         self.code = Some(code);
         self
     }
 
+    /// Adds a note that has no source location.
+    #[must_use]
     pub fn with_note(mut self, msg: impl Into<Cow<'static, str>>) -> Self {
         self.notes.push(Note {
             message: msg.into(),
@@ -688,6 +727,8 @@ impl Diagnostic {
         self
     }
 
+    /// Adds a note that points at a source location.
+    #[must_use]
     pub fn with_note_at(mut self, msg: impl Into<Cow<'static, str>>, span: SourceSpan) -> Self {
         self.notes.push(Note {
             message: msg.into(),
@@ -696,6 +737,8 @@ impl Diagnostic {
         self
     }
 
+    /// Adds a suggested edit: replace the text at `span` with `replacement`.
+    #[must_use]
     pub fn with_fix_it(
         mut self,
         msg: impl Into<Cow<'static, str>>,
@@ -720,9 +763,9 @@ impl std::fmt::Display for Diagnostic {
 
         // Include diagnostic code if present
         if let Some(code) = &self.code {
-            write!(f, "{}[{}]", prefix, code)?;
+            write!(f, "{prefix}[{code}]")?;
         } else {
-            write!(f, "{}", prefix)?;
+            write!(f, "{prefix}")?;
         }
 
         // Include source location if present
@@ -759,16 +802,22 @@ impl std::fmt::Display for Diagnostic {
     }
 }
 
+/// The list of warnings and errors a compile has produced so far.
 #[derive(Debug, Clone)]
 pub struct DiagnosticsVec {
+    /// The diagnostics, in the order they were reported.
     pub inner: Vec<Diagnostic>,
 }
 
 impl DiagnosticsVec {
+    /// Makes an empty list.
+    #[must_use]
     pub fn new() -> Self {
         Self { inner: Vec::new() }
     }
 
+    /// Adds a diagnostic that has no code and no location. After ten errors it adds one
+    /// "Too many errors" error and then drops every further error.
     pub fn report(&mut self, level: DiagnosticLevel, message: impl Into<Cow<'static, str>>) {
         if level == DiagnosticLevel::Error && self.error_count() >= 10 {
             if self.error_count() == 10 {
@@ -800,6 +849,10 @@ impl DiagnosticsVec {
 
     /// Emit a warning with a diagnostic code and source span.
     /// Returns a mutable reference to the diagnostic for chaining notes/fix-its.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the diagnostic it returns was added to the list just before.
     pub fn warn(
         &mut self,
         code: DiagnosticCode,
@@ -821,6 +874,10 @@ impl DiagnosticsVec {
 
     /// Emit an error with a diagnostic code and optional source span.
     /// Returns a mutable reference to the diagnostic for chaining notes/fix-its.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the diagnostic it returns was added to the list just before.
     pub fn error_with_code(
         &mut self,
         code: DiagnosticCode,
@@ -840,6 +897,8 @@ impl DiagnosticsVec {
         self.inner.last_mut().unwrap()
     }
 
+    /// How many of the diagnostics are errors.
+    #[must_use]
     pub fn error_count(&self) -> usize {
         self.inner
             .iter()
@@ -847,6 +906,8 @@ impl DiagnosticsVec {
             .count()
     }
 
+    /// How many of the diagnostics are warnings.
+    #[must_use]
     pub fn warning_count(&self) -> usize {
         self.inner
             .iter()
@@ -854,27 +915,35 @@ impl DiagnosticsVec {
             .count()
     }
 
+    /// Adds an error with this message. See [`DiagnosticsVec::report`] for the limit on errors.
     pub fn push(&mut self, message: String) {
         self.report(DiagnosticLevel::Error, message);
     }
 
+    /// Adds a warning with this message.
     pub fn push_warning(&mut self, message: String) {
         self.report(DiagnosticLevel::Warning, message);
     }
 
+    /// True when nothing has been reported.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
+    /// How many diagnostics there are, warnings and errors together.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
+    /// Goes over the diagnostics in the order they were reported.
     pub fn iter(&self) -> std::slice::Iter<'_, Diagnostic> {
         self.inner.iter()
     }
 
     /// Check if a specific warning code has been emitted.
+    #[must_use]
     pub fn has_warning(&self, code: DiagnosticCode) -> bool {
         self.inner
             .iter()
@@ -882,6 +951,7 @@ impl DiagnosticsVec {
     }
 
     /// Check if a specific error code has been emitted.
+    #[must_use]
     pub fn has_error(&self, code: DiagnosticCode) -> bool {
         self.inner
             .iter()
@@ -944,6 +1014,11 @@ impl Default for DiagnosticsVec {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 
@@ -970,7 +1045,7 @@ mod tests {
     fn test_diagnostics_vec_error_cap_at_10() {
         let mut diags = DiagnosticsVec::new();
         for i in 0..15 {
-            diags.push(format!("error {}", i));
+            diags.push(format!("error {i}"));
         }
         // 10 real errors + 1 "too many errors" message = 11 total
         assert_eq!(diags.error_count(), 11);
@@ -983,7 +1058,7 @@ mod tests {
     fn test_diagnostics_vec_warnings_not_capped() {
         let mut diags = DiagnosticsVec::new();
         for i in 0..20 {
-            diags.push_warning(format!("warning {}", i));
+            diags.push_warning(format!("warning {i}"));
         }
         assert_eq!(diags.len(), 20);
         assert_eq!(diags.error_count(), 0);

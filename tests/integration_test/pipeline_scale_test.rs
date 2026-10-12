@@ -38,6 +38,41 @@ fn default_modules() -> usize {
     }
 }
 
+/// The size of one emitted module, for a failure message.
+fn describe(label: &str, text: &str) -> String {
+    format!(
+        "{label}: {} bytes, {} functions",
+        text.len(),
+        text.matches("func.func").count()
+    )
+}
+
+/// A determinism failure over 36 MB of MLIR is useless without the offending line,
+/// so dump both and name the first place they diverge.
+fn first_divergence(a: &str, b: &str) -> String {
+    let dir = std::env::temp_dir().join("vx_scale_determinism");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("a.mlir"), a);
+    let _ = std::fs::write(dir.join("b.mlir"), b);
+    for (n, (la, lb)) in a.lines().zip(b.lines()).enumerate() {
+        if la != lb {
+            return format!(
+                "first difference at line {}:\n  a: {}\n  b: {}\n  both written to {}",
+                n + 1,
+                la.trim(),
+                lb.trim(),
+                dir.display()
+            );
+        }
+    }
+    format!(
+        "no differing line; lengths {} vs {} (one is a prefix of the other). both written to {}",
+        a.len(),
+        b.len(),
+        dir.display()
+    )
+}
+
 #[test]
 fn pipeline_emits_identical_mlir_at_benchmark_scale() {
     let modules = from_env("VX_SCALE_MODULES", default_modules());
@@ -84,40 +119,6 @@ fn pipeline_emits_identical_mlir_at_benchmark_scale() {
     // Not "one rayon thread": the sequential schedule takes rayon off the path entirely,
     // which is the baseline the scaling number is quoted against.
     let no_rayon = compile(1, Schedule::Sequential);
-
-    let describe = |label: &str, text: &String| {
-        format!(
-            "{label}: {} bytes, {} functions",
-            text.len(),
-            text.matches("func.func").count()
-        )
-    };
-
-    // A determinism failure over 36 MB of MLIR is useless without the offending line,
-    // so dump both and name the first place they diverge.
-    let first_divergence = |a: &str, b: &str| -> String {
-        let dir = std::env::temp_dir().join("vx_scale_determinism");
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(dir.join("a.mlir"), a);
-        let _ = std::fs::write(dir.join("b.mlir"), b);
-        for (n, (la, lb)) in a.lines().zip(b.lines()).enumerate() {
-            if la != lb {
-                return format!(
-                    "first difference at line {}:\n  a: {}\n  b: {}\n  both written to {}",
-                    n + 1,
-                    la.trim(),
-                    lb.trim(),
-                    dir.display()
-                );
-            }
-        }
-        format!(
-            "no differing line; lengths {} vs {} (one is a prefix of the other). both written to {}",
-            a.len(),
-            b.len(),
-            dir.display()
-        )
-    };
 
     assert!(
         one_thread == many_threads,

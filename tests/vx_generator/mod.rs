@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 #[derive(Default)]
 pub struct StructBuilder {
     pub name: String,
@@ -20,7 +22,7 @@ impl StructBuilder {
     pub fn build(&self) -> String {
         let mut s = format!("struct {} {{\n", self.name);
         for (f, t) in &self.fields {
-            s.push_str(&format!("  {}: {},\n", f, t));
+            writeln!(s, "  {f}: {t},").expect("writing to a String cannot fail");
         }
         s.push_str("}\n");
         s
@@ -66,13 +68,13 @@ impl FunctionBuilder {
         let args_str = self
             .args
             .iter()
-            .map(|(n, t)| format!("{}: {}", n, t))
+            .map(|(n, t)| format!("{n}: {t}"))
             .collect::<Vec<_>>()
             .join(", ");
 
         let mut s = format!("fn {}({})", self.name, args_str);
         if self.ret_type != "()" {
-            s.push_str(&format!(" -> {}", self.ret_type));
+            write!(s, " -> {}", self.ret_type).expect("writing to a String cannot fail");
         }
         s.push_str(" {\n");
         s.push_str(&self.body);

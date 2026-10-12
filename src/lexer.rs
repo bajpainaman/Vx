@@ -13,301 +13,458 @@
 //
 //===----------------------------------------------------------------------===//
 
+/// What kind of token a piece of source text is. `S` is how the text of a name, a number or
+/// a comment is held, and `C` is how the text of a string literal is held.
 #[derive(Debug, PartialEq, Clone, Eq)]
 pub enum TokenTypeBase<S, C> {
     // Keywords
+    /// The keyword `fn`.
     Fn,
+    /// The keyword `let`.
     Let,
+    /// The keyword `mut`.
     Mut,
+    /// The keyword `for`.
     For,
+    /// The keyword `in`.
     In,
+    /// The keyword `if`.
     If,
+    /// The keyword `else`.
     Else,
+    /// The keyword `loop`.
     Loop,
+    /// The keyword `while`.
     While,
+    /// The keyword `break`.
     Break,
+    /// The keyword `continue`.
     Continue,
+    /// The keyword `return`.
     Return,
+    /// The keyword `spawn`.
     Spawn,
+    /// The keyword `on`.
     On,
+    /// The keyword `where`.
     Where,
+    /// The keyword `transfer`.
     Transfer,
+    /// The keyword `unroll`.
     Unroll,
+    /// The keyword `across`.
     Across,
+    /// The keyword `match`.
     Match,
+    /// The keyword `struct`.
     Struct,
+    /// The keyword `unsafe`.
     Unsafe,
+    /// The keyword `safe`.
     Safe,
+    /// The keyword `extern`.
     Extern,
+    /// The keyword `trait`.
     Trait,
     /// `type Item;` in a trait, `type Item = i64;` in an impl.
     TypeKw,
+    /// The keyword `impl`.
     Impl,
+    /// The keyword `comptime`.
     Comptime,
+    /// The keyword `import`.
     Import,
+    /// The keyword `assert`.
     Assert,
+    /// The keyword `enum`.
     Enum,
+    /// The keyword `as`.
     As,
+    /// The keyword `grad`.
     Grad,
+    /// The keyword `vjp`.
     Vjp,
+    /// The keyword `jvp`.
     Jvp,
+    /// The keyword `requires`.
     Requires,
+    /// The keyword `ensures`.
     Ensures,
+    /// The keyword `invariant`.
     Invariant,
+    /// The keyword `macro_rules`, together with the `!` after it when there is one.
     MacroRules,
 
     // Types & Topology
+    /// The built-in name `Topology`.
     Topology,
+    /// The built-in name `Memory`.
     Memory,
+    /// The built-in name `Ref`.
     Ref,
+    /// The built-in name `Verified`.
     Verified,
+    /// The built-in name `Pinned`.
     Pinned,
+    /// The built-in name `HardwareState`.
     HardwareState,
 
     // Identifiers & Literals
+    /// A name, such as `count`. Holds the name.
     Identifier(S),
+    /// A number, such as `42` or `1.5f32`. Holds its text as written.
     Number(S),
+    /// A string in double quotes. Holds its text, with each escape such as `\n` replaced
+    /// by the character it stands for.
     StringLiteral(C),
 
     // Symbols
+    /// The symbol `(`.
     LeftParen,
+    /// The symbol `)`.
     RightParen,
+    /// The symbol `{`.
     LeftBrace,
+    /// The symbol `}`.
     RightBrace,
+    /// The symbol `[`.
     LeftBracket,
+    /// The symbol `]`.
     RightBracket,
+    /// The symbol `<`.
     LeftAngle,
+    /// The symbol `>`.
     RightAngle,
+    /// The symbol `:`.
     Colon,
+    /// The symbol `::`.
     DoubleColon,
+    /// The symbol `;`.
     Semicolon,
+    /// The symbol `,`.
     Comma,
+    /// The symbol `=`.
     Equals,
+    /// The symbol `+=`.
     PlusEquals,
+    /// The symbol `-=`.
     MinusEquals,
+    /// The symbol `*=`.
     StarEquals,
+    /// The symbol `/=`.
     SlashEquals,
+    /// The symbol `%=`.
     PercentEquals,
+    /// The symbol `&=`.
     AmpersandEquals,
+    /// The symbol `|=`.
     PipeEquals,
+    /// The symbol `^=`.
     CaretEquals,
+    /// The symbol `->`.
     Arrow,
+    /// The symbol `=>`.
     FatArrow,
+    /// The symbol `+`.
     Plus,
+    /// The symbol `-`.
     Minus,
+    /// The symbol `*`.
     Star,
+    /// The symbol `/`.
     Slash,
+    /// The symbol `%`.
     Percent,
+    /// The symbol `.`.
     Dot,
+    /// The symbol `..`.
     DoubleDot,
+    /// The symbol `&`.
     Ampersand,
+    /// The symbol `^`.
     Caret,
+    /// The symbol `@`.
     At,
+    /// The symbol `$`.
     Dollar,
+    /// The symbol `?`.
     Question,
 
     // Logical & Relational
+    /// The symbol `==`.
     EqEq,
+    /// The symbol `!=`.
     NotEq,
+    /// The symbol `<=`.
     LessEq,
+    /// The symbol `>=`.
     GreaterEq,
+    /// The symbol `&&`.
     AndAnd,
+    /// The symbol `||`.
     OrOr,
+    /// The symbol `!`.
     Bang,
+    /// The symbol `|`.
     Pipe,
 
     // Special
+    /// The end of the source.
     Eof,
+    /// A character that starts no token, or the first escape in a string literal that the
+    /// lexer does not know.
     Unknown(char),
+    /// A `//` comment. Holds the whole comment. Only produced by a lexer that keeps comments.
     Comment(S),
+    /// A `///` comment. Holds the whole comment.
     DocComment(S),
+    /// A run of spaces, tabs and newlines. Holds that text. Only produced by a lexer that
+    /// keeps comments.
     Whitespace(S),
 }
 
+/// A token kind whose text is borrowed from the source being lexed.
 pub type TokenType<'a> = TokenTypeBase<&'a str, std::borrow::Cow<'a, str>>;
+/// A token kind that owns its text, so it can outlive the source.
 pub type OwnedTokenType = TokenTypeBase<crate::symbol::Symbol, String>;
 
-impl<S: std::fmt::Display, C: std::fmt::Display> std::fmt::Display for TokenTypeBase<S, C> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TokenTypeBase::Fn => write!(f, "fn"),
-            TokenTypeBase::Let => write!(f, "let"),
-            TokenTypeBase::Mut => write!(f, "mut"),
-            TokenTypeBase::For => write!(f, "for"),
-            TokenTypeBase::In => write!(f, "in"),
-            TokenTypeBase::If => write!(f, "if"),
-            TokenTypeBase::Else => write!(f, "else"),
-            TokenTypeBase::Loop => write!(f, "loop"),
-            TokenTypeBase::While => write!(f, "while"),
-            TokenTypeBase::Break => write!(f, "break"),
-            TokenTypeBase::Continue => write!(f, "continue"),
-            TokenTypeBase::Return => write!(f, "return"),
-            TokenTypeBase::Spawn => write!(f, "spawn"),
-            TokenTypeBase::On => write!(f, "on"),
-            TokenTypeBase::Where => write!(f, "where"),
-            TokenTypeBase::Transfer => write!(f, "transfer"),
-            TokenTypeBase::Unroll => write!(f, "unroll"),
-            TokenTypeBase::Across => write!(f, "across"),
-            TokenTypeBase::Match => write!(f, "match"),
-            TokenTypeBase::Struct => write!(f, "struct"),
-            TokenTypeBase::Unsafe => write!(f, "unsafe"),
-            TokenTypeBase::Safe => write!(f, "safe"),
-            TokenTypeBase::Extern => write!(f, "extern"),
-            TokenTypeBase::Trait => write!(f, "trait"),
-            TokenTypeBase::TypeKw => write!(f, "type"),
-            TokenTypeBase::Impl => write!(f, "impl"),
-            TokenTypeBase::Comptime => write!(f, "comptime"),
-            TokenTypeBase::Import => write!(f, "import"),
-            TokenTypeBase::Assert => write!(f, "assert"),
-            TokenTypeBase::Enum => write!(f, "enum"),
-            TokenTypeBase::As => write!(f, "as"),
-            TokenTypeBase::Grad => write!(f, "grad"),
-            TokenTypeBase::Vjp => write!(f, "vjp"),
-            TokenTypeBase::Jvp => write!(f, "jvp"),
-            TokenTypeBase::Requires => write!(f, "requires"),
-            TokenTypeBase::Ensures => write!(f, "ensures"),
-            TokenTypeBase::Invariant => write!(f, "invariant"),
-
-            TokenTypeBase::Topology => write!(f, "Topology"),
-            TokenTypeBase::Memory => write!(f, "Memory"),
-            TokenTypeBase::Ref => write!(f, "Ref"),
-            TokenTypeBase::Verified => write!(f, "Verified"),
-            TokenTypeBase::Pinned => write!(f, "Pinned"),
-            TokenTypeBase::HardwareState => write!(f, "HardwareState"),
-
-            TokenTypeBase::MacroRules => write!(f, "macro_rules"),
-
-            TokenTypeBase::Identifier(s) => write!(f, "{}", s),
-            TokenTypeBase::Number(s) => write!(f, "{}", s),
-            TokenTypeBase::StringLiteral(s) => write!(f, "\"{}\"", s),
-
-            TokenTypeBase::LeftParen => write!(f, "("),
-            TokenTypeBase::RightParen => write!(f, ")"),
-            TokenTypeBase::LeftBrace => write!(f, "{{"),
-            TokenTypeBase::RightBrace => write!(f, "}}"),
-            TokenTypeBase::LeftBracket => write!(f, "["),
-            TokenTypeBase::RightBracket => write!(f, "]"),
-            TokenTypeBase::LeftAngle => write!(f, "<"),
-            TokenTypeBase::RightAngle => write!(f, ">"),
-            TokenTypeBase::Colon => write!(f, ":"),
-            TokenTypeBase::DoubleColon => write!(f, "::"),
-            TokenTypeBase::Semicolon => write!(f, ";"),
-            TokenTypeBase::Comma => write!(f, ","),
-            TokenTypeBase::Equals => write!(f, "="),
-            TokenTypeBase::PlusEquals => write!(f, "+="),
-            TokenTypeBase::MinusEquals => write!(f, "-="),
-            TokenTypeBase::StarEquals => write!(f, "*="),
-            TokenTypeBase::SlashEquals => write!(f, "/="),
-            TokenTypeBase::PercentEquals => write!(f, "%="),
-            TokenTypeBase::AmpersandEquals => write!(f, "&="),
-            TokenTypeBase::PipeEquals => write!(f, "|="),
-            TokenTypeBase::CaretEquals => write!(f, "^="),
-            TokenTypeBase::Arrow => write!(f, "->"),
-            TokenTypeBase::FatArrow => write!(f, "=>"),
-            TokenTypeBase::Plus => write!(f, "+"),
-            TokenTypeBase::Minus => write!(f, "-"),
-            TokenTypeBase::Star => write!(f, "*"),
-            TokenTypeBase::Slash => write!(f, "/"),
-            TokenTypeBase::Percent => write!(f, "%"),
-            TokenTypeBase::Dot => write!(f, "."),
-            TokenTypeBase::DoubleDot => write!(f, ".."),
-            TokenTypeBase::Ampersand => write!(f, "&"),
-            TokenTypeBase::Caret => write!(f, "^"),
-            TokenTypeBase::At => write!(f, "@"),
-            TokenTypeBase::Dollar => write!(f, "$"),
-            TokenTypeBase::Question => write!(f, "?"),
-
-            TokenTypeBase::EqEq => write!(f, "=="),
-            TokenTypeBase::NotEq => write!(f, "!="),
-            TokenTypeBase::LessEq => write!(f, "<="),
-            TokenTypeBase::GreaterEq => write!(f, ">="),
-            TokenTypeBase::AndAnd => write!(f, "&&"),
-            TokenTypeBase::OrOr => write!(f, "||"),
-            TokenTypeBase::Bang => write!(f, "!"),
-            TokenTypeBase::Pipe => write!(f, "|"),
-
-            TokenTypeBase::Comment(s) => write!(f, "{}", s),
-            TokenTypeBase::DocComment(s) => write!(f, "{}", s),
-            TokenTypeBase::Whitespace(s) => write!(f, "{}", s),
-            TokenTypeBase::Unknown(c) => write!(f, "{}", c),
-            TokenTypeBase::Eof => write!(f, ""),
+/// Writes the code that needs one line for every token kind that holds no text: how a kind
+/// is printed, and how a kind is copied into a `TokenTypeBase` that holds its text in another
+/// way. Each entry below is such a kind and how it is written in source.
+///
+/// The kinds that do hold text are written by hand in each `match`. A kind that is in neither
+/// place is a compile error, so a new kind cannot be forgotten.
+macro_rules! plain_token_kinds {
+    ($(($kind:ident, $text:literal)),* $(,)?) => {
+        impl<S: std::fmt::Display, C: std::fmt::Display> std::fmt::Display for TokenTypeBase<S, C> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    $(TokenTypeBase::$kind => f.write_str($text),)*
+                    TokenTypeBase::Identifier(s)
+                    | TokenTypeBase::Number(s)
+                    | TokenTypeBase::Comment(s)
+                    | TokenTypeBase::DocComment(s)
+                    | TokenTypeBase::Whitespace(s) => write!(f, "{s}"),
+                    TokenTypeBase::StringLiteral(s) => write!(f, "\"{s}\""),
+                    TokenTypeBase::Unknown(c) => write!(f, "{c}"),
+                }
+            }
         }
-    }
+
+        impl<S, C> TokenTypeBase<S, C> {
+            /// This kind, with the text it holds converted by `text`, or by `string` when it
+            /// is a string literal.
+            fn map_text<S2, C2>(
+                self,
+                text: impl FnOnce(S) -> S2,
+                string: impl FnOnce(C) -> C2,
+            ) -> TokenTypeBase<S2, C2> {
+                match self {
+                    $(TokenTypeBase::$kind => TokenTypeBase::$kind,)*
+                    TokenTypeBase::Identifier(s) => TokenTypeBase::Identifier(text(s)),
+                    TokenTypeBase::Number(s) => TokenTypeBase::Number(text(s)),
+                    TokenTypeBase::StringLiteral(s) => TokenTypeBase::StringLiteral(string(s)),
+                    TokenTypeBase::Unknown(c) => TokenTypeBase::Unknown(c),
+                    TokenTypeBase::Comment(s) => TokenTypeBase::Comment(text(s)),
+                    TokenTypeBase::DocComment(s) => TokenTypeBase::DocComment(text(s)),
+                    TokenTypeBase::Whitespace(s) => TokenTypeBase::Whitespace(text(s)),
+                }
+            }
+
+            /// The same as `map_text`, for a kind that is only borrowed.
+            fn map_text_ref<'t, S2, C2>(
+                &'t self,
+                text: impl FnOnce(&'t S) -> S2,
+                string: impl FnOnce(&'t C) -> C2,
+            ) -> TokenTypeBase<S2, C2> {
+                match self {
+                    $(TokenTypeBase::$kind => TokenTypeBase::$kind,)*
+                    TokenTypeBase::Identifier(s) => TokenTypeBase::Identifier(text(s)),
+                    TokenTypeBase::Number(s) => TokenTypeBase::Number(text(s)),
+                    TokenTypeBase::StringLiteral(s) => TokenTypeBase::StringLiteral(string(s)),
+                    TokenTypeBase::Unknown(c) => TokenTypeBase::Unknown(*c),
+                    TokenTypeBase::Comment(s) => TokenTypeBase::Comment(text(s)),
+                    TokenTypeBase::DocComment(s) => TokenTypeBase::DocComment(text(s)),
+                    TokenTypeBase::Whitespace(s) => TokenTypeBase::Whitespace(text(s)),
+                }
+            }
+        }
+    };
 }
 
+plain_token_kinds! {
+    (Fn, "fn"),
+    (Let, "let"),
+    (Mut, "mut"),
+    (For, "for"),
+    (In, "in"),
+    (If, "if"),
+    (Else, "else"),
+    (Loop, "loop"),
+    (While, "while"),
+    (Break, "break"),
+    (Continue, "continue"),
+    (Return, "return"),
+    (Spawn, "spawn"),
+    (On, "on"),
+    (Where, "where"),
+    (Transfer, "transfer"),
+    (Unroll, "unroll"),
+    (Across, "across"),
+    (Match, "match"),
+    (Struct, "struct"),
+    (Unsafe, "unsafe"),
+    (Safe, "safe"),
+    (Extern, "extern"),
+    (Trait, "trait"),
+    (TypeKw, "type"),
+    (Impl, "impl"),
+    (Comptime, "comptime"),
+    (Import, "import"),
+    (Assert, "assert"),
+    (Enum, "enum"),
+    (As, "as"),
+    (Grad, "grad"),
+    (Vjp, "vjp"),
+    (Jvp, "jvp"),
+    (Requires, "requires"),
+    (Ensures, "ensures"),
+    (Invariant, "invariant"),
+    (MacroRules, "macro_rules"),
+    (Topology, "Topology"),
+    (Memory, "Memory"),
+    (Ref, "Ref"),
+    (Verified, "Verified"),
+    (Pinned, "Pinned"),
+    (HardwareState, "HardwareState"),
+    (LeftParen, "("),
+    (RightParen, ")"),
+    (LeftBrace, "{"),
+    (RightBrace, "}"),
+    (LeftBracket, "["),
+    (RightBracket, "]"),
+    (LeftAngle, "<"),
+    (RightAngle, ">"),
+    (Colon, ":"),
+    (DoubleColon, "::"),
+    (Semicolon, ";"),
+    (Comma, ","),
+    (Equals, "="),
+    (PlusEquals, "+="),
+    (MinusEquals, "-="),
+    (StarEquals, "*="),
+    (SlashEquals, "/="),
+    (PercentEquals, "%="),
+    (AmpersandEquals, "&="),
+    (PipeEquals, "|="),
+    (CaretEquals, "^="),
+    (Arrow, "->"),
+    (FatArrow, "=>"),
+    (Plus, "+"),
+    (Minus, "-"),
+    (Star, "*"),
+    (Slash, "/"),
+    (Percent, "%"),
+    (Dot, "."),
+    (DoubleDot, ".."),
+    (Ampersand, "&"),
+    (Caret, "^"),
+    (At, "@"),
+    (Dollar, "$"),
+    (Question, "?"),
+    (EqEq, "=="),
+    (NotEq, "!="),
+    (LessEq, "<="),
+    (GreaterEq, ">="),
+    (AndAnd, "&&"),
+    (OrOr, "||"),
+    (Bang, "!"),
+    (Pipe, "|"),
+    (Eof, ""),
+}
+
+/// One token, and where it is in the source.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenBase<S, C> {
+    /// What kind of token it is, with its text when the kind holds any.
     pub kind: TokenTypeBase<S, C>,
+    /// The line the lexer was on when it finished the token. The first line is 1.
     pub line: usize,
+    /// The column the token starts at. The first column is 1.
     pub column: usize,
+    /// How many bytes of source the token covers.
     pub length: usize,
 }
 
+/// A token whose text is borrowed from the source being lexed.
 pub type Token<'a> = TokenBase<&'a str, std::borrow::Cow<'a, str>>;
+/// A token that owns its text, so it can outlive the source.
 pub type OwnedToken = TokenBase<crate::symbol::Symbol, String>;
 
-use once_cell::sync::Lazy;
 use rustc_hash::FxHashMap;
 
-static KEYWORDS: Lazy<
-    FxHashMap<&'static str, TokenTypeBase<&'static str, std::borrow::Cow<'static, str>>>,
-> = Lazy::new(|| {
-    let mut m = FxHashMap::default();
-    m.insert("fn", TokenTypeBase::Fn);
-    m.insert("let", TokenTypeBase::Let);
-    m.insert("mut", TokenTypeBase::Mut);
-    m.insert("for", TokenTypeBase::For);
-    m.insert("in", TokenTypeBase::In);
-    m.insert("if", TokenTypeBase::If);
-    m.insert("else", TokenTypeBase::Else);
-    m.insert("loop", TokenTypeBase::Loop);
-    m.insert("while", TokenTypeBase::While);
-    m.insert("break", TokenTypeBase::Break);
-    m.insert("continue", TokenTypeBase::Continue);
-    m.insert("return", TokenTypeBase::Return);
-    m.insert("spawn", TokenTypeBase::Spawn);
-    m.insert("on", TokenTypeBase::On);
-    m.insert("where", TokenTypeBase::Where);
-    m.insert("transfer", TokenTypeBase::Transfer);
-    m.insert("unroll", TokenTypeBase::Unroll);
-    m.insert("across", TokenTypeBase::Across);
-    m.insert("match", TokenTypeBase::Match);
-    m.insert("Topology", TokenTypeBase::Topology);
-    m.insert("Memory", TokenTypeBase::Memory);
-    m.insert("Ref", TokenTypeBase::Ref);
-    m.insert("Verified", TokenTypeBase::Verified);
-    m.insert("Pinned", TokenTypeBase::Pinned);
-    m.insert("HardwareState", TokenTypeBase::HardwareState);
-    m.insert("struct", TokenTypeBase::Struct);
-    m.insert("unsafe", TokenTypeBase::Unsafe);
-    m.insert("safe", TokenTypeBase::Safe);
-    m.insert("extern", TokenTypeBase::Extern);
-    m.insert("trait", TokenTypeBase::Trait);
-    m.insert("type", TokenTypeBase::TypeKw);
-    m.insert("impl", TokenTypeBase::Impl);
-    m.insert("comptime", TokenTypeBase::Comptime);
-    m.insert("import", TokenTypeBase::Import);
-    m.insert("assert", TokenTypeBase::Assert);
-    m.insert("enum", TokenTypeBase::Enum);
-    m.insert("as", TokenTypeBase::As);
-    m.insert("grad", TokenTypeBase::Grad);
-    m.insert("vjp", TokenTypeBase::Vjp);
-    m.insert("jvp", TokenTypeBase::Jvp);
-    m.insert("requires", TokenTypeBase::Requires);
-    m.insert("ensures", TokenTypeBase::Ensures);
-    m.insert("invariant", TokenTypeBase::Invariant);
-    m
-});
+static KEYWORDS: std::sync::LazyLock<FxHashMap<&'static str, TokenType<'static>>> =
+    std::sync::LazyLock::new(|| {
+        let mut m = FxHashMap::default();
+        m.insert("fn", TokenTypeBase::Fn);
+        m.insert("let", TokenTypeBase::Let);
+        m.insert("mut", TokenTypeBase::Mut);
+        m.insert("for", TokenTypeBase::For);
+        m.insert("in", TokenTypeBase::In);
+        m.insert("if", TokenTypeBase::If);
+        m.insert("else", TokenTypeBase::Else);
+        m.insert("loop", TokenTypeBase::Loop);
+        m.insert("while", TokenTypeBase::While);
+        m.insert("break", TokenTypeBase::Break);
+        m.insert("continue", TokenTypeBase::Continue);
+        m.insert("return", TokenTypeBase::Return);
+        m.insert("spawn", TokenTypeBase::Spawn);
+        m.insert("on", TokenTypeBase::On);
+        m.insert("where", TokenTypeBase::Where);
+        m.insert("transfer", TokenTypeBase::Transfer);
+        m.insert("unroll", TokenTypeBase::Unroll);
+        m.insert("across", TokenTypeBase::Across);
+        m.insert("match", TokenTypeBase::Match);
+        m.insert("Topology", TokenTypeBase::Topology);
+        m.insert("Memory", TokenTypeBase::Memory);
+        m.insert("Ref", TokenTypeBase::Ref);
+        m.insert("Verified", TokenTypeBase::Verified);
+        m.insert("Pinned", TokenTypeBase::Pinned);
+        m.insert("HardwareState", TokenTypeBase::HardwareState);
+        m.insert("struct", TokenTypeBase::Struct);
+        m.insert("unsafe", TokenTypeBase::Unsafe);
+        m.insert("safe", TokenTypeBase::Safe);
+        m.insert("extern", TokenTypeBase::Extern);
+        m.insert("trait", TokenTypeBase::Trait);
+        m.insert("type", TokenTypeBase::TypeKw);
+        m.insert("impl", TokenTypeBase::Impl);
+        m.insert("comptime", TokenTypeBase::Comptime);
+        m.insert("import", TokenTypeBase::Import);
+        m.insert("assert", TokenTypeBase::Assert);
+        m.insert("enum", TokenTypeBase::Enum);
+        m.insert("as", TokenTypeBase::As);
+        m.insert("grad", TokenTypeBase::Grad);
+        m.insert("vjp", TokenTypeBase::Vjp);
+        m.insert("jvp", TokenTypeBase::Jvp);
+        m.insert("requires", TokenTypeBase::Requires);
+        m.insert("ensures", TokenTypeBase::Ensures);
+        m.insert("invariant", TokenTypeBase::Invariant);
+        m
+    });
 
+/// Splits source text into tokens, one at a time.
 pub struct Lexer<'a> {
     source: &'a str,
     iter: std::iter::Peekable<std::str::CharIndices<'a>>,
     line: usize,
     column: usize,
+    /// Whether `//` comments and whitespace come out as tokens. When false they are skipped.
     pub preserve_comments: bool,
 }
 
 impl<'a> Lexer<'a> {
+    /// A lexer over `source` that skips `//` comments and whitespace.
+    #[must_use]
     pub fn new(source: &'a str) -> Self {
         Self {
             source,
@@ -318,6 +475,9 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// A lexer over `source` that gives `//` comments and whitespace back as tokens, for a
+    /// tool that has to keep them, such as the formatter.
+    #[must_use]
     pub fn new_with_comments(source: &'a str) -> Self {
         Self {
             source,
@@ -348,9 +508,8 @@ impl<'a> Lexer<'a> {
     }
 
     fn current_byte_offset(&mut self) -> usize {
-        self.peek()
-            .map(|&(idx, _)| idx)
-            .unwrap_or(self.source.len())
+        let end = self.source.len();
+        self.peek().map_or(end, |&(idx, _)| idx)
     }
 
     fn skip_whitespace(&mut self) {
@@ -453,7 +612,8 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 break;
             }
-            let mut char_to_push = self.advance().unwrap().1;
+            self.advance();
+            let mut char_to_push = next_c;
             if char_to_push == '\\' {
                 if text.is_none() {
                     let mut initial_text = String::with_capacity(raw_len + 4);
@@ -461,33 +621,13 @@ impl<'a> Lexer<'a> {
                     text = Some(initial_text);
                 }
                 if let Some(esc_c) = self.peek_char() {
-                    match esc_c {
-                        'n' => {
-                            self.advance();
-                            char_to_push = '\n';
-                        }
-                        't' => {
-                            self.advance();
-                            char_to_push = '\t';
-                        }
-                        'r' => {
-                            self.advance();
-                            char_to_push = '\r';
-                        }
-                        '"' => {
-                            self.advance();
-                            char_to_push = '"';
-                        }
-                        '\\' => {
-                            self.advance();
-                            char_to_push = '\\';
-                        }
-                        _ => {
-                            self.advance();
-                            char_to_push = esc_c;
-                            if unknown_escape.is_none() {
-                                unknown_escape = Some(esc_c);
-                            }
+                    self.advance();
+                    if let Some(value) = Self::escape_value(esc_c) {
+                        char_to_push = value;
+                    } else {
+                        char_to_push = esc_c;
+                        if unknown_escape.is_none() {
+                            unknown_escape = Some(esc_c);
                         }
                     }
                 }
@@ -521,6 +661,19 @@ impl<'a> Lexer<'a> {
             line: self.line,
             column: start_col,
             length: self.current_byte_offset() - start_byte,
+        }
+    }
+
+    /// The character that a backslash followed by `esc_c` stands for in a string literal, or
+    /// `None` when there is no such escape.
+    fn escape_value(esc_c: char) -> Option<char> {
+        match esc_c {
+            'n' => Some('\n'),
+            't' => Some('\t'),
+            'r' => Some('\r'),
+            '"' => Some('"'),
+            '\\' => Some('\\'),
+            _ => None,
         }
     }
 
@@ -581,6 +734,90 @@ impl<'a> Lexer<'a> {
         None
     }
 
+    /// If the next character is `second`, takes it and returns `two`. Otherwise returns `one`.
+    /// For a symbol that is one character long or two, such as `+` and `+=`.
+    fn one_or_two(
+        &mut self,
+        second: char,
+        one: TokenType<'a>,
+        two: TokenType<'a>,
+    ) -> TokenType<'a> {
+        if self.peek_char() == Some(second) {
+            self.advance();
+            two
+        } else {
+            one
+        }
+    }
+
+    /// The symbol that starts with `c`, which has just been taken from the source. Takes the
+    /// second character too when the two together are one symbol, such as `->`.
+    fn symbol(&mut self, c: char) -> TokenType<'a> {
+        match c {
+            '(' => TokenTypeBase::LeftParen,
+            ')' => TokenTypeBase::RightParen,
+            '{' => TokenTypeBase::LeftBrace,
+            '}' => TokenTypeBase::RightBrace,
+            '[' => TokenTypeBase::LeftBracket,
+            ']' => TokenTypeBase::RightBracket,
+
+            ';' => TokenTypeBase::Semicolon,
+            ',' => TokenTypeBase::Comma,
+            '+' => self.one_or_two('=', TokenTypeBase::Plus, TokenTypeBase::PlusEquals),
+            '*' => self.one_or_two('=', TokenTypeBase::Star, TokenTypeBase::StarEquals),
+            '@' => TokenTypeBase::At,
+            '$' => TokenTypeBase::Dollar,
+            '?' => TokenTypeBase::Question,
+            '/' => self.one_or_two('=', TokenTypeBase::Slash, TokenTypeBase::SlashEquals),
+            '%' => self.one_or_two('=', TokenTypeBase::Percent, TokenTypeBase::PercentEquals),
+            '^' => self.one_or_two('=', TokenTypeBase::Caret, TokenTypeBase::CaretEquals),
+            '=' => {
+                if self.peek_char() == Some('=') {
+                    self.advance();
+                    TokenTypeBase::EqEq
+                } else {
+                    self.one_or_two('>', TokenTypeBase::Equals, TokenTypeBase::FatArrow)
+                }
+            }
+            '!' => self.one_or_two('=', TokenTypeBase::Bang, TokenTypeBase::NotEq),
+            '<' => self.one_or_two('=', TokenTypeBase::LeftAngle, TokenTypeBase::LessEq),
+            '>' => self.one_or_two('=', TokenTypeBase::RightAngle, TokenTypeBase::GreaterEq),
+            '&' => {
+                if self.peek_char() == Some('&') {
+                    self.advance();
+                    TokenTypeBase::AndAnd
+                } else {
+                    self.one_or_two(
+                        '=',
+                        TokenTypeBase::Ampersand,
+                        TokenTypeBase::AmpersandEquals,
+                    )
+                }
+            }
+            '|' => {
+                if self.peek_char() == Some('|') {
+                    self.advance();
+                    TokenTypeBase::OrOr
+                } else {
+                    self.one_or_two('=', TokenTypeBase::Pipe, TokenTypeBase::PipeEquals)
+                }
+            }
+            '.' => self.one_or_two('.', TokenTypeBase::Dot, TokenTypeBase::DoubleDot),
+            '-' => {
+                if self.peek_char() == Some('>') {
+                    self.advance();
+                    TokenTypeBase::Arrow
+                } else {
+                    self.one_or_two('=', TokenTypeBase::Minus, TokenTypeBase::MinusEquals)
+                }
+            }
+            ':' => self.one_or_two(':', TokenTypeBase::Colon, TokenTypeBase::DoubleColon),
+            _ => TokenTypeBase::Unknown(c),
+        }
+    }
+
+    /// Takes the next token from the source. At the end of the source it returns an `Eof`
+    /// token, and keeps returning one if it is called again.
     pub fn next_token(&mut self) -> Token<'a> {
         if !self.preserve_comments {
             self.skip_whitespace();
@@ -588,16 +825,13 @@ impl<'a> Lexer<'a> {
 
         let start_col = self.column;
 
-        let (start_byte, c) = match self.peek() {
-            Some(&(idx, c)) => (idx, c),
-            None => {
-                return TokenBase {
-                    kind: TokenTypeBase::Eof,
-                    line: self.line,
-                    column: self.column,
-                    length: 0,
-                }
-            }
+        let Some(&(start_byte, c)) = self.peek() else {
+            return TokenBase {
+                kind: TokenTypeBase::Eof,
+                line: self.line,
+                column: self.column,
+                length: 0,
+            };
         };
 
         if self.preserve_comments && c.is_whitespace() {
@@ -624,145 +858,7 @@ impl<'a> Lexer<'a> {
             return self.string_literal(start_byte, start_col);
         }
 
-        let kind = match c {
-            '(' => TokenTypeBase::LeftParen,
-            ')' => TokenTypeBase::RightParen,
-            '{' => TokenTypeBase::LeftBrace,
-            '}' => TokenTypeBase::RightBrace,
-            '[' => TokenTypeBase::LeftBracket,
-            ']' => TokenTypeBase::RightBracket,
-
-            ';' => TokenTypeBase::Semicolon,
-            ',' => TokenTypeBase::Comma,
-            '+' => {
-                if self.peek_char() == Some('=') {
-                    self.advance();
-                    TokenTypeBase::PlusEquals
-                } else {
-                    TokenTypeBase::Plus
-                }
-            }
-            '*' => {
-                if self.peek_char() == Some('=') {
-                    self.advance();
-                    TokenTypeBase::StarEquals
-                } else {
-                    TokenTypeBase::Star
-                }
-            }
-            '@' => TokenTypeBase::At,
-            '$' => TokenTypeBase::Dollar,
-            '?' => TokenTypeBase::Question,
-            '/' => {
-                if self.peek_char() == Some('=') {
-                    self.advance();
-                    TokenTypeBase::SlashEquals
-                } else {
-                    TokenTypeBase::Slash
-                }
-            }
-            '%' => {
-                if self.peek_char() == Some('=') {
-                    self.advance();
-                    TokenTypeBase::PercentEquals
-                } else {
-                    TokenTypeBase::Percent
-                }
-            }
-            '^' => {
-                if self.peek_char() == Some('=') {
-                    self.advance();
-                    TokenTypeBase::CaretEquals
-                } else {
-                    TokenTypeBase::Caret
-                }
-            }
-            '=' => {
-                if self.peek_char() == Some('=') {
-                    self.advance();
-                    TokenTypeBase::EqEq
-                } else if self.peek_char() == Some('>') {
-                    self.advance();
-                    TokenTypeBase::FatArrow
-                } else {
-                    TokenTypeBase::Equals
-                }
-            }
-            '!' => {
-                if self.peek_char() == Some('=') {
-                    self.advance();
-                    TokenTypeBase::NotEq
-                } else {
-                    TokenTypeBase::Bang
-                }
-            }
-            '<' => {
-                if self.peek_char() == Some('=') {
-                    self.advance();
-                    TokenTypeBase::LessEq
-                } else {
-                    TokenTypeBase::LeftAngle
-                }
-            }
-            '>' => {
-                if self.peek_char() == Some('=') {
-                    self.advance();
-                    TokenTypeBase::GreaterEq
-                } else {
-                    TokenTypeBase::RightAngle
-                }
-            }
-            '&' => {
-                if self.peek_char() == Some('&') {
-                    self.advance();
-                    TokenTypeBase::AndAnd
-                } else if self.peek_char() == Some('=') {
-                    self.advance();
-                    TokenTypeBase::AmpersandEquals
-                } else {
-                    TokenTypeBase::Ampersand
-                }
-            }
-            '|' => {
-                if self.peek_char() == Some('|') {
-                    self.advance();
-                    TokenTypeBase::OrOr
-                } else if self.peek_char() == Some('=') {
-                    self.advance();
-                    TokenTypeBase::PipeEquals
-                } else {
-                    TokenTypeBase::Pipe
-                }
-            }
-            '.' => {
-                if self.peek_char() == Some('.') {
-                    self.advance();
-                    TokenTypeBase::DoubleDot
-                } else {
-                    TokenTypeBase::Dot
-                }
-            }
-            '-' => {
-                if self.peek_char() == Some('>') {
-                    self.advance();
-                    TokenTypeBase::Arrow
-                } else if self.peek_char() == Some('=') {
-                    self.advance();
-                    TokenTypeBase::MinusEquals
-                } else {
-                    TokenTypeBase::Minus
-                }
-            }
-            ':' => {
-                if self.peek_char() == Some(':') {
-                    self.advance();
-                    TokenTypeBase::DoubleColon
-                } else {
-                    TokenTypeBase::Colon
-                }
-            }
-            _ => TokenTypeBase::Unknown(c),
-        };
+        let kind = self.symbol(c);
 
         TokenBase {
             kind,
@@ -772,6 +868,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Every token from here to the end of the source. The last one is the `Eof` token.
     pub fn tokenize(&mut self) -> Vec<Token<'a>> {
         let mut tokens = Vec::new();
         loop {
@@ -786,111 +883,13 @@ impl<'a> Lexer<'a> {
     }
 }
 
-impl<'a> Token<'a> {
+impl Token<'_> {
+    /// The same token with its own copy of its text, so it can outlive the source.
+    #[must_use]
     pub fn into_owned(self) -> OwnedToken {
-        let kind = match self.kind {
-            TokenTypeBase::Fn => TokenTypeBase::Fn,
-            TokenTypeBase::Let => TokenTypeBase::Let,
-            TokenTypeBase::Mut => TokenTypeBase::Mut,
-            TokenTypeBase::For => TokenTypeBase::For,
-            TokenTypeBase::In => TokenTypeBase::In,
-            TokenTypeBase::If => TokenTypeBase::If,
-            TokenTypeBase::Else => TokenTypeBase::Else,
-            TokenTypeBase::Loop => TokenTypeBase::Loop,
-            TokenTypeBase::While => TokenTypeBase::While,
-            TokenTypeBase::Break => TokenTypeBase::Break,
-            TokenTypeBase::Continue => TokenTypeBase::Continue,
-            TokenTypeBase::Return => TokenTypeBase::Return,
-            TokenTypeBase::Spawn => TokenTypeBase::Spawn,
-            TokenTypeBase::On => TokenTypeBase::On,
-            TokenTypeBase::Where => TokenTypeBase::Where,
-            TokenTypeBase::Transfer => TokenTypeBase::Transfer,
-            TokenTypeBase::Unroll => TokenTypeBase::Unroll,
-            TokenTypeBase::Across => TokenTypeBase::Across,
-            TokenTypeBase::Match => TokenTypeBase::Match,
-            TokenTypeBase::Struct => TokenTypeBase::Struct,
-            TokenTypeBase::Unsafe => TokenTypeBase::Unsafe,
-            TokenTypeBase::Safe => TokenTypeBase::Safe,
-            TokenTypeBase::Extern => TokenTypeBase::Extern,
-            TokenTypeBase::Trait => TokenTypeBase::Trait,
-            TokenTypeBase::TypeKw => TokenTypeBase::TypeKw,
-            TokenTypeBase::Impl => TokenTypeBase::Impl,
-            TokenTypeBase::Comptime => TokenTypeBase::Comptime,
-            TokenTypeBase::Import => TokenTypeBase::Import,
-            TokenTypeBase::Assert => TokenTypeBase::Assert,
-            TokenTypeBase::Enum => TokenTypeBase::Enum,
-            TokenTypeBase::As => TokenTypeBase::As,
-            TokenTypeBase::Grad => TokenTypeBase::Grad,
-            TokenTypeBase::Vjp => TokenTypeBase::Vjp,
-            TokenTypeBase::Jvp => TokenTypeBase::Jvp,
-            TokenTypeBase::Requires => TokenTypeBase::Requires,
-            TokenTypeBase::Ensures => TokenTypeBase::Ensures,
-            TokenTypeBase::Invariant => TokenTypeBase::Invariant,
-            TokenTypeBase::MacroRules => TokenTypeBase::MacroRules,
-            TokenTypeBase::Topology => TokenTypeBase::Topology,
-            TokenTypeBase::Memory => TokenTypeBase::Memory,
-            TokenTypeBase::Ref => TokenTypeBase::Ref,
-            TokenTypeBase::Verified => TokenTypeBase::Verified,
-            TokenTypeBase::Pinned => TokenTypeBase::Pinned,
-            TokenTypeBase::HardwareState => TokenTypeBase::HardwareState,
-            TokenTypeBase::Identifier(s) => {
-                TokenTypeBase::Identifier(crate::symbol::Symbol::from(s))
-            }
-            TokenTypeBase::Number(s) => TokenTypeBase::Number(crate::symbol::Symbol::from(s)),
-            TokenTypeBase::StringLiteral(s) => TokenTypeBase::StringLiteral(s.into_owned()),
-            TokenTypeBase::LeftParen => TokenTypeBase::LeftParen,
-            TokenTypeBase::RightParen => TokenTypeBase::RightParen,
-            TokenTypeBase::LeftBrace => TokenTypeBase::LeftBrace,
-            TokenTypeBase::RightBrace => TokenTypeBase::RightBrace,
-            TokenTypeBase::LeftBracket => TokenTypeBase::LeftBracket,
-            TokenTypeBase::RightBracket => TokenTypeBase::RightBracket,
-            TokenTypeBase::LeftAngle => TokenTypeBase::LeftAngle,
-            TokenTypeBase::RightAngle => TokenTypeBase::RightAngle,
-            TokenTypeBase::Colon => TokenTypeBase::Colon,
-            TokenTypeBase::DoubleColon => TokenTypeBase::DoubleColon,
-            TokenTypeBase::Semicolon => TokenTypeBase::Semicolon,
-            TokenTypeBase::Comma => TokenTypeBase::Comma,
-            TokenTypeBase::Equals => TokenTypeBase::Equals,
-            TokenTypeBase::PlusEquals => TokenTypeBase::PlusEquals,
-            TokenTypeBase::MinusEquals => TokenTypeBase::MinusEquals,
-            TokenTypeBase::StarEquals => TokenTypeBase::StarEquals,
-            TokenTypeBase::SlashEquals => TokenTypeBase::SlashEquals,
-            TokenTypeBase::PercentEquals => TokenTypeBase::PercentEquals,
-            TokenTypeBase::AmpersandEquals => TokenTypeBase::AmpersandEquals,
-            TokenTypeBase::PipeEquals => TokenTypeBase::PipeEquals,
-            TokenTypeBase::CaretEquals => TokenTypeBase::CaretEquals,
-            TokenTypeBase::Arrow => TokenTypeBase::Arrow,
-            TokenTypeBase::FatArrow => TokenTypeBase::FatArrow,
-            TokenTypeBase::Plus => TokenTypeBase::Plus,
-            TokenTypeBase::Minus => TokenTypeBase::Minus,
-            TokenTypeBase::Star => TokenTypeBase::Star,
-            TokenTypeBase::Slash => TokenTypeBase::Slash,
-            TokenTypeBase::Percent => TokenTypeBase::Percent,
-            TokenTypeBase::Dot => TokenTypeBase::Dot,
-            TokenTypeBase::DoubleDot => TokenTypeBase::DoubleDot,
-            TokenTypeBase::Ampersand => TokenTypeBase::Ampersand,
-            TokenTypeBase::Caret => TokenTypeBase::Caret,
-            TokenTypeBase::At => TokenTypeBase::At,
-            TokenTypeBase::Question => TokenTypeBase::Question,
-            TokenTypeBase::Dollar => TokenTypeBase::Dollar,
-            TokenTypeBase::EqEq => TokenTypeBase::EqEq,
-            TokenTypeBase::NotEq => TokenTypeBase::NotEq,
-            TokenTypeBase::LessEq => TokenTypeBase::LessEq,
-            TokenTypeBase::GreaterEq => TokenTypeBase::GreaterEq,
-            TokenTypeBase::AndAnd => TokenTypeBase::AndAnd,
-            TokenTypeBase::OrOr => TokenTypeBase::OrOr,
-            TokenTypeBase::Bang => TokenTypeBase::Bang,
-            TokenTypeBase::Pipe => TokenTypeBase::Pipe,
-            TokenTypeBase::Eof => TokenTypeBase::Eof,
-            TokenTypeBase::Unknown(c) => TokenTypeBase::Unknown(c),
-            TokenTypeBase::Comment(s) => TokenTypeBase::Comment(crate::symbol::Symbol::from(s)),
-            TokenTypeBase::DocComment(s) => {
-                TokenTypeBase::DocComment(crate::symbol::Symbol::from(s))
-            }
-            TokenTypeBase::Whitespace(s) => {
-                TokenTypeBase::Whitespace(crate::symbol::Symbol::from(s))
-            }
-        };
+        let kind = self
+            .kind
+            .map_text(crate::symbol::Symbol::from, std::borrow::Cow::into_owned);
         OwnedToken {
             kind,
             line: self.line,
@@ -901,106 +900,12 @@ impl<'a> Token<'a> {
 }
 
 impl OwnedToken {
-    pub fn as_token<'a>(&'a self) -> Token<'a> {
-        let kind = match &self.kind {
-            TokenTypeBase::Fn => TokenTypeBase::Fn,
-            TokenTypeBase::Let => TokenTypeBase::Let,
-            TokenTypeBase::Mut => TokenTypeBase::Mut,
-            TokenTypeBase::For => TokenTypeBase::For,
-            TokenTypeBase::In => TokenTypeBase::In,
-            TokenTypeBase::If => TokenTypeBase::If,
-            TokenTypeBase::Else => TokenTypeBase::Else,
-            TokenTypeBase::Loop => TokenTypeBase::Loop,
-            TokenTypeBase::While => TokenTypeBase::While,
-            TokenTypeBase::Break => TokenTypeBase::Break,
-            TokenTypeBase::Continue => TokenTypeBase::Continue,
-            TokenTypeBase::Return => TokenTypeBase::Return,
-            TokenTypeBase::Spawn => TokenTypeBase::Spawn,
-            TokenTypeBase::On => TokenTypeBase::On,
-            TokenTypeBase::Where => TokenTypeBase::Where,
-            TokenTypeBase::Transfer => TokenTypeBase::Transfer,
-            TokenTypeBase::Unroll => TokenTypeBase::Unroll,
-            TokenTypeBase::Across => TokenTypeBase::Across,
-            TokenTypeBase::Match => TokenTypeBase::Match,
-            TokenTypeBase::Struct => TokenTypeBase::Struct,
-            TokenTypeBase::Unsafe => TokenTypeBase::Unsafe,
-            TokenTypeBase::Safe => TokenTypeBase::Safe,
-            TokenTypeBase::Extern => TokenTypeBase::Extern,
-            TokenTypeBase::Trait => TokenTypeBase::Trait,
-            TokenTypeBase::TypeKw => TokenTypeBase::TypeKw,
-            TokenTypeBase::Impl => TokenTypeBase::Impl,
-            TokenTypeBase::Comptime => TokenTypeBase::Comptime,
-            TokenTypeBase::Import => TokenTypeBase::Import,
-            TokenTypeBase::Assert => TokenTypeBase::Assert,
-            TokenTypeBase::Enum => TokenTypeBase::Enum,
-            TokenTypeBase::As => TokenTypeBase::As,
-            TokenTypeBase::Grad => TokenTypeBase::Grad,
-            TokenTypeBase::Vjp => TokenTypeBase::Vjp,
-            TokenTypeBase::Jvp => TokenTypeBase::Jvp,
-            TokenTypeBase::Requires => TokenTypeBase::Requires,
-            TokenTypeBase::Ensures => TokenTypeBase::Ensures,
-            TokenTypeBase::Invariant => TokenTypeBase::Invariant,
-            TokenTypeBase::MacroRules => TokenTypeBase::MacroRules,
-            TokenTypeBase::Topology => TokenTypeBase::Topology,
-            TokenTypeBase::Memory => TokenTypeBase::Memory,
-            TokenTypeBase::Ref => TokenTypeBase::Ref,
-            TokenTypeBase::Verified => TokenTypeBase::Verified,
-            TokenTypeBase::Pinned => TokenTypeBase::Pinned,
-            TokenTypeBase::HardwareState => TokenTypeBase::HardwareState,
-            TokenTypeBase::Identifier(s) => TokenTypeBase::Identifier(&**s),
-            TokenTypeBase::Number(s) => TokenTypeBase::Number(&**s),
-            TokenTypeBase::StringLiteral(s) => {
-                TokenTypeBase::StringLiteral(std::borrow::Cow::Borrowed(s.as_str()))
-            }
-            TokenTypeBase::LeftParen => TokenTypeBase::LeftParen,
-            TokenTypeBase::RightParen => TokenTypeBase::RightParen,
-            TokenTypeBase::LeftBrace => TokenTypeBase::LeftBrace,
-            TokenTypeBase::RightBrace => TokenTypeBase::RightBrace,
-            TokenTypeBase::LeftBracket => TokenTypeBase::LeftBracket,
-            TokenTypeBase::RightBracket => TokenTypeBase::RightBracket,
-            TokenTypeBase::LeftAngle => TokenTypeBase::LeftAngle,
-            TokenTypeBase::RightAngle => TokenTypeBase::RightAngle,
-            TokenTypeBase::Colon => TokenTypeBase::Colon,
-            TokenTypeBase::DoubleColon => TokenTypeBase::DoubleColon,
-            TokenTypeBase::Semicolon => TokenTypeBase::Semicolon,
-            TokenTypeBase::Comma => TokenTypeBase::Comma,
-            TokenTypeBase::Equals => TokenTypeBase::Equals,
-            TokenTypeBase::PlusEquals => TokenTypeBase::PlusEquals,
-            TokenTypeBase::MinusEquals => TokenTypeBase::MinusEquals,
-            TokenTypeBase::StarEquals => TokenTypeBase::StarEquals,
-            TokenTypeBase::SlashEquals => TokenTypeBase::SlashEquals,
-            TokenTypeBase::PercentEquals => TokenTypeBase::PercentEquals,
-            TokenTypeBase::AmpersandEquals => TokenTypeBase::AmpersandEquals,
-            TokenTypeBase::PipeEquals => TokenTypeBase::PipeEquals,
-            TokenTypeBase::CaretEquals => TokenTypeBase::CaretEquals,
-            TokenTypeBase::Arrow => TokenTypeBase::Arrow,
-            TokenTypeBase::FatArrow => TokenTypeBase::FatArrow,
-            TokenTypeBase::Plus => TokenTypeBase::Plus,
-            TokenTypeBase::Minus => TokenTypeBase::Minus,
-            TokenTypeBase::Star => TokenTypeBase::Star,
-            TokenTypeBase::Slash => TokenTypeBase::Slash,
-            TokenTypeBase::Percent => TokenTypeBase::Percent,
-            TokenTypeBase::Dot => TokenTypeBase::Dot,
-            TokenTypeBase::DoubleDot => TokenTypeBase::DoubleDot,
-            TokenTypeBase::Ampersand => TokenTypeBase::Ampersand,
-            TokenTypeBase::Caret => TokenTypeBase::Caret,
-            TokenTypeBase::At => TokenTypeBase::At,
-            TokenTypeBase::Question => TokenTypeBase::Question,
-            TokenTypeBase::Dollar => TokenTypeBase::Dollar,
-            TokenTypeBase::EqEq => TokenTypeBase::EqEq,
-            TokenTypeBase::NotEq => TokenTypeBase::NotEq,
-            TokenTypeBase::LessEq => TokenTypeBase::LessEq,
-            TokenTypeBase::GreaterEq => TokenTypeBase::GreaterEq,
-            TokenTypeBase::AndAnd => TokenTypeBase::AndAnd,
-            TokenTypeBase::OrOr => TokenTypeBase::OrOr,
-            TokenTypeBase::Bang => TokenTypeBase::Bang,
-            TokenTypeBase::Pipe => TokenTypeBase::Pipe,
-            TokenTypeBase::Eof => TokenTypeBase::Eof,
-            TokenTypeBase::Unknown(c) => TokenTypeBase::Unknown(*c),
-            TokenTypeBase::Comment(s) => TokenTypeBase::Comment(&**s),
-            TokenTypeBase::DocComment(s) => TokenTypeBase::DocComment(&**s),
-            TokenTypeBase::Whitespace(s) => TokenTypeBase::Whitespace(&**s),
-        };
+    /// The same token with its text borrowed from this one.
+    #[must_use]
+    pub fn as_token(&self) -> Token<'_> {
+        let kind = self
+            .kind
+            .map_text_ref(|s| &**s, |s| std::borrow::Cow::Borrowed(s.as_str()));
         Token {
             kind,
             line: self.line,
@@ -1011,6 +916,11 @@ impl OwnedToken {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 
@@ -1118,7 +1028,7 @@ mod tests {
         if let TokenTypeBase::StringLiteral(s) = kind {
             assert_eq!(s.as_ref(), "hello");
         } else {
-            panic!("Expected StringLiteral, got {:?}", kind);
+            panic!("Expected StringLiteral, got {kind:?}");
         }
     }
 

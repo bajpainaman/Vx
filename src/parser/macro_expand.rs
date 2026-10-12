@@ -14,11 +14,13 @@
 //===----------------------------------------------------------------------===//
 
 use crate::lexer::OwnedTokenType;
-use crate::syntax::*;
+use crate::syntax::{expr, stmt, Function, MacroRule, TokenTree, VxModule};
 use crate::syntax::{Delimiter, Span};
 use std::collections::HashMap;
 
+/// Replaces every macro call in a module with the code the macro stands for.
 pub struct MacroExpander<'a> {
+    /// The rules of every `macro_rules!` macro, by macro name.
     pub macros: &'a HashMap<crate::symbol::Symbol, Vec<MacroRule>>,
     /// The trait methods that carry a default body, across every module. Held here because
     /// filling them in is the last thing expansion does, and it has to be the last thing:
@@ -27,6 +29,8 @@ pub struct MacroExpander<'a> {
     pub trait_defaults: &'a crate::resolver::TraitDefaults,
 }
 
+/// Move an expression out of its place, leaving the number `0` there until the caller writes
+/// the expanded expression back.
 fn take_expr(expr: &mut expr::Expr) -> expr::Expr {
     std::mem::replace(
         expr,
@@ -37,28 +41,20 @@ fn take_expr(expr: &mut expr::Expr) -> expr::Expr {
         )),
     )
 }
-/// Split a `print!`/`println!` format string at its `{}` placeholders and interleave the
-/// arguments, so `println!("a={} b={}", x, y)` becomes the four pieces `"a="`, `x`, `" b="`, `y`.
+/// Split a format string at its `{}` placeholders and put the next argument in each place.
+/// Returns the pieces in the order they print, and how many placeholders there were.
+/// `exprs` is the whole argument list of the macro, the format string first.
 ///
-/// Both lowering paths print a macro's arguments in sequence, so doing this here is the whole
-/// implementation of formatting -- and it fixes both paths at once. Without it the format string
-/// was printed verbatim, placeholders included, and the arguments were appended after it:
-/// `println!("value={}", x)` wrote `value={}1.5`.
+/// # Errors
 ///
-/// `{{` and `}}` are the escapes for a literal brace, as in Rust. A format spec (`{:.3}`, `{name}`)
-/// is refused rather than silently printed, so the gap is visible where it is written.
-///
-/// A leading string with no `{}` at all is left alone: it is a label, and `println!("count: ", v)`
-/// -- print the arguments in sequence -- is how the corpus already spells that.
-fn interleave_format_args(
-    exprs: Vec<expr::Expr>,
+/// Fails when the format string has a placeholder other than `{}`, a `}` with no `{` before
+/// it, or more `{}` than there are arguments.
+fn split_at_placeholders(
+    text: &str,
+    fmt_span: Span,
+    exprs: &[expr::Expr],
     macro_name: &str,
-) -> Result<Vec<expr::Expr>, String> {
-    // Only a leading string literal is a format string. `print!(x)` prints a value and has none.
-    let Some(expr::Expr::StringLiteral(fmt)) = exprs.first() else {
-        return Ok(exprs);
-    };
-    let (text, fmt_span) = (fmt.value.as_ref().to_string(), fmt.span);
+) -> Result<(Vec<expr::Expr>, usize), String> {
     let mut pieces: Vec<expr::Expr> = Vec::new();
     let mut lit = String::new();
     let mut args = exprs.iter().skip(1);
@@ -105,6 +101,37 @@ fn interleave_format_args(
             lit, fmt_span,
         )));
     }
+    Ok((pieces, used))
+}
+
+/// Split a `print!`/`println!` format string at its `{}` placeholders and interleave the
+/// arguments, so `println!("a={} b={}", x, y)` becomes the four pieces `"a="`, `x`, `" b="`, `y`.
+///
+/// Both lowering paths print a macro's arguments in sequence, so doing this here is the whole
+/// implementation of formatting -- and it fixes both paths at once. Without it the format string
+/// was printed verbatim, placeholders included, and the arguments were appended after it:
+/// `println!("value={}", x)` wrote `value={}1.5`.
+///
+/// `{{` and `}}` are the escapes for a literal brace, as in Rust. A format spec (`{:.3}`, `{name}`)
+/// is refused rather than silently printed, so the gap is visible where it is written.
+///
+/// A leading string with no `{}` at all is left alone: it is a label, and `println!("count: ", v)`
+/// -- print the arguments in sequence -- is how the corpus already spells that.
+///
+/// # Errors
+///
+/// Fails when the format string has a placeholder other than `{}`, a `}` with no `{` before
+/// it, or a number of `{}` different from the number of arguments.
+fn interleave_format_args(
+    exprs: Vec<expr::Expr>,
+    macro_name: &str,
+) -> Result<Vec<expr::Expr>, String> {
+    // Only a leading string literal is a format string. `print!(x)` prints a value and has none.
+    let Some(expr::Expr::StringLiteral(fmt)) = exprs.first() else {
+        return Ok(exprs);
+    };
+    let (text, fmt_span) = (fmt.value.as_ref().to_string(), fmt.span);
+    let (pieces, used) = split_at_placeholders(&text, fmt_span, &exprs, macro_name)?;
     let supplied = exprs.len() - 1;
     // A leading string with no placeholders is a label, not a format string: Vx prints a macro's
     // arguments in sequence, and `println!("count: ", v)` is the established spelling for that.
@@ -132,6 +159,8 @@ fn interleave_format_args(
 }
 
 impl<'a> MacroExpander<'a> {
+    /// An expander that knows the given macros and trait default methods.
+    #[must_use]
     pub fn new(
         macros: &'a HashMap<crate::symbol::Symbol, Vec<MacroRule>>,
         trait_defaults: &'a crate::resolver::TraitDefaults,
@@ -142,24 +171,30 @@ impl<'a> MacroExpander<'a> {
         }
     }
 
-    fn parse_expanded_expr(
-        &self,
-        tokens: &[crate::lexer::OwnedToken],
-    ) -> Result<expr::Expr, String> {
+    /// Parse the tokens a macro produced as one expression.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tokens are not an expression.
+    fn parse_expanded_expr(tokens: &[crate::lexer::OwnedToken]) -> Result<expr::Expr, String> {
         let lexed_tokens: Vec<_> = tokens.iter().map(|t| t.as_token()).collect();
         let mut parser = crate::parser::Parser::new(&lexed_tokens, "");
-        parser.parse_expr().map_err(|e| format!("{:?}", e))
+        parser.parse_expr().map_err(|e| format!("{e:?}"))
     }
 
+    /// Parse the tokens a macro call was given as a list of expressions with commas between.
+    ///
+    /// # Errors
+    ///
+    /// Fails when one of the list's entries is not an expression.
     fn parse_expanded_exprs(
-        &self,
         tokens: &[crate::lexer::OwnedToken],
     ) -> Result<Vec<expr::Expr>, String> {
         let lexed_tokens: Vec<_> = tokens.iter().map(|t| t.as_token()).collect();
         let mut parser = crate::parser::Parser::new(&lexed_tokens, "");
         let mut exprs = Vec::new();
         while !parser.check(&crate::lexer::TokenType::Eof) {
-            exprs.push(parser.parse_expr().map_err(|e| format!("{:?}", e))?);
+            exprs.push(parser.parse_expr().map_err(|e| format!("{e:?}"))?);
             if !parser.match_token(&crate::lexer::TokenType::Comma) {
                 break;
             }
@@ -173,10 +208,14 @@ impl<'a> MacroExpander<'a> {
     /// fails to match is not an error -- the next rule is tried, and only when all of them
     /// fail is anything reported. An unknown kind raised there came out as "no matching rule
     /// found", which points at the call rather than at the typo in the rule.
-    fn validate_matcher(&self, name: &str, matcher: &[TokenTree]) -> Result<(), String> {
+    ///
+    /// # Errors
+    ///
+    /// Fails when a fragment in the matcher has a kind other than `expr`, `ty` or `ident`.
+    fn validate_matcher(name: &str, matcher: &[TokenTree]) -> Result<(), String> {
         let mut tokens = Vec::new();
         for tt in matcher {
-            tokens.extend(self.flatten_tt(tt));
+            tokens.extend(Self::flatten_tt(tt));
         }
         for (i, tok) in tokens.iter().enumerate() {
             if tok.kind != OwnedTokenType::Dollar || i + 3 >= tokens.len() {
@@ -188,9 +227,8 @@ impl<'a> MacroExpander<'a> {
             if let OwnedTokenType::Identifier(kind) = &tokens[i + 3].kind {
                 if !matches!(kind.as_ref(), "expr" | "ty" | "ident") {
                     return Err(format!(
-                        "unknown macro fragment kind '{}' in macro {}: the kinds that exist \
-                         are `expr`, `ty` and `ident`",
-                        kind, name
+                        "unknown macro fragment kind '{kind}' in macro {name}: the kinds that exist \
+                         are `expr`, `ty` and `ident`"
                     ));
                 }
             }
@@ -203,6 +241,12 @@ impl<'a> MacroExpander<'a> {
     /// The transcribed tokens are handed to a fresh parser's whole-program entry point, so a
     /// macro may produce anything that can be written at the top level -- an `impl`, a `fn`,
     /// a `struct` -- and each is parsed by the same code that parses one written by hand.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the macro is not defined, when one of its rules names a fragment kind that
+    /// does not exist, when no rule matches the call, or when the result does not parse as
+    /// items.
     fn expand_item_macro(
         &self,
         call: &stmt::MacroCallStmt,
@@ -212,21 +256,21 @@ impl<'a> MacroExpander<'a> {
             .get(call.name.as_ref())
             .ok_or_else(|| format!("Macro {} not found", call.name))?;
         for rule in rules {
-            self.validate_matcher(call.name.as_ref(), &rule.matcher)?;
+            Self::validate_matcher(call.name.as_ref(), &rule.matcher)?;
         }
         let input_tokens = match &call.token_tree {
             TokenTree::Delimited(_, inner) => {
                 let mut tokens = Vec::new();
                 for i in inner {
-                    tokens.extend(self.flatten_tt(i));
+                    tokens.extend(Self::flatten_tt(i));
                 }
                 tokens
             }
-            other => self.flatten_tt(other),
+            other => Self::flatten_tt(other),
         };
         for rule in rules {
-            if let Ok(captures) = self.match_rule(&rule.matcher, &input_tokens) {
-                let mut transcribed = self.transcribe(&rule.transcriber, &captures)?;
+            if let Ok(captures) = Self::match_rule(&rule.matcher, &input_tokens) {
+                let mut transcribed = Self::transcribe(&rule.transcriber, &captures);
                 transcribed.push(crate::lexer::OwnedToken {
                     kind: OwnedTokenType::Eof,
                     line: 0,
@@ -243,6 +287,13 @@ impl<'a> MacroExpander<'a> {
         Err(format!("No matching rule found for macro {}", call.name))
     }
 
+    /// Expand every macro call in `module`, then give each impl the default trait methods it
+    /// did not write.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a macro call cannot be expanded, or when macro calls in item position still
+    /// produce more macro calls after 64 rounds.
     pub fn expand_module(&self, module: &mut VxModule) -> Result<(), String> {
         // Item-position macro calls first, so the items they produce are expanded below like
         // any other. A produced item may call another item macro, so this drains a worklist
@@ -306,20 +357,40 @@ impl<'a> MacroExpander<'a> {
         Ok(())
     }
 
+    /// Expand the macro calls in a function's body.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a macro call in the body cannot be expanded.
     fn expand_function(&self, func: &mut Function) -> Result<(), String> {
-        let body = std::mem::take(&mut func.body);
+        self.expand_block(&mut func.body)
+    }
+
+    /// Expand the macro calls in a list of statements, in place.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a macro call in one of the statements cannot be expanded.
+    fn expand_block(&self, block: &mut Vec<stmt::Statement>) -> Result<(), String> {
+        let body = std::mem::take(block);
         let mut new_body = Vec::with_capacity(body.len());
-        for stmt in body {
-            new_body.extend(self.expand_stmt(stmt)?);
+        for s in body {
+            new_body.extend(self.expand_stmt(s)?);
         }
-        func.body = new_body;
+        *block = new_body;
         Ok(())
     }
 
+    /// Expand one statement. A statement that is a macro call becomes the expression the macro
+    /// stands for.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a macro call in the statement cannot be expanded.
     fn expand_stmt(&self, mut stmt: stmt::Statement) -> Result<Vec<stmt::Statement>, String> {
         if let stmt::Statement::MacroCall(call) = stmt {
             let expanded_expr =
-                self.expand_macro_call(&call.name, &call.token_tree, &call.block_tree)?;
+                self.expand_macro_call(&call.name, &call.token_tree, call.block_tree.as_ref())?;
             let recursively_expanded = self.expand_expr(expanded_expr)?;
             return Ok(vec![stmt::Statement::ExprStmt(stmt::ExprStmtStmt {
                 expr: recursively_expanded,
@@ -332,6 +403,11 @@ impl<'a> MacroExpander<'a> {
         Ok(vec![stmt])
     }
 
+    /// Expand the macro calls in the expressions and statements a statement holds.
+    ///
+    /// # Errors
+    ///
+    /// Fails when one of those macro calls cannot be expanded.
     fn expand_stmt_children(&self, stmt: &mut stmt::Statement) -> Result<(), String> {
         match stmt {
             stmt::Statement::ExprStmt(e) => {
@@ -357,35 +433,42 @@ impl<'a> MacroExpander<'a> {
                 *a.expr = self.expand_expr(take_expr(&mut a.expr))?;
             }
             stmt::Statement::Loop(l) => {
-                let body = std::mem::take(&mut l.body);
-                let mut new_body = Vec::with_capacity(body.len());
-                for s in body {
-                    new_body.extend(self.expand_stmt(s)?);
-                }
-                l.body = new_body;
+                self.expand_block(&mut l.body)?;
             }
             stmt::Statement::ForLoop(f) => {
                 *f.iterable = self.expand_expr(take_expr(&mut f.iterable))?;
-                let body = std::mem::take(&mut f.body);
-                let mut new_body = Vec::with_capacity(body.len());
-                for s in body {
-                    new_body.extend(self.expand_stmt(s)?);
-                }
-                f.body = new_body;
+                self.expand_block(&mut f.body)?;
             }
             _ => {}
         }
         Ok(())
     }
 
+    /// Expand an expression: a macro call becomes what the macro stands for, and every other
+    /// expression has the macro calls inside it expanded.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a macro call in the expression cannot be expanded.
     fn expand_expr(&self, mut expr: expr::Expr) -> Result<expr::Expr, String> {
         if let expr::Expr::MacroCall(call) = expr {
             let expanded =
-                self.expand_macro_call(&call.name, &call.token_tree, &call.block_tree)?;
+                self.expand_macro_call(&call.name, &call.token_tree, call.block_tree.as_ref())?;
             return self.expand_expr(expanded);
         }
         // Traverse and expand
-        match &mut expr {
+        self.expand_operands(&mut expr)?;
+        Ok(expr)
+    }
+
+    /// Expand the macro calls in the operands of an operator, a range, a field access or an
+    /// index. Any other kind of expression is passed on to `expand_call_arguments`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a macro call in the expression cannot be expanded.
+    fn expand_operands(&self, expr: &mut expr::Expr) -> Result<(), String> {
+        match expr {
             expr::Expr::BinaryOp(b) => {
                 *b.lhs = self.expand_expr(take_expr(&mut b.lhs))?;
                 *b.rhs = self.expand_expr(take_expr(&mut b.rhs))?;
@@ -418,17 +501,67 @@ impl<'a> MacroExpander<'a> {
                 *m.base = self.expand_expr(take_expr(&mut m.base))?;
                 *m.index = self.expand_expr(take_expr(&mut m.index))?;
             }
+            _ => self.expand_call_arguments(expr)?,
+        }
+        Ok(())
+    }
+
+    /// Expand the macro calls in the bodies of a `match`, an `if`, a closure, and an `unsafe`,
+    /// `comptime` or `spawn` block. Any other kind of expression has nothing left to expand.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a macro call in the expression cannot be expanded.
+    fn expand_nested_blocks(&self, expr: &mut expr::Expr) -> Result<(), String> {
+        match expr {
             expr::Expr::Match(m) => {
                 *m.expr = self.expand_expr(take_expr(&mut m.expr))?;
                 for arm in &mut m.arms {
-                    let body = std::mem::take(&mut arm.body);
-                    let mut new_body = Vec::with_capacity(body.len());
-                    for s in body {
-                        new_body.extend(self.expand_stmt(s)?);
-                    }
-                    arm.body = new_body;
+                    self.expand_block(&mut arm.body)?;
                 }
             }
+            expr::Expr::If(i) => {
+                *i.cond = self.expand_expr(take_expr(&mut i.cond))?;
+                self.expand_block(&mut i.then_block)?;
+                if let Some(else_b) = &mut i.else_block {
+                    self.expand_block(else_b)?;
+                }
+            }
+            expr::Expr::UnsafeBlock(u) => {
+                if let Some(ret) = &mut u.ret {
+                    **ret = self.expand_expr(take_expr(ret))?;
+                }
+                self.expand_block(&mut u.stmts)?;
+            }
+            expr::Expr::ComptimeBlock(u) => {
+                if let Some(ret) = &mut u.ret {
+                    **ret = self.expand_expr(take_expr(ret))?;
+                }
+                self.expand_block(&mut u.stmts)?;
+            }
+            expr::Expr::Closure(c) => {
+                *c.body = self.expand_expr(take_expr(&mut c.body))?;
+            }
+            expr::Expr::SpawnOn(s) => {
+                if let Some(ret) = &mut s.ret {
+                    **ret = self.expand_expr(take_expr(ret))?;
+                }
+                self.expand_block(&mut s.stmts)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Expand the macro calls in the arguments of a call, the fields of a struct literal and
+    /// the elements of an array or `vec!`. Any other kind of expression is passed on to
+    /// `expand_nested_blocks`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a macro call in the expression cannot be expanded.
+    fn expand_call_arguments(&self, expr: &mut expr::Expr) -> Result<(), String> {
+        match expr {
             expr::Expr::FunctionCall(f) => {
                 for arg in &mut f.args {
                     *arg = self.expand_expr(take_expr(arg))?;
@@ -455,59 +588,6 @@ impl<'a> MacroExpander<'a> {
                     *e = self.expand_expr(take_expr(e))?;
                 }
             }
-            expr::Expr::If(i) => {
-                *i.cond = self.expand_expr(take_expr(&mut i.cond))?;
-                let body = std::mem::take(&mut i.then_block);
-                let mut new_body = Vec::with_capacity(body.len());
-                for s in body {
-                    new_body.extend(self.expand_stmt(s)?);
-                }
-                i.then_block = new_body;
-                if let Some(else_b) = &mut i.else_block {
-                    let body = std::mem::take(else_b);
-                    let mut new_body = Vec::with_capacity(body.len());
-                    for s in body {
-                        new_body.extend(self.expand_stmt(s)?);
-                    }
-                    *else_b = new_body;
-                }
-            }
-            expr::Expr::UnsafeBlock(u) => {
-                if let Some(ret) = &mut u.ret {
-                    **ret = self.expand_expr(take_expr(ret))?;
-                }
-                let body = std::mem::take(&mut u.stmts);
-                let mut new_body = Vec::with_capacity(body.len());
-                for s in body {
-                    new_body.extend(self.expand_stmt(s)?);
-                }
-                u.stmts = new_body;
-            }
-            expr::Expr::ComptimeBlock(u) => {
-                if let Some(ret) = &mut u.ret {
-                    **ret = self.expand_expr(take_expr(ret))?;
-                }
-                let body = std::mem::take(&mut u.stmts);
-                let mut new_body = Vec::with_capacity(body.len());
-                for s in body {
-                    new_body.extend(self.expand_stmt(s)?);
-                }
-                u.stmts = new_body;
-            }
-            expr::Expr::Closure(c) => {
-                *c.body = self.expand_expr(take_expr(&mut c.body))?;
-            }
-            expr::Expr::SpawnOn(s) => {
-                if let Some(ret) = &mut s.ret {
-                    **ret = self.expand_expr(take_expr(ret))?;
-                }
-                let body = std::mem::take(&mut s.stmts);
-                let mut new_body = Vec::with_capacity(body.len());
-                for st in body {
-                    new_body.extend(self.expand_stmt(st)?);
-                }
-                s.stmts = new_body;
-            }
             expr::Expr::Grad(g) => {
                 for arg in &mut g.args {
                     *arg = self.expand_expr(take_expr(arg))?;
@@ -525,53 +605,61 @@ impl<'a> MacroExpander<'a> {
                 }
                 *j_expr.tangent = self.expand_expr(take_expr(&mut j_expr.tangent))?;
             }
-            _ => {}
+            _ => self.expand_nested_blocks(expr)?,
         }
-        Ok(expr)
+        Ok(())
     }
 
+    /// The expression one macro call stands for. `mlir!`, `vec!`, `print!` and `println!` are
+    /// built in; any other name is looked up in the `macro_rules!` macros.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the macro is not defined, when one of its rules names a fragment kind that
+    /// does not exist, when no rule matches the call, when the result does not parse as an
+    /// expression, or when a built-in macro is given arguments it cannot read.
     fn expand_macro_call(
         &self,
         name: &str,
         tt: &TokenTree,
-        block_tree: &Option<TokenTree>,
+        block_tree: Option<&TokenTree>,
     ) -> Result<expr::Expr, String> {
         if name == "mlir" {
-            return self.expand_mlir_macro(tt, block_tree);
+            return Self::expand_mlir_macro(tt, block_tree);
         }
 
         if name == "vec" {
-            return self.expand_vec_macro(tt);
+            return Self::expand_vec_macro(tt);
         }
         if name == "print" {
-            return self.expand_print_macro(tt);
+            return Self::expand_print_macro(tt);
         }
         if name == "println" {
-            return self.expand_println_macro(tt);
+            return Self::expand_println_macro(tt);
         }
 
         let rules = self
             .macros
             .get(name)
-            .ok_or_else(|| format!("Macro {} not found", name))?;
+            .ok_or_else(|| format!("Macro {name} not found"))?;
         for rule in rules {
-            self.validate_matcher(name, &rule.matcher)?;
+            Self::validate_matcher(name, &rule.matcher)?;
         }
 
         let input_tokens = match tt {
             TokenTree::Delimited(_, inner) => {
                 let mut tokens = Vec::new();
                 for i in inner {
-                    tokens.extend(self.flatten_tt(i));
+                    tokens.extend(Self::flatten_tt(i));
                 }
                 tokens
             }
-            _ => self.flatten_tt(tt),
+            _ => Self::flatten_tt(tt),
         };
 
         for rule in rules {
-            if let Ok(captures) = self.match_rule(&rule.matcher, &input_tokens) {
-                let mut transcribed = self.transcribe(&rule.transcriber, &captures)?;
+            if let Ok(captures) = Self::match_rule(&rule.matcher, &input_tokens) {
+                let mut transcribed = Self::transcribe(&rule.transcriber, &captures);
                 // IMPORTANT: The parser expects an EOF token at the end!
                 transcribed.push(crate::lexer::OwnedToken {
                     kind: OwnedTokenType::Eof,
@@ -579,20 +667,22 @@ impl<'a> MacroExpander<'a> {
                     column: 0,
                     length: 0,
                 });
-                return self.parse_expanded_expr(&transcribed);
+                return Self::parse_expanded_expr(&transcribed);
             }
         }
 
-        Err(format!("No matching rule found for macro {}", name))
+        Err(format!("No matching rule found for macro {name}"))
     }
 
-    fn flatten_tt(&self, tt: &TokenTree) -> Vec<crate::lexer::OwnedToken> {
+    /// The tokens of a token tree in source order, with the brackets of a delimited tree
+    /// written out as tokens.
+    fn flatten_tt(tt: &TokenTree) -> Vec<crate::lexer::OwnedToken> {
         let mut tokens = Vec::new();
         match tt {
             TokenTree::Token(t) => tokens.push(t.clone()),
             TokenTree::Group(inner) => {
                 for i in inner {
-                    tokens.extend(self.flatten_tt(i));
+                    tokens.extend(Self::flatten_tt(i));
                 }
             }
             TokenTree::Delimited(delim, inner) => {
@@ -612,7 +702,7 @@ impl<'a> MacroExpander<'a> {
                     length: 0,
                 });
                 for i in inner {
-                    tokens.extend(self.flatten_tt(i));
+                    tokens.extend(Self::flatten_tt(i));
                 }
                 tokens.push(crate::lexer::OwnedToken {
                     kind: close,
@@ -625,66 +715,81 @@ impl<'a> MacroExpander<'a> {
         tokens
     }
 
+    /// The name and kind of the fragment `$name:kind` whose `$` is the matcher token at `at`.
+    /// `None` when the tokens there are not a fragment.
+    fn fragment_at(
+        matcher_tokens: &[crate::lexer::OwnedToken],
+        at: usize,
+    ) -> Option<(&crate::symbol::Symbol, &str)> {
+        if matcher_tokens[at].kind != OwnedTokenType::Dollar || at + 3 >= matcher_tokens.len() {
+            return None;
+        }
+        let OwnedTokenType::Identifier(name) = &matcher_tokens[at + 1].kind else {
+            return None;
+        };
+        if matcher_tokens[at + 2].kind != OwnedTokenType::Colon {
+            return None;
+        }
+        let OwnedTokenType::Identifier(kind) = &matcher_tokens[at + 3].kind else {
+            return None;
+        };
+        Some((name, kind.as_ref()))
+    }
+
+    /// Match the tokens of a macro call against one rule's matcher. Returns the tokens each
+    /// fragment of the matcher took, by fragment name.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the call does not fit the matcher: a token differs, the call ends too early,
+    /// or the call has tokens left over.
     fn match_rule(
-        &self,
         matcher: &[TokenTree],
         input: &[crate::lexer::OwnedToken],
     ) -> Result<HashMap<crate::symbol::Symbol, Vec<crate::lexer::OwnedToken>>, String> {
         let mut captures = HashMap::new();
         let mut matcher_tokens = Vec::new();
         for tt in matcher {
-            matcher_tokens.extend(self.flatten_tt(tt));
+            matcher_tokens.extend(Self::flatten_tt(tt));
         }
 
         let mut i = 0; // input index
         let mut j = 0; // matcher index
 
         while j < matcher_tokens.len() {
-            let m_tok = &matcher_tokens[j];
-
-            if m_tok.kind == OwnedTokenType::Dollar && j + 2 < matcher_tokens.len() {
-                let name_tok = &matcher_tokens[j + 1];
-                let colon_tok = &matcher_tokens[j + 2];
-
-                if let OwnedTokenType::Identifier(name) = &name_tok.kind {
-                    if colon_tok.kind == OwnedTokenType::Colon && j + 3 < matcher_tokens.len() {
-                        let kind_tok = &matcher_tokens[j + 3];
-                        if let OwnedTokenType::Identifier(kind) = &kind_tok.kind {
-                            // Match a meta-variable. `ident` takes exactly one token; `expr`
-                            // and `ty` take everything up to the next token the matcher names,
-                            // which is what lets `$t : ty` capture `Tensor<f32, [4]>` as well
-                            // as `i32`. They are not told apart beyond that: nothing here
-                            // parses the capture to check it really is a type or an
-                            // expression, and the error surfaces where the capture is used.
-                            if kind.as_ref() == "ident" {
-                                if i >= input.len() {
-                                    return Err("Input ended unexpectedly".to_string());
-                                }
-                                captures.insert(name.clone(), vec![input[i].clone()]);
-                                i += 1;
-                                j += 4;
-                                continue;
-                            }
-                            if kind.as_ref() == "expr" || kind.as_ref() == "ty" {
-                                let mut captured = Vec::new();
-                                if j + 4 < matcher_tokens.len() {
-                                    let next_m_tok = &matcher_tokens[j + 4];
-                                    while i < input.len() && input[i].kind != next_m_tok.kind {
-                                        captured.push(input[i].clone());
-                                        i += 1;
-                                    }
-                                } else {
-                                    while i < input.len() {
-                                        captured.push(input[i].clone());
-                                        i += 1;
-                                    }
-                                }
-                                captures.insert(name.clone(), captured);
-                                j += 4;
-                                continue;
-                            }
+            if let Some((name, kind)) = Self::fragment_at(&matcher_tokens, j) {
+                // Match a meta-variable. `ident` takes exactly one token; `expr`
+                // and `ty` take everything up to the next token the matcher names,
+                // which is what lets `$t : ty` capture `Tensor<f32, [4]>` as well
+                // as `i32`. They are not told apart beyond that: nothing here
+                // parses the capture to check it really is a type or an
+                // expression, and the error surfaces where the capture is used.
+                if kind == "ident" {
+                    if i >= input.len() {
+                        return Err("Input ended unexpectedly".to_string());
+                    }
+                    captures.insert(name.clone(), vec![input[i].clone()]);
+                    i += 1;
+                    j += 4;
+                    continue;
+                }
+                if kind == "expr" || kind == "ty" {
+                    let mut taken = Vec::new();
+                    if j + 4 < matcher_tokens.len() {
+                        let next_m_tok = &matcher_tokens[j + 4];
+                        while i < input.len() && input[i].kind != next_m_tok.kind {
+                            taken.push(input[i].clone());
+                            i += 1;
+                        }
+                    } else {
+                        while i < input.len() {
+                            taken.push(input[i].clone());
+                            i += 1;
                         }
                     }
+                    captures.insert(name.clone(), taken);
+                    j += 4;
+                    continue;
                 }
             }
 
@@ -709,15 +814,16 @@ impl<'a> MacroExpander<'a> {
         Ok(captures)
     }
 
+    /// Write out a rule's transcriber, with each `$name` replaced by the tokens that fragment
+    /// took from the call. The result ends with an end-of-file token.
     fn transcribe(
-        &self,
         transcriber: &[TokenTree],
         captures: &HashMap<crate::symbol::Symbol, Vec<crate::lexer::OwnedToken>>,
-    ) -> Result<Vec<crate::lexer::OwnedToken>, String> {
+    ) -> Vec<crate::lexer::OwnedToken> {
         let mut tokens = Vec::new();
         let mut transcriber_tokens = Vec::new();
         for tt in transcriber {
-            transcriber_tokens.extend(self.flatten_tt(tt));
+            transcriber_tokens.extend(Self::flatten_tt(tt));
         }
 
         let mut j = 0;
@@ -766,17 +872,22 @@ impl<'a> MacroExpander<'a> {
             length: 0,
         });
 
-        Ok(tokens)
+        tokens
     }
 
-    fn expand_vec_macro(&self, tt: &TokenTree) -> Result<expr::Expr, String> {
-        let elements = match tt {
-            TokenTree::Delimited(_, inner) => inner,
-            _ => return Err("Expected delimited token tree for vec!".to_string()),
+    /// Turn a `vec!` call into the list of its elements.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the arguments are not in brackets, or when one of them is not an
+    /// expression.
+    fn expand_vec_macro(tt: &TokenTree) -> Result<expr::Expr, String> {
+        let TokenTree::Delimited(_, elements) = tt else {
+            return Err("Expected delimited token tree for vec!".to_string());
         };
         let mut tokens = Vec::new();
         for t in elements {
-            tokens.extend(self.flatten_tt(t));
+            tokens.extend(Self::flatten_tt(t));
         }
         tokens.push(crate::lexer::OwnedToken {
             kind: OwnedTokenType::Eof,
@@ -784,21 +895,26 @@ impl<'a> MacroExpander<'a> {
             column: 0,
             length: 0,
         });
-        let exprs = self.parse_expanded_exprs(&tokens)?;
+        let exprs = Self::parse_expanded_exprs(&tokens)?;
         Ok(expr::Expr::VecMacro(expr::VecMacroExpr {
             elements: exprs,
             span: Span::default(),
         }))
     }
 
-    fn expand_print_macro(&self, tt: &TokenTree) -> Result<expr::Expr, String> {
-        let elements = match tt {
-            TokenTree::Delimited(_, inner) => inner,
-            _ => return Err("Expected delimited token tree for print!".to_string()),
+    /// Turn a `print!` call into an expression that prints its arguments.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the arguments are not in brackets, when one of them is not an
+    /// expression, or when the format string and the arguments do not agree.
+    fn expand_print_macro(tt: &TokenTree) -> Result<expr::Expr, String> {
+        let TokenTree::Delimited(_, elements) = tt else {
+            return Err("Expected delimited token tree for print!".to_string());
         };
         let mut tokens = Vec::new();
         for t in elements {
-            tokens.extend(self.flatten_tt(t));
+            tokens.extend(Self::flatten_tt(t));
         }
         tokens.push(crate::lexer::OwnedToken {
             kind: OwnedTokenType::Eof,
@@ -806,21 +922,26 @@ impl<'a> MacroExpander<'a> {
             column: 0,
             length: 0,
         });
-        let exprs = self.parse_expanded_exprs(&tokens)?;
+        let exprs = Self::parse_expanded_exprs(&tokens)?;
         Ok(expr::Expr::Print(expr::PrintExpr {
             args: interleave_format_args(exprs, "print!")?,
             span: Span::default(),
         }))
     }
 
-    fn expand_println_macro(&self, tt: &TokenTree) -> Result<expr::Expr, String> {
-        let elements = match tt {
-            TokenTree::Delimited(_, inner) => inner,
-            _ => return Err("Expected delimited token tree for println!".to_string()),
+    /// Turn a `println!` call into an expression that prints its arguments and ends the line.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the arguments are not in brackets, when one of them is not an
+    /// expression, or when the format string and the arguments do not agree.
+    fn expand_println_macro(tt: &TokenTree) -> Result<expr::Expr, String> {
+        let TokenTree::Delimited(_, elements) = tt else {
+            return Err("Expected delimited token tree for println!".to_string());
         };
         let mut tokens = Vec::new();
         for t in elements {
-            tokens.extend(self.flatten_tt(t));
+            tokens.extend(Self::flatten_tt(t));
         }
         tokens.push(crate::lexer::OwnedToken {
             kind: OwnedTokenType::Eof,
@@ -828,28 +949,24 @@ impl<'a> MacroExpander<'a> {
             column: 0,
             length: 0,
         });
-        let exprs = self.parse_expanded_exprs(&tokens)?;
+        let exprs = Self::parse_expanded_exprs(&tokens)?;
         Ok(expr::Expr::Println(expr::PrintlnExpr {
             args: interleave_format_args(exprs, "println!")?,
             span: Span::default(),
         }))
     }
 
-    fn expand_mlir_macro(
-        &self,
-        tt: &TokenTree,
-        block_tree: &Option<TokenTree>,
-    ) -> Result<expr::Expr, String> {
-        let mut inputs = Vec::new();
-        let mut clobbers = Vec::new();
-        let mut returns = None;
-        let mut dialects = Vec::new();
-
-        let tokens = match tt {
+    /// The tokens inside the brackets of an `mlir!` call, with an end-of-file token after them.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the arguments of the call are not in brackets.
+    fn mlir_header_tokens(tt: &TokenTree) -> Result<Vec<crate::lexer::OwnedToken>, String> {
+        match tt {
             TokenTree::Delimited(_, inner) => {
                 let mut t = Vec::new();
                 for i in inner {
-                    t.extend(self.flatten_tt(i));
+                    t.extend(Self::flatten_tt(i));
                 }
                 t.push(crate::lexer::OwnedToken {
                     kind: crate::lexer::OwnedTokenType::Eof,
@@ -857,10 +974,233 @@ impl<'a> MacroExpander<'a> {
                     column: 0,
                     length: 0,
                 });
-                t
+                Ok(t)
             }
-            _ => return Err("Expected delimited token tree for mlir!".to_string()),
+            _ => Err("Expected delimited token tree for mlir!".to_string()),
+        }
+    }
+
+    /// Parse the `inputs` field of an `mlir!` call, `(%a = x: type, ...)`, and add each entry
+    /// to `inputs`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the list is not in `(` and `)`, or when an entry is not a name, `=`, an
+    /// expression, `:` and a type.
+    fn parse_mlir_inputs(
+        parser: &mut crate::parser::Parser<'_>,
+        inputs: &mut Vec<(crate::symbol::Symbol, expr::Expr, String)>,
+    ) -> Result<(), String> {
+        parser
+            .consume(&crate::lexer::TokenType::LeftParen, "Expected '('")
+            .map_err(|e| e.format(""))?;
+        if !parser.check(&crate::lexer::TokenType::RightParen) {
+            loop {
+                // An MLIR value name: `%arg`. Until `%` was the remainder
+                // operator nothing else in the language spelled it, so it arrived
+                // here as `Unknown('%')`; it is an ordinary token now.
+                let is_percent = match parser.peek().kind {
+                    crate::lexer::TokenType::Percent => {
+                        parser.advance();
+                        true
+                    }
+                    _ => false,
+                };
+                let arg_name = match &parser.advance().kind {
+                    crate::lexer::TokenType::Identifier(ident) => {
+                        if is_percent {
+                            format!("%{ident}")
+                        } else {
+                            ident.to_string()
+                        }
+                    }
+                    _ => return Err("Expected identifier in inputs".to_string()),
+                };
+                parser
+                    .consume(&crate::lexer::TokenType::Equals, "Expected '='")
+                    .map_err(|e| e.format(""))?;
+                let expr = parser.parse_expr().map_err(|e| e.format(""))?;
+                parser
+                    .consume(&crate::lexer::TokenType::Colon, "Expected ':'")
+                    .map_err(|e| e.format(""))?;
+
+                let ty_str = Self::parse_mlir_type_text(parser);
+                inputs.push((arg_name.into(), expr, ty_str));
+
+                if !parser.match_token(&crate::lexer::TokenType::Comma) {
+                    break;
+                }
+            }
+        }
+        parser
+            .consume(&crate::lexer::TokenType::RightParen, "Expected ')'")
+            .map_err(|e| e.format(""))?;
+        Ok(())
+    }
+
+    /// The MLIR type of one `inputs` entry as text: every token up to the `,` or `)` that ends
+    /// the entry, with a space wherever the source had one.
+    fn parse_mlir_type_text(parser: &mut crate::parser::Parser<'_>) -> String {
+        let mut ty_str = String::new();
+        let mut angle_depth = 0;
+        // Keep the gaps the source had. Gluing the tokens together turned
+        // `memref<N x M x f32>` into one word, and a type parameter that is
+        // not a word of its own cannot be substituted (Vx#414).
+        let mut prev_end = 0;
+        while !parser.check(&crate::lexer::TokenType::Eof) {
+            if angle_depth == 0
+                && (parser.check(&crate::lexer::TokenType::Comma)
+                    || parser.check(&crate::lexer::TokenType::RightParen))
+            {
+                break;
+            }
+            let tok = parser.advance();
+            if tok.kind == crate::lexer::TokenType::LeftAngle {
+                angle_depth += 1;
+            } else if tok.kind == crate::lexer::TokenType::RightAngle {
+                angle_depth -= 1;
+            }
+            if prev_end > 0 && tok.column > prev_end {
+                ty_str.push(' ');
+            }
+            prev_end = tok.column + tok.length;
+            ty_str.push_str(&tok.kind.to_string());
+        }
+        ty_str
+    }
+
+    /// Parse the `clobbers` field of an `mlir!` call, `[a, b]`, and add each expression to
+    /// `clobbers`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the list is not in `[` and `]`, or when an entry is not an expression.
+    fn parse_mlir_clobbers(
+        parser: &mut crate::parser::Parser<'_>,
+        clobbers: &mut Vec<expr::Expr>,
+    ) -> Result<(), String> {
+        parser
+            .consume(&crate::lexer::TokenType::LeftBracket, "Expected '['")
+            .map_err(|e| e.format(""))?;
+        if !parser.check(&crate::lexer::TokenType::RightBracket) {
+            loop {
+                clobbers.push(parser.parse_expr().map_err(|e| e.format(""))?);
+                if !parser.match_token(&crate::lexer::TokenType::Comma) {
+                    break;
+                }
+            }
+        }
+        parser
+            .consume(&crate::lexer::TokenType::RightBracket, "Expected ']'")
+            .map_err(|e| e.format(""))?;
+        Ok(())
+    }
+
+    /// Parse the `dialects` field of an `mlir!` call, `["a", "b"]`, and add each name to
+    /// `dialects`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the list is not in `[` and `]`, or when an entry is not a string.
+    fn parse_mlir_dialects(
+        parser: &mut crate::parser::Parser<'_>,
+        dialects: &mut Vec<String>,
+    ) -> Result<(), String> {
+        parser
+            .consume(&crate::lexer::TokenType::LeftBracket, "Expected '['")
+            .map_err(|e| e.format(""))?;
+        if !parser.check(&crate::lexer::TokenType::RightBracket) {
+            loop {
+                match &parser.advance().kind {
+                    crate::lexer::TokenType::StringLiteral(lit) => {
+                        dialects.push(lit.to_string());
+                    }
+                    _ => return Err("Expected string literal in dialects".to_string()),
+                }
+                if !parser.match_token(&crate::lexer::TokenType::Comma) {
+                    break;
+                }
+            }
+        }
+        parser
+            .consume(&crate::lexer::TokenType::RightBracket, "Expected ']'")
+            .map_err(|e| e.format(""))?;
+        Ok(())
+    }
+
+    /// The text of the block after an `mlir!` call, laid out by the line and column of each
+    /// token so it reads as it did in the source.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the call has no block after it.
+    fn mlir_block_text(block_tree: Option<&TokenTree>) -> Result<String, String> {
+        let Some(TokenTree::Delimited(_, inner)) = block_tree else {
+            return Err("mlir! macro requires a trailing block".to_string());
         };
+        let mut t = Vec::new();
+        for i in inner {
+            t.extend(Self::flatten_tt(i));
+        }
+
+        let mut s = String::new();
+        let mut current_line = 0;
+        let mut current_col = 0;
+
+        for tok in t {
+            let text = tok.kind.to_string();
+            // A delimiter synthesized when the token tree was built carries no position.
+            // Laying one out by column drove the rest of its line hundreds of columns to
+            // the right, and the block stopped parsing (Vx#414).
+            if tok.line == 0 {
+                s.push_str(&text);
+                current_col += text.chars().count();
+                continue;
+            }
+
+            if current_line == 0 {
+                current_line = tok.line;
+                current_col = tok.column;
+            }
+
+            if tok.line > current_line {
+                for _ in 0..(tok.line - current_line) {
+                    s.push('\n');
+                }
+                current_col = 1;
+                current_line = tok.line;
+            }
+
+            if tok.column > current_col {
+                for _ in 0..(tok.column - current_col) {
+                    s.push(' ');
+                }
+            }
+
+            s.push_str(&text);
+            current_col = tok.column + tok.length;
+        }
+        Ok(s)
+    }
+
+    /// Turn an `mlir!` call into an inline MLIR expression: the fields in the brackets, then
+    /// the block of MLIR text.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the arguments are not in brackets, when a field is not `inputs`, `clobbers`,
+    /// `returns` or `dialects`, when a field's value does not parse, or when the call has no
+    /// block after it.
+    fn expand_mlir_macro(
+        tt: &TokenTree,
+        block_tree: Option<&TokenTree>,
+    ) -> Result<expr::Expr, String> {
+        let mut inputs = Vec::new();
+        let mut clobbers = Vec::new();
+        let mut returns = None;
+        let mut dialects = Vec::new();
+
+        let tokens = Self::mlir_header_tokens(tt)?;
 
         let lexed_tokens: Vec<_> = tokens.iter().map(|t| t.as_token()).collect();
         let mut parser = crate::parser::Parser::new(&lexed_tokens, "");
@@ -879,92 +1219,8 @@ impl<'a> MacroExpander<'a> {
                 .map_err(|e| e.format(""))?;
 
             match field_name.as_ref() {
-                "inputs" => {
-                    parser
-                        .consume(&crate::lexer::TokenType::LeftParen, "Expected '('")
-                        .map_err(|e| e.format(""))?;
-                    if !parser.check(&crate::lexer::TokenType::RightParen) {
-                        loop {
-                            // An MLIR value name: `%arg`. Until `%` was the remainder
-                            // operator nothing else in the language spelled it, so it arrived
-                            // here as `Unknown('%')`; it is an ordinary token now.
-                            let is_percent = match parser.peek().kind {
-                                crate::lexer::TokenType::Percent => {
-                                    parser.advance();
-                                    true
-                                }
-                                _ => false,
-                            };
-                            let arg_name = match &parser.advance().kind {
-                                crate::lexer::TokenType::Identifier(ident) => {
-                                    if is_percent {
-                                        format!("%{}", ident)
-                                    } else {
-                                        ident.to_string()
-                                    }
-                                }
-                                _ => return Err("Expected identifier in inputs".to_string()),
-                            };
-                            parser
-                                .consume(&crate::lexer::TokenType::Equals, "Expected '='")
-                                .map_err(|e| e.format(""))?;
-                            let expr = parser.parse_expr().map_err(|e| e.format(""))?;
-                            parser
-                                .consume(&crate::lexer::TokenType::Colon, "Expected ':'")
-                                .map_err(|e| e.format(""))?;
-
-                            let mut ty_str = String::new();
-                            let mut angle_depth = 0;
-                            // Keep the gaps the source had. Gluing the tokens together turned
-                            // `memref<N x M x f32>` into one word, and a type parameter that is
-                            // not a word of its own cannot be substituted (Vx#414).
-                            let mut prev_end = 0;
-                            while !parser.check(&crate::lexer::TokenType::Eof) {
-                                if angle_depth == 0
-                                    && (parser.check(&crate::lexer::TokenType::Comma)
-                                        || parser.check(&crate::lexer::TokenType::RightParen))
-                                {
-                                    break;
-                                }
-                                let tok = parser.advance();
-                                if tok.kind == crate::lexer::TokenType::LeftAngle {
-                                    angle_depth += 1;
-                                } else if tok.kind == crate::lexer::TokenType::RightAngle {
-                                    angle_depth -= 1;
-                                }
-                                if prev_end > 0 && tok.column > prev_end {
-                                    ty_str.push(' ');
-                                }
-                                prev_end = tok.column + tok.length;
-                                ty_str.push_str(&tok.kind.to_string());
-                            }
-                            inputs.push((arg_name.into(), expr, ty_str));
-
-                            if !parser.match_token(&crate::lexer::TokenType::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    parser
-                        .consume(&crate::lexer::TokenType::RightParen, "Expected ')'")
-                        .map_err(|e| e.format(""))?;
-                }
-                "clobbers" => {
-                    parser
-                        .consume(&crate::lexer::TokenType::LeftBracket, "Expected '['")
-                        .map_err(|e| e.format(""))?;
-                    if !parser.check(&crate::lexer::TokenType::RightBracket) {
-                        loop {
-                            clobbers.push(parser.parse_expr().map_err(|e| e.format(""))?);
-                            if !parser.match_token(&crate::lexer::TokenType::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    parser
-                        .consume(&crate::lexer::TokenType::RightBracket, "Expected ']'")
-                        .map_err(|e| e.format(""))?;
-                }
+                "inputs" => Self::parse_mlir_inputs(&mut parser, &mut inputs)?,
+                "clobbers" => Self::parse_mlir_clobbers(&mut parser, &mut clobbers)?,
                 "returns" => {
                     if parser.match_token(&crate::lexer::TokenType::Identifier("void")) {
                         returns = None;
@@ -972,80 +1228,14 @@ impl<'a> MacroExpander<'a> {
                         returns = Some(parser.parse_type().map_err(|e| e.format(""))?);
                     }
                 }
-                "dialects" => {
-                    parser
-                        .consume(&crate::lexer::TokenType::LeftBracket, "Expected '['")
-                        .map_err(|e| e.format(""))?;
-                    if !parser.check(&crate::lexer::TokenType::RightBracket) {
-                        loop {
-                            match &parser.advance().kind {
-                                crate::lexer::TokenType::StringLiteral(lit) => {
-                                    dialects.push(lit.to_string());
-                                }
-                                _ => return Err("Expected string literal in dialects".to_string()),
-                            }
-                            if !parser.match_token(&crate::lexer::TokenType::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    parser
-                        .consume(&crate::lexer::TokenType::RightBracket, "Expected ']'")
-                        .map_err(|e| e.format(""))?;
-                }
-                _ => return Err(format!("Unknown field '{}' in mlir! macro", field_name)),
+                "dialects" => Self::parse_mlir_dialects(&mut parser, &mut dialects)?,
+                _ => return Err(format!("Unknown field '{field_name}' in mlir! macro")),
             }
 
             parser.match_token(&crate::lexer::TokenType::Comma);
         }
 
-        let block_str = if let Some(TokenTree::Delimited(_, inner)) = block_tree {
-            let mut t = Vec::new();
-            for i in inner {
-                t.extend(self.flatten_tt(i));
-            }
-
-            let mut s = String::new();
-            let mut current_line = 0;
-            let mut current_col = 0;
-
-            for tok in t {
-                let text = tok.kind.to_string();
-                // A delimiter synthesized when the token tree was built carries no position.
-                // Laying one out by column drove the rest of its line hundreds of columns to
-                // the right, and the block stopped parsing (Vx#414).
-                if tok.line == 0 {
-                    s.push_str(&text);
-                    current_col += text.chars().count();
-                    continue;
-                }
-
-                if current_line == 0 {
-                    current_line = tok.line;
-                    current_col = tok.column;
-                }
-
-                if tok.line > current_line {
-                    for _ in 0..(tok.line - current_line) {
-                        s.push('\n');
-                    }
-                    current_col = 1;
-                    current_line = tok.line;
-                }
-
-                if tok.column > current_col {
-                    for _ in 0..(tok.column - current_col) {
-                        s.push(' ');
-                    }
-                }
-
-                s.push_str(&text);
-                current_col = tok.column + tok.length;
-            }
-            s
-        } else {
-            return Err("mlir! macro requires a trailing block".to_string());
-        };
+        let block_str = Self::mlir_block_text(block_tree)?;
 
         // The macro's own position, so a block that fails to parse can be pointed at. A
         // default span reported every one of them at 0:0 (Vx#414).

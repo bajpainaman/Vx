@@ -38,20 +38,31 @@ pub enum Decline {
     /// A builtin called with operands the flat path does not lower: the wrong arity, or a tensor
     /// whose rank or element type the emitted kernel does not accept.
     BuiltinShape {
+        /// The name of the builtin that was called.
         builtin: &'static str,
+        /// A short fixed phrase saying which operand the flat path could not lower.
         why: &'static str,
     },
 
     /// A value whose lowered type is not the one this construct needs -- indexing something that
     /// is not a pointer, taking a field of a nominal the flat path has no layout for.
-    TypeNotModelled { what: &'static str },
+    TypeNotModelled {
+        /// A short fixed phrase naming the construct and the type it needed.
+        what: &'static str,
+    },
 
     /// A construct the flat path lowers only in memory mode, reached in register mode.
-    NeedsMemoryMode { construct: &'static str },
+    NeedsMemoryMode {
+        /// A short fixed phrase naming the construct.
+        construct: &'static str,
+    },
 
     /// Something the flat path does not lower yet that is none of the above. `what` is a short
     /// fixed phrase, never a formatted value, so the histogram groups.
-    Unsupported { what: &'static str },
+    Unsupported {
+        /// A short fixed phrase naming what is not lowered yet.
+        what: &'static str,
+    },
 
     /// A gap in the flat *emitter* that has not been given a phrase of its own yet, naming the
     /// source line that produced it.
@@ -60,13 +71,17 @@ pub enum Decline {
     /// reached. Writing a description for each up front would be 190 guesses about which ones
     /// matter. Carrying the site instead means the histogram names the exact line to describe,
     /// and only the lines something actually reaches get the work.
-    EmitterGap { site: &'static str },
+    EmitterGap {
+        /// The source file and line of the emitter code that gave up.
+        site: &'static str,
+    },
 }
 
 impl Decline {
     /// A stable key for grouping. Deliberately drops the payload of the variants that carry one:
     /// a histogram of "unresolved callee `foo`, unresolved callee `bar`" answers nothing that
     /// "unresolved callee x2" does not.
+    #[must_use]
     pub fn key(&self) -> &'static str {
         match self {
             Decline::UnsupportedExpr(_) => "unsupported-expr",
@@ -82,6 +97,7 @@ impl Decline {
 
     /// The key plus the one detail that says *which* construct, for a histogram that names the
     /// work rather than the category: `unsupported-expr(Closure)`.
+    #[must_use]
     pub fn detail_key(&self) -> String {
         match self {
             Decline::UnsupportedExpr(k) => format!("unsupported-expr({k})"),

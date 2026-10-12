@@ -22,7 +22,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn field<'a>(env: &'a str, key: &str) -> Option<&'a str> {
@@ -34,13 +34,28 @@ fn field<'a>(env: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+/// Everything vxc printed, on either stream, compiling `src` with `args` from the repo root.
+fn vxc_log(root: &Path, src: &str, args: &[String]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_vxc"))
+        .current_dir(root)
+        .arg(src)
+        .args(args)
+        .output()
+        .expect("failed to run vxc");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
 #[test]
 fn every_differential_pair_reaches_its_claimed_verdict() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let pairs_dir = root.join("utils/differential/pairs");
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(&pairs_dir)
         .expect("utils/differential/pairs is missing")
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.path())
         .filter(|p| p.is_dir())
         .collect();
@@ -66,17 +81,7 @@ fn every_differential_pair_reaches_its_claimed_verdict() {
             .map(str::to_string)
             .collect();
 
-        let out = Command::new(env!("CARGO_BIN_EXE_vxc"))
-            .current_dir(&root)
-            .arg(src)
-            .args(&args)
-            .output()
-            .expect("failed to run vxc");
-        let log = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let log = vxc_log(&root, src, &args);
         let refused = log.lines().any(|l| l.starts_with("Error"));
 
         // `none` is the admitting pair: it states a placement the machine accepts, and

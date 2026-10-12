@@ -12,6 +12,8 @@
 // lock-free, high-throughput architecture.
 //
 //===----------------------------------------------------------------------===//
+/// Checks that each phase of the parallel compile left its data in the state the next phase
+/// expects. They run only in a debug build, and each one stops the compiler when it fails.
 #[cfg(debug_assertions)]
 pub mod verify_arch {
     use crate::gid::{TypeId, Word2, Word2Arena, Word2Scope, LOCAL_DEFERRED_BIT};
@@ -21,6 +23,11 @@ pub mod verify_arch {
     use std::collections::HashMap;
     use std::sync::{Arc, Weak};
 
+    /// Checks that parsing gave one module for each file and that every module kept its path.
+    ///
+    /// # Panics
+    ///
+    /// If the number of modules differs from the number of files, or a module has an empty path.
     pub fn verify_phase_1_parse(file_paths: &[String], parsed_modules: &[syntax::VxModule]) {
         assert_eq!(
             file_paths.len(),
@@ -35,6 +42,11 @@ pub mod verify_arch {
         }
     }
 
+    /// Checks that the frozen registry is still held by someone.
+    ///
+    /// # Panics
+    ///
+    /// If nothing holds the registry.
     pub fn verify_phase_2_registry(registry: &Arc<crate::session::ImmutableGlobalRegistry>) {
         assert!(
             Arc::strong_count(registry) >= 1,
@@ -42,6 +54,12 @@ pub mod verify_arch {
         );
     }
 
+    /// Checks that every worker reads from the same frozen session, and that each index a worker
+    /// wrote into its type list points inside that worker's own lists.
+    ///
+    /// # Panics
+    ///
+    /// If a worker holds a different session, or one of its indexes is out of range.
     pub fn verify_phase_3_isolation(workers: &[&LocalWorkerState], global: &Arc<GlobalSession>) {
         for worker in workers {
             // INVARIANT 1: Zero Shared Mutability (The Aliasing Proof)
@@ -71,7 +89,7 @@ pub mod verify_arch {
                         Word2Arena::SlowMeta => worker.local_slow_path_arena.len(),
                     };
                     assert!(
-                        (index as usize) < arena_len,
+                        usize::try_from(index).is_ok_and(|i| i < arena_len),
                         "FATAL: Local deferred index out of bounds ({index} >= {arena_len} in the \
                          {arena:?} arena)."
                     );
@@ -80,6 +98,12 @@ pub mod verify_arch {
         }
     }
 
+    /// Checks that merging the workers' lists left no entry twice.
+    ///
+    /// # Panics
+    ///
+    /// If two generic instantiations have the same type arguments, or two entries of the function
+    /// metadata list are equal.
     pub fn verify_phase_4_deduplication(
         global_generics_arena: &Arc<Vec<TypeId>>,
         global_generics_offsets: &Arc<Vec<(usize, usize)>>,
@@ -108,6 +132,15 @@ pub mod verify_arch {
         );
     }
 
+    /// Checks that the previous session was freed once the new one replaced it.
+    ///
+    /// # Panics
+    ///
+    /// If something still holds the previous session.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "callers are in other files; they hand over the only weak handle they kept"
+    )]
     pub fn verify_phase_5_epoch_advance(old_epoch: Weak<GlobalSession>) {
         // INVARIANT: Zero Leakage
         assert!(
@@ -116,6 +149,12 @@ pub mod verify_arch {
         );
     }
 
+    /// Checks that every id in the patched type list is final: none is still marked as local to a
+    /// worker, and each index points inside the session's lists.
+    ///
+    /// # Panics
+    ///
+    /// If an id is still marked as local, or an index is out of range.
     pub fn verify_phase_6_simd_patch(patched_type_stream: &[TypeId], session: &Arc<GlobalSession>) {
         // We can use rayon here to verify the patch pass in parallel
         patched_type_stream.par_iter().for_each(|gid| {
@@ -144,24 +183,33 @@ pub mod verify_arch {
                             (session.slow_path_arena.len(), "function")
                         }
                     };
-                    assert!((index as usize) < limit, "FATAL: Patched {what} index OOB.");
+                    assert!(
+                        usize::try_from(index).is_ok_and(|i| i < limit),
+                        "FATAL: Patched {what} index OOB."
+                    );
                 }
                 // A content digest indexes nothing, so there is no bound to check. Its integrity
                 // condition is different in kind: equal arguments must give equal digests, which is
-                // true by construction and tested in `gid.rs`.
-                crate::gid::Word2::GenericDigest(_) => {}
-                crate::gid::Word2::FastLifetime(_) => {}
+                // true by construction and tested in `gid.rs`. Inline lifetime bits index nothing
+                // either.
+                crate::gid::Word2::GenericDigest(_) | crate::gid::Word2::FastLifetime(_) => {}
             }
         });
     }
 
+    /// A place to check that each function was put in the bucket of its module. It checks nothing
+    /// yet, because a function does not carry the id that would be needed.
+    #[allow(
+        clippy::implicit_hasher,
+        reason = "callers are in other files; they all pass a map with the default hasher"
+    )]
     pub fn verify_phase_7_routing(
         buckets: &[Vec<syntax::Function>],
         module_index_map: &HashMap<u64, usize>,
     ) {
         // Build a reverse lookup mapping dense indices back to their Module Hashes
         let mut index_to_hash: HashMap<usize, u64> = HashMap::new();
-        for (&hash, &index) in module_index_map.iter() {
+        for (&hash, &index) in module_index_map {
             index_to_hash.insert(index, hash);
         }
 
@@ -177,6 +225,12 @@ pub mod verify_arch {
         }
     }
 
+    /// Checks the size of the serialized type dictionary: an 8-byte length and then one id for
+    /// each entry.
+    ///
+    /// # Panics
+    ///
+    /// If `bytes` has any other length.
     pub fn verify_phase_8_serialization(bytes: &[u8], dictionary_len: usize) {
         // 8 bytes for length prefix, then dictionary_len * 32 (size of TypeId)
         let expected_size = 8 + dictionary_len * std::mem::size_of::<TypeId>();

@@ -18,6 +18,11 @@ instantiate_result_ffi!(i32, i32, i32, i32);
 instantiate_result_ffi!(f32, f32, i32, i32);
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 

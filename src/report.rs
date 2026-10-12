@@ -19,13 +19,16 @@
 /// there, against the space's declared capacity. Recorded for *every* placed space, not only
 /// those that overflow — an admitted program emits no capacity diagnostic, so this is the only
 /// place its resident total appears. Downstream that total is what turns a capacity verdict into
-/// an engine's required memory utilization (#285). See [`crate::hir::env::TypeChecker::resident_sets`].
+/// an engine's required memory utilization (#285). See `crate::hir::env::TypeChecker::resident_sets`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResidentSet {
+    /// The memory space the tiles are placed in.
     pub space: crate::syntax::MemorySpace,
     /// Granule-rounded sum of tiles placed in this space by one function.
     pub total_bytes: u64,
+    /// The capacity the space declares, in bytes.
     pub capacity_bytes: u64,
+    /// How many tiles the function places in this space.
     pub tiles: usize,
     /// Whether the space is declared `overcommit` (an overflow is W1028, not E6010).
     pub overcommit: bool,
@@ -35,7 +38,7 @@ pub struct ResidentSet {
 /// declared cost of each hop. A direct transfer has one hop; a multi-hop route (synthesized when
 /// no direct edge exists) has one per staging step. `derived_cost` is the bandwidth-roofline cost
 /// when the declarations make it computable, which is what the emitted `vx.transfer` carries.
-/// See [`crate::hir::env::TypeChecker::staging_routes`] (#282).
+/// See `crate::hir::env::TypeChecker::staging_routes` (#282).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StagingRoute {
     /// The spaces traversed, source first: `[CPU_DRAM, HBM3e, SMEM]`.
@@ -90,9 +93,13 @@ pub struct StagingRoute {
 /// become one number that hides which of them is the problem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferTraffic {
+    /// The name of the buffer in the source program.
     pub buffer: String,
+    /// The memory space the buffer is placed in.
     pub space: crate::syntax::MemorySpace,
+    /// Bytes the region reads from the buffer.
     pub read_bytes: u64,
+    /// Bytes the region writes to the buffer.
     pub written_bytes: u64,
 }
 
@@ -124,8 +131,11 @@ pub struct SpawnRegionTraffic {
 /// re-reads the same tile is wasteful in a way a combined total cannot show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpaceTraffic {
+    /// The memory space these bytes move in or out of.
     pub space: crate::syntax::MemorySpace,
+    /// Bytes read from the space.
     pub read_bytes: u64,
+    /// Bytes written to the space.
     pub written_bytes: u64,
 }
 
@@ -146,6 +156,8 @@ pub enum TrafficSource {
 }
 
 impl TrafficSource {
+    /// The name of this source as it is written in the JSON report.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             TrafficSource::BuiltinCopy => "builtin_copy",
@@ -162,7 +174,9 @@ impl TrafficSource {
 /// time model consumes these; it does not produce them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Traffic {
+    /// One entry per memory space the hop reads or writes.
     pub per_space: Vec<SpaceTraffic>,
+    /// What the byte counts were counted from.
     pub source: TrafficSource,
     /// `false` when a branch forced a per-space maximum rather than a sum — the figures are
     /// then an upper bound on one execution, not the count of one. Anything less certain than
@@ -181,6 +195,8 @@ pub enum CostSource {
 }
 
 impl CostSource {
+    /// The name of this cost source as it is written in the JSON report.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             CostSource::LinkRate => "link_rate",

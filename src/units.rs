@@ -32,23 +32,35 @@
 /// A byte-quantity unit suffix. Baseline is [`ByteUnit::B`]; [`ByteUnit::factor`] converts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ByteUnit {
+    /// One byte.
     B,
     // SI (decimal) -- what vendors quote bandwidth in.
+    /// Kilobyte: 10^3 bytes.
     KB,
+    /// Megabyte: 10^6 bytes.
     MB,
+    /// Gigabyte: 10^9 bytes.
     GB,
+    /// Terabyte: 10^12 bytes.
     TB,
+    /// Petabyte: 10^15 bytes.
     PB,
     // IEC (binary) -- what cache/SMEM capacities actually are.
+    /// Kibibyte: 2^10 bytes.
     KiB,
+    /// Mebibyte: 2^20 bytes.
     MiB,
+    /// Gibibyte: 2^30 bytes.
     GiB,
+    /// Tebibyte: 2^40 bytes.
     TiB,
+    /// Pebibyte: 2^50 bytes.
     PiB,
 }
 
 impl ByteUnit {
     /// Bytes per unit. `u64` holds every one of these exactly (`PiB` = 2^50, `PB` = 10^15).
+    #[must_use]
     pub const fn factor(self) -> u64 {
         match self {
             ByteUnit::B => 1,
@@ -68,6 +80,7 @@ impl ByteUnit {
     /// Parse a unit suffix. Case-sensitive on purpose: `Mb` (megabit) is not `MB` (megabyte), and
     /// accepting it as one would be exactly the class of silent factor-of-8 error this module
     /// exists to prevent.
+    #[must_use]
     pub fn parse(s: &str) -> Option<ByteUnit> {
         Some(match s {
             "B" => ByteUnit::B,
@@ -112,16 +125,26 @@ pub enum UnitError {
 /// Computed as `(digits * factor) / 10^places` in `u128`, and rejected unless the division is
 /// exact. `u128` because `PiB` (2^50) times a 15-digit mantissa overflows `u64` mid-computation
 /// while the answer still fits.
+///
+/// # Errors
+///
+/// [`UnitError::Malformed`] when the mantissa is not plain decimal digits with at most one dot,
+/// [`UnitError::NotWholeBytes`] when the result is not a whole number, and
+/// [`UnitError::Overflow`] when it does not fit in `u64`.
 pub fn to_bytes(mantissa: &str, unit: ByteUnit) -> Result<u64, UnitError> {
-    scale_exact(mantissa, unit.factor() as u128)
+    scale_exact(mantissa, u128::from(unit.factor()))
 }
 
 /// A clock frequency unit. Always decimal — nobody has ever meant 2^30 by "GHz".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreqUnit {
+    /// One hertz.
     Hz,
+    /// Kilohertz: 10^3 Hz. Written `kHz` in a machine file.
     KHz,
+    /// Megahertz: 10^6 Hz.
     MHz,
+    /// Gigahertz: 10^9 Hz.
     GHz,
 }
 
@@ -136,6 +159,7 @@ impl FreqUnit {
     }
 
     /// Case-sensitive, like `ByteUnit::parse`. `mhz` is not `MHz`.
+    #[must_use]
     pub fn parse(s: &str) -> Option<FreqUnit> {
         match s {
             "Hz" => Some(FreqUnit::Hz),
@@ -153,14 +177,26 @@ impl FreqUnit {
 /// Convert a decimal mantissa plus a frequency unit into hertz, **exactly**.
 ///
 /// Same discipline as [`to_bytes`]: the mantissa arrives as source text so nothing is lost to
-/// binary floating point before it gets here. `1.98 GHz` is exactly 1_980_000_000 Hz, and a figure
+/// binary floating point before it gets here. `1.98 GHz` is exactly `1_980_000_000` Hz, and a figure
 /// that is not a whole number of hertz is refused rather than rounded.
+///
+/// # Errors
+///
+/// [`UnitError::Malformed`] when the mantissa is not plain decimal digits with at most one dot,
+/// [`UnitError::NotWholeBytes`] when the result is not a whole number, and
+/// [`UnitError::Overflow`] when it does not fit in `u64`.
 pub fn to_hertz(mantissa: &str, unit: FreqUnit) -> Result<u64, UnitError> {
     scale_exact(mantissa, unit.factor())
 }
 
 /// The shared exact-scaling core: `(digits * factor) / 10^places` in `u128`, exact division
 /// required.
+///
+/// # Errors
+///
+/// [`UnitError::Malformed`] when the mantissa is not plain decimal digits with at most one dot,
+/// [`UnitError::NotWholeBytes`] when the result is not a whole number, and
+/// [`UnitError::Overflow`] when it does not fit in `u64`.
 fn scale_exact(mantissa: &str, factor: u128) -> Result<u64, UnitError> {
     let (int_part, frac_part) = match mantissa.split_once('.') {
         Some((i, f)) => (i, f),
@@ -178,18 +214,23 @@ fn scale_exact(mantissa: &str, factor: u128) -> Result<u64, UnitError> {
     // mantissa longer than that is malformed for a hardware figure regardless.
     let digits: u128 = format!("{int_part}{frac_part}")
         .parse()
-        .map_err(|_| UnitError::Malformed)?;
-    let places = u32::try_from(frac_part.len()).map_err(|_| UnitError::Malformed)?;
+        .map_err(|_too_many_digits| UnitError::Malformed)?;
+    let places = u32::try_from(frac_part.len()).map_err(|_too_many_places| UnitError::Malformed)?;
     let scale = 10u128.checked_pow(places).ok_or(UnitError::Malformed)?;
 
     let numerator = digits.checked_mul(factor).ok_or(UnitError::Overflow)?;
     if numerator % scale != 0 {
         return Err(UnitError::NotWholeBytes);
     }
-    u64::try_from(numerator / scale).map_err(|_| UnitError::Overflow)
+    u64::try_from(numerator / scale).map_err(|_too_big_for_u64| UnitError::Overflow)
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 

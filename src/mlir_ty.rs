@@ -17,8 +17,12 @@
 use crate::syntax::ElementType;
 
 /// The MLIR spelling of a scalar element type, or `None` when the flat path has no lowering for it.
+#[must_use]
 pub fn mlir_scalar(elem: &ElementType) -> Option<&'static str> {
-    use ElementType::*;
+    use ElementType::{
+        Bool, Generic, USize, BF16, F16, F32, F4E2M1, F64, F8E4M3, F8E5M2, I128, I16, I32, I4, I64,
+        I8, U128, U16, U32, U4, U64, U8,
+    };
     Some(match elem {
         F16 => "f16",
         F32 => "f32",
@@ -33,13 +37,14 @@ pub fn mlir_scalar(elem: &ElementType) -> Option<&'static str> {
         Bool => "i1",
         // fp8 is capacity/declaration-only for now: the JIT has no fp8 arithmetic,
         // so the flat path declines. Compute support is #249.
-        F8E4M3 | F8E5M2 | F4E2M1 => return None,
-        Generic(_) => return None,
+        // A generic element has no MLIR type until it is replaced by a real one.
+        F8E4M3 | F8E5M2 | F4E2M1 | Generic(_) => return None,
     })
 }
 
 /// The MLIR spelling of `<N x T>`: `vector<NxT>`. `None` when the element has no MLIR spelling
 /// (fp8, a generic), which is the same condition that makes a scalar of it decline.
+#[must_use]
 pub fn mlir_vector(elem: &ElementType, lanes: usize) -> Option<String> {
     Some(format!("vector<{lanes}x{}>", mlir_scalar(elem)?))
 }
@@ -47,8 +52,9 @@ pub fn mlir_vector(elem: &ElementType, lanes: usize) -> Option<String> {
 /// The float element type an MLIR spelling names, for reading a vector type back apart.
 /// Floats only: the vectorized slice ops are the only place a spelling is re-parsed, and
 /// they are float-only.
+#[must_use]
 pub fn float_elem_of_mlir(spelling: &str) -> Option<ElementType> {
-    use ElementType::*;
+    use ElementType::{BF16, F16, F32, F64};
     Some(match spelling {
         "f16" => F16,
         "f32" => F32,

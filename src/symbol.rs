@@ -11,4 +11,5 @@
 //
 //===----------------------------------------------------------------------===//
 
+/// A name from the source program, stored once and shared, so copying it is cheap.
 pub type Symbol = std::sync::Arc<str>;

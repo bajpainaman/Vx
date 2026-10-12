@@ -11,7 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::TypeChecker;
 
 impl TypeChecker<'_> {
     /// Report a `Memory`/`Topology` name declared by two modules of this compilation unit with

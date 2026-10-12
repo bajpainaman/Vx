@@ -6,6 +6,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+//! Build script for the Vx runtime library: sets how the macOS shared library names itself.
+
+/// Tells cargo which extra linker flag the shared library needs.
 fn main() {
     // A macOS dylib records the path it expects to be found at, and every executable linked
     // against it copies that string verbatim. The default is the absolute path of the machine

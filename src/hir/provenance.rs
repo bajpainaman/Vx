@@ -40,6 +40,7 @@ impl ReturnProvenance {
     /// Does a call whose result is bound (and kept live) reborrow — and therefore persist a borrow
     /// on — the argument at position `slot`? `AnyParam`/`Local` say "assume yes" (conservative);
     /// `NotAReference` says "no argument reborrow outlives the call."
+    #[must_use]
     pub fn includes(&self, slot: usize) -> bool {
         match self {
             ReturnProvenance::NotAReference => false,
@@ -59,6 +60,7 @@ impl ReturnProvenance {
 /// encodes as `0`; `Local` matches the summary's conservative-top reading (it is an `E4005` in the
 /// callee, so a caller never actually sees the reference, but the encoding must not read narrower
 /// than [`ReturnProvenance::includes`]).
+#[must_use]
 pub fn encode_return_provenance(prov: &ReturnProvenance) -> u8 {
     match prov {
         ReturnProvenance::NotAReference => 0,
@@ -66,10 +68,9 @@ pub fn encode_return_provenance(prov: &ReturnProvenance) -> u8 {
         ReturnProvenance::FromParams(bits) => {
             // Exactly one parameter in slots 0..=3 fits the inline field; anything else (multiple
             // sources, or a slot beyond the fourth) degrades to the conservative top.
-            if bits.count_ones() == 1 {
-                let slot = bits.trailing_zeros();
-                if slot < 4 {
-                    return (slot + 1) as u8;
+            if bits.is_power_of_two() {
+                if let Ok(code @ 1..=4) = u8::try_from(bits.trailing_zeros() + 1) {
+                    return code;
                 }
             }
             7
@@ -80,6 +81,7 @@ pub fn encode_return_provenance(prov: &ReturnProvenance) -> u8 {
 /// Does the packed slot-0 code `prov` (see [`encode_return_provenance`]) treat parameter `slot` as a
 /// possible alias source? The packed-form mirror of [`ReturnProvenance::includes`]: `0` excludes all,
 /// `7` (and the reserved `5`/`6`) includes all, `1..=4` includes exactly parameter slot `0..=3`.
+#[must_use]
 pub fn inline_prov_includes(prov: u8, slot: usize) -> bool {
     match prov {
         0 => false,
@@ -124,14 +126,13 @@ struct ProvWalk<'a> {
     /// union of every return site's parameter-slot bitset.
     acc_bits: u32,
     /// a return position we could not pin to specific parameters ⇒ the whole summary is `AnyParam`.
+    /// Also set when the body contains an `unsafe` block: a parameter-derived pointer may be
+    /// stashed somewhere a structural walk cannot see, so the summary must be conservative.
     saw_any: bool,
     /// at least one return rooted in a local (an `E4005` in the callee).
     saw_local: bool,
     /// at least one return rooted in a parameter.
     saw_param: bool,
-    /// the body contains an `unsafe` block ⇒ a parameter-derived pointer may be stashed somewhere a
-    /// structural walk cannot see, so the summary must be conservative.
-    saw_unsafe: bool,
     /// The summaries known so far for the functions this body calls.
     callee: &'a dyn Fn(&str) -> Option<ReturnProvenance>,
 }
@@ -193,20 +194,16 @@ impl<'a> ProvWalk<'a> {
                 ExprProv::Any
             }
             Expr::FunctionCall(fc) => match (self.callee)(fc.name.as_ref()) {
-                Some(ReturnProvenance::FromParams(bits)) if bits != 0 => (0..32)
+                Some(ReturnProvenance::FromParams(bits)) if bits != 0 => (0..32usize)
                     .filter(|i| bits & (1u32 << i) != 0)
-                    .map(|i| {
-                        fc.args
-                            .get(i as usize)
-                            .map_or(ExprProv::Any, |a| self.expr_prov(a))
-                    })
+                    .map(|i| fc.args.get(i).map_or(ExprProv::Any, |a| self.expr_prov(a)))
                     .reduce(join)
                     .unwrap_or(ExprProv::Any),
                 _ => ExprProv::Any,
             },
-            Expr::MethodCall(_) => ExprProv::Any,
             // Value expressions carry no reference provenance.
             Expr::Number(_) | Expr::StringLiteral(_) => ExprProv::NotRef,
+            // A method call, and anything else, is unknown.
             _ => ExprProv::Any,
         }
     }
@@ -280,7 +277,7 @@ impl<'a> ProvWalk<'a> {
             Expr::UnsafeBlock(_) => {
                 // A parameter-derived pointer can be stashed through raw-pointer stores inside an
                 // `unsafe` block where a structural walk cannot follow it. Refuse to narrow.
-                self.saw_unsafe = true;
+                self.saw_any = true;
             }
             Expr::ComptimeBlock(c) => {
                 self.walk_block(&c.stmts);
@@ -296,6 +293,7 @@ impl<'a> ProvWalk<'a> {
 /// Compute the return-provenance summary for `func` (#243). Pure and body-only — safe to call from
 /// any worker on any function, in any order. A call in a return position is unknown here;
 /// [`refine_through_calls`] makes it exact.
+#[must_use]
 pub fn compute_return_provenance(func: &Function) -> ReturnProvenance {
     compute_return_provenance_with(func, &|_| None)
 }
@@ -332,12 +330,11 @@ fn compute_return_provenance_with(
         saw_any: false,
         saw_local: false,
         saw_param: false,
-        saw_unsafe: false,
         callee,
     };
     walk.walk_block(&func.body);
 
-    if walk.saw_unsafe || walk.saw_any {
+    if walk.saw_any {
         return ReturnProvenance::AnyParam;
     }
     if walk.saw_param {
@@ -372,9 +369,9 @@ pub fn provenance_map<'a>(
 /// Recompute the summaries in `map` with each call in a return position read through its callee's
 /// summary, until none changes. Every summary starts sound and each round only narrows it, so the
 /// result is sound after any number of rounds; recursion keeps `AnyParam`.
-pub fn refine_through_calls(
+pub fn refine_through_calls<S: std::hash::BuildHasher>(
     funcs: &[&Function],
-    map: &mut std::collections::HashMap<crate::symbol::Symbol, ReturnProvenance>,
+    map: &mut std::collections::HashMap<crate::symbol::Symbol, ReturnProvenance, S>,
 ) {
     let funcs: Vec<&Function> = funcs
         .iter()
@@ -401,6 +398,11 @@ pub fn refine_through_calls(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 

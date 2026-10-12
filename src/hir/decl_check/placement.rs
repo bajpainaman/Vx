@@ -10,7 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::TypeChecker;
 
 impl TypeChecker<'_> {
     /// Every placement written in a type names a place the machine has.

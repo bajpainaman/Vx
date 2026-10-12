@@ -1,8 +1,16 @@
-// This test expands the same raw-pointer FFI macro as the production library.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+//! Checks that the Vx declaration of file close, which dropping a `File` calls, agrees with
+//! the C ABI of the Rust function.
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "this test expands the same raw-pointer FFI macro as the runtime library"
+)]
+#![allow(unsafe_code, reason = "these tests call the C ABI the runtime exports")]
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 
-// The Vx declaration of file close, which dropping a `File` calls, must agree with the Rust
-// function's C ABI.
 include!("../stdlib/rust_core/src/ffi/macros.rs");
 instantiate_file_ffi!();
 

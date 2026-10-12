@@ -11,7 +11,7 @@
 // Programs with a `// REQUIRES:` line are skipped -- their path choice differs by host --
 // as are the few that cannot compile as a bare `vxc file.vx` (each names why, in-line).
 //===----------------------------------------------------------------------===//
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -213,7 +213,7 @@ enum CodegenPath {
     Flat,
     Ast(Vec<String>),
     /// The flat path declined and the AST fallback then FAILED to compile (nonzero exit):
-    /// the program does not build on the default path at all. Tracked in KNOWN_BROKEN (Vx#398)
+    /// the program does not build on the default path at all. Tracked in `KNOWN_BROKEN` (Vx#398)
     /// so the set can only shrink.
     AstBroken(Vec<String>),
 }
@@ -275,13 +275,40 @@ fn path_taken(program: &Path) -> Result<CodegenPath, String> {
     }
 }
 
-#[test]
-fn flat_path_coverage_of_the_backend_corpus_holds() {
-    // Every `pass` family, not just the backend's: the flat path compiles most of the tree
-    // now, and gating only backend/pass is how two programs (llama2_math.vx, closures.vx)
-    // panicked at HEAD with nothing noticing. `fail` directories stay out -- their programs
-    // must not compile -- as do multi-file module roots.
-    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+/// What one sweep of the corpus found: which path each program took, and why the declining
+/// ones declined. Programs are named relative to `tests/`.
+#[derive(Default)]
+struct Sweep {
+    /// Programs the flat path declined.
+    declined: BTreeSet<String>,
+    /// Declined programs whose AST fallback then failed to compile too.
+    fallback_broken: BTreeSet<String>,
+    /// How many programs compiled through the flat path.
+    flat_count: usize,
+    /// Programs that compiled through neither path, each with why.
+    broken: Vec<String>,
+    /// How many programs declined for each first reason.
+    by_reason: BTreeMap<String, usize>,
+    /// Programs that declined without saying why.
+    unexplained: Vec<String>,
+}
+
+/// A program's path relative to `tests`, the way the lists in this file name it.
+fn name_in_tests(tests: &Path, program: &Path) -> String {
+    program
+        .strip_prefix(tests)
+        .unwrap_or(program)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Every program of every `pass` family under `tests`, named relative to `tests`.
+///
+/// Every `pass` family, not just the backend's: the flat path compiles most of the tree
+/// now, and gating only backend/pass is how two programs (`llama2_math.vx`, `closures.vx`)
+/// panicked at HEAD with nothing noticing. `fail` directories stay out -- their programs
+/// must not compile -- as do multi-file module roots.
+fn pass_corpus(tests: &Path) -> Vec<(String, PathBuf)> {
     let families = [
         "backend/pass",
         "frontend/pass",
@@ -289,113 +316,82 @@ fn flat_path_coverage_of_the_backend_corpus_holds() {
         "optimizations/pass",
         "warnings/pass",
     ];
-    let expected: BTreeSet<String> = KNOWN_DECLINES.iter().map(|s| s.to_string()).collect();
-
-    let mut declined = BTreeSet::new();
-    let mut fallback_broken = BTreeSet::new();
-    let mut flat_count = 0usize;
-    let mut broken = Vec::new();
-    let mut by_reason: std::collections::BTreeMap<String, usize> = Default::default();
-    let mut unexplained: Vec<String> = Vec::new();
-
     let mut corpus: Vec<(String, PathBuf)> = Vec::new();
     for family in families {
         for program in corpus_programs(&tests.join(family)) {
-            let rel = program
-                .strip_prefix(&tests)
-                .unwrap_or(&program)
-                .to_string_lossy()
-                .to_string();
+            let rel = name_in_tests(tests, &program);
             corpus.push((rel, program));
         }
     }
-    for (name, program) in corpus {
-        // Programs that cannot compile as a bare `vxc file.vx` for reasons that are not the
-        // flat path's business. Each names why; shrinking this list is separate work.
-        const NOT_STANDALONE: &[&str] = &[
-            "optimizations/pass/array_literal_nested.vx", // expects failure by design (RUN: not vxc)
-            "optimizations/pass/codegen_error_diagnostics.vx", // expects failure by design (RUN: not vxc)
-            "optimizations/pass/host_flag_scope.vx",           // needs --host
-            "optimizations/pass/device_transfer_plugin.vx",    // needs --machine and a plugin
-            "optimizations/pass/numa_peer_node_is_priced.vx",  // needs --host and --machine
-            // needs --host and --machine
-            "optimizations/pass/dtcm_tiles_in_sibling_blocks_fit_a_cortex_m7.vx",
-            "frontend/pass/packages/import_from_a_package.vx", // needs --package
-        ];
-        if NOT_STANDALONE.contains(&name.as_str()) {
-            continue;
-        }
-        let source = std::fs::read_to_string(&program).unwrap_or_default();
-        if source.contains("// REQUIRES:") {
-            continue;
-        }
-        // `// XFAIL: *` marks a RUN line that cannot pass yet. Some of those programs still
-        // compile (the RUN line fails on what the IR says), and those are swept like any other;
-        // one written ahead of the compiler reaches neither path, and that is the state it
-        // claims, so it is skipped until the marker comes off.
-        let xfail = source.contains("// XFAIL: *");
+    corpus
+}
 
-        match path_taken(&program) {
-            Ok(CodegenPath::Flat) => flat_count += 1,
-            Ok(CodegenPath::Ast(reasons)) => {
-                if reasons.is_empty() {
-                    unexplained.push(name.clone());
-                }
-                // One program declines for one reason -- the first construct the flat path could
-                // not carry. Counting them all would weight a program by how many later
-                // constructs it happens to contain.
-                if let Some(first) = reasons.first() {
-                    *by_reason.entry(first.clone()).or_insert(0) += 1;
-                }
-                declined.insert(name);
-            }
-            Ok(CodegenPath::AstBroken(reasons)) => {
-                if let Some(first) = reasons.first() {
-                    *by_reason.entry(first.clone()).or_insert(0) += 1;
-                }
-                declined.insert(name.clone());
-                fallback_broken.insert(name);
-            }
-            Err(_) if xfail => continue,
-            Err(why) => broken.push(format!("{name}: {why}")),
-        }
+/// Compiles one program and records which path it took in `sweep`. A program that cannot be
+/// compiled as a bare `vxc file.vx`, or that has a `// REQUIRES:` line, is left out.
+fn sweep_one(sweep: &mut Sweep, name: String, program: &Path) {
+    // Programs that cannot compile as a bare `vxc file.vx` for reasons that are not the
+    // flat path's business. Each names why; shrinking this list is separate work.
+    const NOT_STANDALONE: &[&str] = &[
+        "optimizations/pass/array_literal_nested.vx", // expects failure by design (RUN: not vxc)
+        "optimizations/pass/codegen_error_diagnostics.vx", // expects failure by design (RUN: not vxc)
+        "optimizations/pass/host_flag_scope.vx",           // needs --host
+        "optimizations/pass/device_transfer_plugin.vx",    // needs --machine and a plugin
+        "optimizations/pass/numa_peer_node_is_priced.vx",  // needs --host and --machine
+        // needs --host and --machine
+        "optimizations/pass/dtcm_tiles_in_sibling_blocks_fit_a_cortex_m7.vx",
+        "frontend/pass/packages/import_from_a_package.vx", // needs --package
+    ];
+    if NOT_STANDALONE.contains(&name.as_str()) {
+        return;
     }
+    let source = std::fs::read_to_string(program).unwrap_or_default();
+    if source.contains("// REQUIRES:") {
+        return;
+    }
+    // `// XFAIL: *` marks a RUN line that cannot pass yet. Some of those programs still
+    // compile (the RUN line fails on what the IR says), and those are swept like any other;
+    // one written ahead of the compiler reaches neither path, and that is the state it
+    // claims, so it is skipped until the marker comes off.
+    let xfail = source.contains("// XFAIL: *");
 
-    assert!(
-        broken.is_empty(),
-        "these corpus programs no longer compile at all:\n{}",
-        broken.join("\n")
-    );
+    match path_taken(program) {
+        Ok(CodegenPath::Flat) => sweep.flat_count += 1,
+        Ok(CodegenPath::Ast(reasons)) => {
+            if reasons.is_empty() {
+                sweep.unexplained.push(name.clone());
+            }
+            // One program declines for one reason -- the first construct the flat path could
+            // not carry. Counting them all would weight a program by how many later
+            // constructs it happens to contain.
+            if let Some(first) = reasons.first() {
+                *sweep.by_reason.entry(first.clone()).or_insert(0) += 1;
+            }
+            sweep.declined.insert(name);
+        }
+        Ok(CodegenPath::AstBroken(reasons)) => {
+            if let Some(first) = reasons.first() {
+                *sweep.by_reason.entry(first.clone()).or_insert(0) += 1;
+            }
+            sweep.declined.insert(name.clone());
+            sweep.fallback_broken.insert(name);
+        }
+        Err(_) if xfail => {}
+        Err(why) => sweep.broken.push(format!("{name}: {why}")),
+    }
+}
 
-    let newly_declining: Vec<_> = declined.difference(&expected).cloned().collect();
-    let newly_covered: Vec<_> = expected.difference(&declined).cloned().collect();
-
-    assert!(
-        newly_declining.is_empty(),
-        "flat-path coverage regressed. These programs used to compile through the \
-         flat path and now fall back to the AST path:\n  {}\n\
-         Run `VX_FLAT_DBG=1 cargo run --bin vxc -- tests/backend/pass/<program> \
-         --action emit-mlir` to see which construct declined.",
-        newly_declining.join("\n  ")
-    );
-
-    assert!(
-        newly_covered.is_empty(),
-        "flat-path coverage improved -- please record it. These programs now compile \
-         through the flat path, so delete them from KNOWN_DECLINES in this file:\n  {}\n\
-         (coverage is now {} of {} portable corpus programs)",
-        newly_covered.join("\n  "),
-        flat_count,
-        flat_count + declined.len()
-    );
-
-    let broken_expected: BTreeSet<String> = KNOWN_BROKEN.iter().map(|s| s.to_string()).collect();
+/// The programs whose AST fallback fails to compile must be exactly `KNOWN_BROKEN`.
+fn assert_fallback_breakage_is_known(fallback_broken: &BTreeSet<String>) {
+    let broken_expected: BTreeSet<String> = KNOWN_BROKEN
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
     let newly_broken: Vec<_> = fallback_broken
         .difference(&broken_expected)
         .cloned()
         .collect();
     let newly_fixed: Vec<_> = broken_expected
-        .difference(&fallback_broken)
+        .difference(fallback_broken)
         .cloned()
         .collect();
     assert!(
@@ -416,6 +412,79 @@ fn flat_path_coverage_of_the_backend_corpus_holds() {
   "
         )
     );
+}
+
+/// Prints the coverage figure and the decline reasons, most common first.
+///
+/// What is missing, rather than which files are missing it. This is a report, not a gate: the
+/// exact-set assertions are what catch a regression, and duplicating them as expected
+/// counts would be a second table to maintain that catches strictly less (a program starting to
+/// decline and another stopping, for the same reason, leaves every count unchanged).
+fn print_decline_report(sweep: &Sweep) {
+    println!(
+        "flat path: {} of {} portable corpus programs ({} declined, tracked in Vx#383)",
+        sweep.flat_count,
+        sweep.flat_count + sweep.declined.len(),
+        sweep.declined.len()
+    );
+    let mut ranked: Vec<_> = sweep.by_reason.iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    for (reason, count) in ranked {
+        println!("flat decline: {count:3} {reason}");
+    }
+}
+
+#[test]
+fn flat_path_coverage_of_the_backend_corpus_holds() {
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let expected: BTreeSet<String> = KNOWN_DECLINES
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+
+    let mut sweep = Sweep::default();
+    for (name, program) in pass_corpus(&tests) {
+        sweep_one(&mut sweep, name, &program);
+    }
+    let Sweep {
+        declined,
+        fallback_broken,
+        flat_count,
+        broken,
+        unexplained,
+        ..
+    } = &sweep;
+    let flat_count = *flat_count;
+
+    assert!(
+        broken.is_empty(),
+        "these corpus programs no longer compile at all:\n{}",
+        broken.join("\n")
+    );
+
+    let newly_declining: Vec<_> = declined.difference(&expected).cloned().collect();
+    let newly_covered: Vec<_> = expected.difference(declined).cloned().collect();
+
+    assert!(
+        newly_declining.is_empty(),
+        "flat-path coverage regressed. These programs used to compile through the \
+         flat path and now fall back to the AST path:\n  {}\n\
+         Run `VX_FLAT_DBG=1 cargo run --bin vxc -- tests/backend/pass/<program> \
+         --action emit-mlir` to see which construct declined.",
+        newly_declining.join("\n  ")
+    );
+
+    assert!(
+        newly_covered.is_empty(),
+        "flat-path coverage improved -- please record it. These programs now compile \
+         through the flat path, so delete them from KNOWN_DECLINES in this file:\n  {}\n\
+         (coverage is now {} of {} portable corpus programs)",
+        newly_covered.join("\n  "),
+        flat_count,
+        flat_count + declined.len()
+    );
+
+    assert_fallback_breakage_is_known(fallback_broken);
 
     // A floor as well as an exact set: if the corpus itself shrinks, the exact-set
     // check above still passes while real coverage quietly drops.
@@ -435,21 +504,7 @@ fn flat_path_coverage_of_the_backend_corpus_holds() {
         unexplained.join("\n  ")
     );
 
-    println!(
-        "flat path: {} of {} portable corpus programs ({} declined, tracked in Vx#383)",
-        flat_count,
-        flat_count + declined.len(),
-        declined.len()
-    );
-    // What is missing, rather than which files are missing it. This is a report, not a gate: the
-    // exact-set assertions above are what catch a regression, and duplicating them as expected
-    // counts would be a second table to maintain that catches strictly less (a program starting to
-    // decline and another stopping, for the same reason, leaves every count unchanged).
-    let mut ranked: Vec<_> = by_reason.iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-    for (reason, count) in ranked {
-        println!("flat decline: {count:3} {reason}");
-    }
+    print_decline_report(&sweep);
 }
 
 /// Run the backend corpus through the FLAT path and check the answers (Vx#566).
@@ -461,29 +516,26 @@ fn flat_path_coverage_of_the_backend_corpus_holds() {
 /// corpus had its answers checked on one code generator and its path choice on the other.
 ///
 /// This runs the same expectations on the flat path -- 68 programs, no new assertions.
-#[test]
-fn flat_path_answers_match_the_backend_expectations() {
-    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
-    let declines: BTreeSet<&str> = KNOWN_DECLINES.iter().copied().collect();
-
-    // The freshly built vxc leads; the rest of PATH carries the MLIR tools the JIT shells
-    // out to (mlir-translate, llc, the linker).
+/// A PATH with the freshly built vxc first; the rest carries the MLIR tools the JIT shells
+/// out to (mlir-translate, llc, the linker).
+fn path_with_fresh_vxc() -> String {
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_vxc")).parent().unwrap();
-    let path_var = format!(
+    format!(
         "{}:{}",
         bin_dir.display(),
         std::env::var("PATH").unwrap_or_default()
-    );
+    )
+}
 
-    let mut checked = 0usize;
-    let mut failures: Vec<String> = Vec::new();
-
-    // `read_dir` rather than the recursive `corpus_programs` above, because this must be
-    // the SAME corpus `run_backend_test` runs, and that walks the directory without
-    // descending. Subdirectories like backend/pass/autodiff/ are reached by their own RUN
-    // lines instead, and their `// EXPECT:` lines assert on emitted IR rather than on what
-    // the program printed -- recursing would quietly test a different thing against
-    // assertions that were never about program output.
+/// The programs directly under `tests/backend/pass`, sorted.
+///
+/// `read_dir` rather than the recursive `corpus_programs` above, because this must be
+/// the SAME corpus `run_backend_test` runs, and that walks the directory without
+/// descending. Subdirectories like backend/pass/autodiff/ are reached by their own RUN
+/// lines instead, and their `// EXPECT:` lines assert on emitted IR rather than on what
+/// the program printed -- recursing would quietly test a different thing against
+/// assertions that were never about program output.
+fn backend_programs(tests: &Path) -> Vec<PathBuf> {
     let backend_dir = tests.join("backend/pass");
     let mut programs: Vec<PathBuf> = std::fs::read_dir(&backend_dir)
         .expect("tests/backend/pass is missing")
@@ -491,40 +543,75 @@ fn flat_path_answers_match_the_backend_expectations() {
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("vx"))
         .collect();
     programs.sort();
+    programs
+}
 
-    for program in programs {
-        let rel = program
-            .strip_prefix(&tests)
-            .unwrap_or(&program)
-            .to_string_lossy()
-            .to_string();
+/// Whether a fixture has opted out of being run.
+///
+/// The same gates `run_backend_test` applies, so the two harnesses agree on what a
+/// fixture has opted out of -- all but `// REQUIRES: flat-codegen`, which says the
+/// legacy path gets the answers wrong and is therefore a reason to run a file here,
+/// not to skip it. Every other `// REQUIRES:` is about which codegen path a
+/// program takes, which is this file's other test, not a reason to skip running one.
+/// `NO_EXEC` was the gate this loop first left out: a fixture that has never been run
+/// can carry EXPECT lines nothing has ever compared, and `matmul_bf16.vx` did.
+fn opted_out_of_running(source: &str) -> bool {
+    if source.contains("// NO_EXEC") {
+        return true;
+    }
+    if source.contains("// REQUIRES: macos") && !cfg!(target_os = "macos") {
+        return true;
+    }
+    source.contains("// REQUIRES: ane")
+}
+
+/// The `// EXPECT:` lines of a fixture, with the marker stripped.
+fn expect_lines(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter(|l| l.trim().starts_with("// EXPECT:"))
+        .map(|l| l.split_once("EXPECT:").unwrap().1.trim().to_string())
+        .collect()
+}
+
+/// Adds a failure to `failures` for each `// EXPECT:` line that `out` does not satisfy.
+fn record_missed_expectations(
+    rel: &str,
+    out: &str,
+    expects: &[String],
+    failures: &mut Vec<String>,
+) {
+    for expect in expects {
+        if !crate::integration_test::compile_test::expect_matches(out, expect) {
+            failures.push(format!(
+                "{rel}: flat path did not produce the expected answer.\n  \
+                 expected to find: {expect}\n  actual stdout:\n{out}"
+            ));
+        }
+    }
+}
+
+#[test]
+fn flat_path_answers_match_the_backend_expectations() {
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let declines: BTreeSet<&str> = KNOWN_DECLINES.iter().copied().collect();
+
+    let path_var = path_with_fresh_vxc();
+
+    let mut checked = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    for program in backend_programs(&tests) {
+        let rel = name_in_tests(&tests, &program);
         if declines.contains(rel.as_str()) {
             continue;
         }
         let source = std::fs::read_to_string(&program).unwrap_or_default();
-
-        // The same gates `run_backend_test` applies, so the two harnesses agree on what a
-        // fixture has opted out of -- all but `// REQUIRES: flat-codegen`, which says the
-        // legacy path gets the answers wrong and is therefore a reason to run a file here,
-        // not to skip it. Every other `// REQUIRES:` is about which codegen path a
-        // program takes, which is this file's other test, not a reason to skip running one.
-        // `NO_EXEC` was the gate this loop first left out: a fixture that has never been run
-        // can carry EXPECT lines nothing has ever compared, and `matmul_bf16.vx` did.
-        if source.contains("// NO_EXEC") {
-            continue;
-        }
-        if source.contains("// REQUIRES: macos") && !cfg!(target_os = "macos") {
-            continue;
-        }
-        if source.contains("// REQUIRES: ane") {
+        if opted_out_of_running(&source) {
             continue;
         }
 
-        let expects: Vec<String> = source
-            .lines()
-            .filter(|l| l.trim().starts_with("// EXPECT:"))
-            .map(|l| l.split_once("EXPECT:").unwrap().1.trim().to_string())
-            .collect();
+        let expects = expect_lines(&source);
         if expects.is_empty() {
             continue;
         }
@@ -561,14 +648,7 @@ fn flat_path_answers_match_the_backend_expectations() {
         // `run_backend_test` sees one combined string from the in-process JIT, so checking
         // only stdout here would fail programs the legacy path passes for no real reason.
         let out = format!("{}{}", String::from_utf8_lossy(&output.stdout), log);
-        for expect in &expects {
-            if !crate::integration_test::compile_test::expect_matches(&out, expect) {
-                failures.push(format!(
-                    "{rel}: flat path did not produce the expected answer.\n  \
-                     expected to find: {expect}\n  actual stdout:\n{out}"
-                ));
-            }
-        }
+        record_missed_expectations(&rel, &out, &expects, &mut failures);
         checked += 1;
     }
 

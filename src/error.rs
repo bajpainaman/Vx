@@ -13,6 +13,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+use std::fmt::Write as _;
+
+/// A compile error, already formatted as the text shown to the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
 
@@ -22,6 +25,10 @@ impl std::fmt::Display for Error {
     }
 }
 
+/// The text of an error at `line`:`col`: the message, the source line, and a line of `^` marks
+/// under the `len` characters the error is about. Only the message line when `line` is not a
+/// line of `source`.
+#[must_use]
 pub fn format_compiler_error(
     source: &str,
     line: usize,
@@ -32,8 +39,7 @@ pub fn format_compiler_error(
     if line > 0 {
         if let Some(src_line) = source.lines().nth(line - 1) {
             let mut out = String::with_capacity(msg.len() + src_line.len() * 2 + 64);
-            use std::fmt::Write;
-            let _ = writeln!(out, "Error at {}:{}: {}", line, col, msg);
+            let _ = writeln!(out, "Error at {line}:{col}: {msg}");
 
             out.push_str(src_line);
             out.push('\n');
@@ -72,9 +78,16 @@ pub fn format_compiler_error(
     }
 
     // Fallback if line is out of bounds
-    format!("Error at {}:{}: {}\n", line, col, msg)
+    format!("Error at {line}:{col}: {msg}\n")
 }
 
+/// The text of a warning at `line`:`col`, laid out like [`format_compiler_error`], with the
+/// warning's code in brackets when it has one.
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "callers are in other files; each argument is a separate part of the report"
+)]
 pub fn format_compiler_warning(
     source: &str,
     line: usize,
@@ -84,15 +97,14 @@ pub fn format_compiler_warning(
     msg: &str,
 ) -> String {
     let code_str = match code {
-        Some(c) => format!("[{}]", c),
+        Some(c) => format!("[{c}]"),
         None => String::new(),
     };
 
     if line > 0 {
         if let Some(src_line) = source.lines().nth(line - 1) {
             let mut out = String::with_capacity(msg.len() + src_line.len() * 2 + 64);
-            use std::fmt::Write;
-            let _ = writeln!(out, "Warning{} at {}:{}: {}", code_str, line, col, msg);
+            let _ = writeln!(out, "Warning{code_str} at {line}:{col}: {msg}");
 
             out.push_str(src_line);
             out.push('\n');
@@ -131,10 +143,15 @@ pub fn format_compiler_warning(
     }
 
     // Fallback if line is out of bounds
-    format!("Warning{} at {}:{}: {}\n", code_str, line, col, msg)
+    format!("Warning{code_str} at {line}:{col}: {msg}\n")
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 

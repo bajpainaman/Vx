@@ -19,10 +19,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::{
+    AssignStmt, CompoundAssignStmt, Expr, ExprStmtStmt, ReturnStmt, Statement, Type, TypeChecker,
+};
 use crate::hir::env::RefProvenance;
 
-impl<'a> TypeChecker<'a> {
+impl TypeChecker<'_> {
     /// Run after a statement has been checked, when its values have types and its closure
     /// literals have become their structs. `return` is handled in `check_return_stmt`.
     pub(crate) fn check_frame_escape(&mut self, stmt: &Statement) {
@@ -31,76 +33,78 @@ impl<'a> TypeChecker<'a> {
         }
         match stmt {
             Statement::LetDecl(decl) => self.check_escape_in_calls(&decl.expr),
-            Statement::Assign(AssignStmt { lhs, rhs, .. }) => {
-                self.check_escape_in_calls(rhs);
-                // The error points at the place written to.
-                let lhs_span = lhs.span();
-                let span = &lhs_span;
-                // The place's type is the value's, and is known more often: a variant built
-                // inside a generic instance can still read as `Unknown`.
-                let stored_ty = match self.check_expr_type_probe(lhs) {
-                    Type::Unknown => self.check_expr_type_probe(rhs),
-                    known => known,
-                };
-                let provenance = self.ref_provenance_of(rhs);
-                let local_depth = match provenance {
-                    Some(RefProvenance::Local(depth))
-                        if self.type_can_hold_reference(&stored_ty) =>
-                    {
-                        Some(depth)
-                    }
-                    _ => None,
-                };
-                let Some(depth) = local_depth else {
-                    // `r = p` makes `r` point wherever `p` does now; a stale "local" would
-                    // refuse a later `return r` that is fine.
-                    if let Expr::Identifier(id) = lhs {
-                        match provenance {
-                            Some(p) => {
-                                self.borrow.ref_provenance.insert(id.name.clone(), p);
-                            }
-                            None => {
-                                self.borrow.ref_provenance.remove(&id.name);
-                            }
-                        }
-                    }
-                    return;
-                };
-                // `r = &x` gives the variable `r` a new value, even when `r` is itself a
-                // reference; only a path through a field, an index or a `*` writes into
-                // whatever the reference points at.
-                let is_path = !matches!(lhs, Expr::Identifier(_));
-                match Self::place_root_through(lhs) {
-                    Some((root, through_deref)) => {
-                        if through_deref || (is_path && self.is_reference_variable(&root)) {
-                            self.report_frame_escape(
-                                "this stores a value that points into this function's stack \
-                                 frame through a reference, where it can outlive the function",
-                                span,
-                            );
-                        } else {
-                            // The local now holds it; returning that local is caught later.
-                            // A field store adds to what the local already points at.
-                            self.hold_in_local(root, depth, is_path, span);
-                        }
-                    }
-                    None => self.report_frame_escape(
-                        "this stores a value that points into this function's stack frame \
-                         where it can outlive the function",
-                        span,
-                    ),
-                }
-            }
+            Statement::Assign(AssignStmt { lhs, rhs, .. }) => self.check_escape_in_assign(lhs, rhs),
             Statement::CompoundAssign(CompoundAssignStmt { rhs, .. }) => {
-                self.check_escape_in_calls(rhs)
+                self.check_escape_in_calls(rhs);
             }
             Statement::Return(ReturnStmt {
                 expr: Some(expr), ..
-            }) => self.check_escape_in_calls(expr),
-            Statement::ExprStmt(ExprStmtStmt { expr, .. }) => self.check_escape_in_calls(expr),
+            })
+            | Statement::ExprStmt(ExprStmtStmt { expr, .. }) => self.check_escape_in_calls(expr),
             Statement::ForLoop(floop) => self.check_escape_in_calls(&floop.iterable),
             Statement::Assert(a) => self.check_escape_in_calls(&a.expr),
             _ => {}
+        }
+    }
+
+    /// The check for `lhs = rhs`: a value that points into this function's stack frame must
+    /// not be stored where it can outlive the function.
+    fn check_escape_in_assign(&mut self, lhs: &Expr, rhs: &Expr) {
+        self.check_escape_in_calls(rhs);
+        // The error points at the place written to.
+        let lhs_span = lhs.span();
+        let span = &lhs_span;
+        // The place's type is the value's, and is known more often: a variant built
+        // inside a generic instance can still read as `Unknown`.
+        let stored_ty = match self.check_expr_type_probe(lhs) {
+            Type::Unknown => self.check_expr_type_probe(rhs),
+            known => known,
+        };
+        let provenance = self.ref_provenance_of(rhs);
+        let local_depth = match provenance {
+            Some(RefProvenance::Local(depth)) if self.type_can_hold_reference(&stored_ty) => {
+                Some(depth)
+            }
+            _ => None,
+        };
+        let Some(depth) = local_depth else {
+            // `r = p` makes `r` point wherever `p` does now; a stale "local" would
+            // refuse a later `return r` that is fine.
+            if let Expr::Identifier(id) = lhs {
+                match provenance {
+                    Some(p) => {
+                        self.borrow.ref_provenance.insert(id.name.clone(), p);
+                    }
+                    None => {
+                        self.borrow.ref_provenance.remove(&id.name);
+                    }
+                }
+            }
+            return;
+        };
+        // `r = &x` gives the variable `r` a new value, even when `r` is itself a
+        // reference; only a path through a field, an index or a `*` writes into
+        // whatever the reference points at.
+        let is_path = !matches!(lhs, Expr::Identifier(_));
+        match Self::place_root_through(lhs) {
+            Some((root, through_deref)) => {
+                if through_deref || (is_path && self.is_reference_variable(&root)) {
+                    self.report_frame_escape(
+                        "this stores a value that points into this function's stack \
+                         frame through a reference, where it can outlive the function",
+                        span,
+                    );
+                } else {
+                    // The local now holds it; returning that local is caught later.
+                    // A field store adds to what the local already points at.
+                    self.hold_in_local(root, depth, is_path, span);
+                }
+            }
+            None => self.report_frame_escape(
+                "this stores a value that points into this function's stack frame \
+                 where it can outlive the function",
+                span,
+            ),
         }
     }
 
@@ -177,30 +181,9 @@ impl<'a> TypeChecker<'a> {
         for sub in &all {
             self.check_escape_in_calls(sub);
         }
-        // A method call may carry no position of its own; its receiver or first argument
-        // does.
-        let span = if span == crate::syntax::Span::default() {
-            all.iter()
-                .map(|e| match e {
-                    Expr::Borrow(b) => b.expr.span(),
-                    e => e.span(),
-                })
-                .find(|s| *s != crate::syntax::Span::default())
-                .unwrap_or(span)
-        } else {
-            span
-        };
+        let span = Self::call_span(span, &all);
 
-        let mut holders: Vec<usize> = Vec::new();
-        let mut depth = 0;
-        for (i, arg) in all.iter().enumerate() {
-            if let Some(RefProvenance::Local(d)) = self.ref_provenance_of(arg) {
-                if self.type_can_hold_reference(&self.check_expr_type_probe(arg)) {
-                    holders.push(i);
-                    depth = depth.max(d);
-                }
-            }
-        }
+        let (holders, depth) = self.frame_holders(&all);
         if holders.is_empty() {
             return;
         }
@@ -235,6 +218,38 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// The position to report a call at. A method call may carry no position of its own; its
+    /// receiver or first argument does.
+    fn call_span(span: crate::syntax::Span, all: &[&Expr]) -> crate::syntax::Span {
+        if span == crate::syntax::Span::default() {
+            all.iter()
+                .map(|e| match e {
+                    Expr::Borrow(b) => b.expr.span(),
+                    e => e.span(),
+                })
+                .find(|s| *s != crate::syntax::Span::default())
+                .unwrap_or(span)
+        } else {
+            span
+        }
+    }
+
+    /// Which of a call's arguments point into this function's stack frame, by index, and the
+    /// depth of the innermost block any of them points into.
+    fn frame_holders(&self, all: &[&Expr]) -> (Vec<usize>, usize) {
+        let mut holders: Vec<usize> = Vec::new();
+        let mut depth = 0;
+        for (i, arg) in all.iter().enumerate() {
+            if let Some(RefProvenance::Local(d)) = self.ref_provenance_of(arg) {
+                if self.type_can_hold_reference(&self.check_expr_type_probe(arg)) {
+                    holders.push(i);
+                    depth = depth.max(d);
+                }
+            }
+        }
+        (holders, depth)
+    }
+
     /// The type a mutable reference argument points at, when it is one: `&mut x` gives the
     /// type of `x`; a variable of type `&mut T` or `*mut T` gives `T`; a receiver is taken
     /// to be one, since the method may borrow it mutably.
@@ -266,8 +281,7 @@ impl<'a> TypeChecker<'a> {
         match expr {
             Expr::Identifier(id) => self
                 .lookup(id.name.as_ref())
-                .map(|(t, _)| t.clone())
-                .unwrap_or(Type::Unknown),
+                .map_or(Type::Unknown, |(t, _)| t.clone()),
             Expr::Borrow(b) => Type::Borrow {
                 inner: Box::new(self.check_expr_type_probe(&b.expr)),
                 mem_space: None,
@@ -313,8 +327,7 @@ impl<'a> TypeChecker<'a> {
                     .functions
                     .iter()
                     .find(|(f, _)| f.name == fc.name)
-                    .map(|(f, _)| f.return_type.clone())
-                    .unwrap_or(Type::Unknown)
+                    .map_or(Type::Unknown, |(f, _)| f.return_type.clone())
             }
             // Anything else: unknown, which the escape gate treats as "could hold one".
             _ => Type::Unknown,
@@ -390,7 +403,7 @@ impl<'a> TypeChecker<'a> {
     fn is_reference_variable(&self, name: &crate::symbol::Symbol) -> bool {
         matches!(
             self.lookup(name.as_ref()).map(|(t, _)| t),
-            Some(Type::Ref(..)) | Some(Type::Borrow { .. }) | Some(Type::Pointer(..))
+            Some(Type::Ref(..) | Type::Borrow { .. } | Type::Pointer(..))
         )
     }
 }

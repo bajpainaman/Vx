@@ -40,21 +40,21 @@ pub const ALLOW_UNVERIFIED: &str = "VX_ALLOW_UNVERIFIED";
 /// reached only after a `z3` spawn has already failed, or once per relaxed transfer edge, so it is
 /// never on a hot path -- and the compiler admits no locking primitive and no process-global
 /// atomic anywhere in `src/`, which CI enforces by name
-/// (docs/parallel_compiler_architecture.md 2.7).
+/// (`docs/parallel_compiler_architecture.md` 2.7).
 ///
 /// An earlier version memoized this, and a probe beside it, through a once-cell. Both were
 /// removed: the memo bought nothing, and it turned a read of the environment into shared mutable
 /// state that every worker thread reached into.
+#[must_use]
 pub fn unverified_allowed() -> bool {
-    std::env::var(ALLOW_UNVERIFIED)
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false)
+    std::env::var(ALLOW_UNVERIFIED).is_ok_and(|v| v != "0" && !v.is_empty())
 }
 
 /// The message shown when an obligation cannot be discharged because no solver is available.
 ///
 /// Names the tool, why it is needed, and the escape hatch — a diagnostic that says only
 /// "z3 not found" leaves the reader to guess whether it mattered.
+#[must_use]
 pub fn missing_message(reason: &str) -> String {
     format!(
         "no SMT solver available, so this proof obligation could not be discharged ({reason}). \
@@ -65,6 +65,11 @@ pub fn missing_message(reason: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 
@@ -100,9 +105,7 @@ mod tests {
         );
         assert_eq!(
             unverified_allowed(),
-            std::env::var(ALLOW_UNVERIFIED)
-                .map(|v| v != "0" && !v.is_empty())
-                .unwrap_or(false),
+            std::env::var(ALLOW_UNVERIFIED).is_ok_and(|v| v != "0" && !v.is_empty()),
             "the answer must be the environment, not a remembered copy of it"
         );
     }

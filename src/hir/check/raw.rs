@@ -36,9 +36,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::{MemorySpace, Type, TypeChecker};
 use crate::diagnostic::{DiagnosticCode, SourceSpan};
-use crate::syntax::expr::{Expr, FunctionCallExpr, LogicalOpExpr, NumberExpr, RelationalOpExpr};
+use crate::syntax::expr::{
+    Expr, FunctionCallExpr, IfExpr, InlineMlirExpr, LogicalOpExpr, MatchExpr, NumberExpr,
+    RelationalOpExpr,
+};
 use crate::syntax::stmt::Statement;
 use crate::syntax::{Dim, LogicalOp, RelationalOp, Span};
 
@@ -62,7 +65,21 @@ struct TileInfo {
     name: crate::symbol::Symbol,
 }
 
-impl<'a> TypeChecker<'a> {
+/// One `raw::<prim>` call being checked: the primitive's name, the arguments with their
+/// types, and where the call is in the source.
+struct RawCall<'a> {
+    prim: &'a str,
+    args: &'a [Expr],
+    arg_types: &'a [Type],
+    span: &'a Span,
+}
+
+/// The type of a primitive that returns no value.
+fn void_type() -> Type {
+    Type::Struct("void".into(), None)
+}
+
+impl TypeChecker<'_> {
     /// Type one `raw::<prim>` call. Called from `resolve_intrinsic_function`, so this
     /// runs before any user-code lookup: the `raw::` prefix is reserved whether or not
     /// the call is legal where it appears.
@@ -73,7 +90,6 @@ impl<'a> TypeChecker<'a> {
         arg_types: &[Type],
         call_span: Span,
     ) -> Type {
-        let unit = || Type::Struct("void".into(), None);
         let i64_ty = Type::Scalar(crate::syntax::ElementType::I64);
         let span = Some(SourceSpan::from_ast_span(&call_span));
 
@@ -86,11 +102,62 @@ impl<'a> TypeChecker<'a> {
                 "load" => arg_types
                     .first()
                     .and_then(|t| Self::as_tensor_operand(t).map(|(e, _, _)| e.clone()))
-                    .map(Type::Scalar)
-                    .unwrap_or_else(unit),
-                _ => unit(),
+                    .map_or_else(void_type, Type::Scalar),
+                _ => void_type(),
             };
         }
+
+        let call = RawCall {
+            prim,
+            args,
+            arg_types,
+            span: &call_span,
+        };
+        let Some((from, to, machine)) = self.raw_lowering_edge(&call) else {
+            return void_type();
+        };
+
+        match prim {
+            "extent" => {
+                if self.raw_arity(&call, 1) {
+                    self.raw_tile_arg(&call, 0, false);
+                }
+                i64_ty
+            }
+            "lane" | "lanes" => {
+                self.raw_arity(&call, 0);
+                i64_ty
+            }
+            "load" => self.check_raw_load(&call),
+            "store" => self.check_raw_store(&call),
+            "barrier" | "async_wait" => {
+                self.raw_arity(&call, 0);
+                void_type()
+            }
+            "async_copy" => self.check_raw_async_copy(&call, &from, &to, &machine),
+            _ => {
+                self.errors.error_with_code(
+                    DiagnosticCode::E6017,
+                    format!(
+                        "unknown primitive `raw::{prim}`; the primitive set is raw::{{{}}}",
+                        RAW_PRIMITIVES.join(", ")
+                    ),
+                    span,
+                );
+                void_type()
+            }
+        }
+    }
+
+    /// The edge of the lowering that contains this call: its two memory spaces and the
+    /// name of its machine. Reports an error and returns `None` when the call is inside
+    /// a closure or outside an `impl transfer` body.
+    fn raw_lowering_edge(
+        &mut self,
+        call: &RawCall<'_>,
+    ) -> Option<(MemorySpace, MemorySpace, String)> {
+        let prim = call.prim;
+        let span = Some(SourceSpan::from_ast_span(call.span));
 
         // A closure runs when it is called, not when the lowering runs, so a primitive
         // inside one escapes every whole-body guarantee (barrier reachability, the async
@@ -105,11 +172,11 @@ impl<'a> TypeChecker<'a> {
                 ),
                 span,
             );
-            return unit();
+            return None;
         }
 
         // The floor property: outside an `impl Transfer` body the names do not resolve.
-        let Some((from, to, machine)) = self.seam.lowering_edge.clone() else {
+        let Some(edge) = self.seam.lowering_edge.clone() else {
             self.errors.error_with_code(
                 DiagnosticCode::E6017,
                 format!(
@@ -118,144 +185,131 @@ impl<'a> TypeChecker<'a> {
                 ),
                 span,
             );
-            return unit();
+            return None;
         };
+        Some(edge)
+    }
 
-        let arity = |n: usize, checker: &mut Self| {
-            if args.len() != n {
-                checker.errors.error_with_code(
-                    DiagnosticCode::E6017,
-                    format!("`raw::{prim}` expects {n} argument(s), got {}", args.len()),
-                    Some(SourceSpan::from_ast_span(&call_span)),
-                );
-                false
-            } else {
-                true
-            }
-        };
-
-        match prim {
-            "extent" => {
-                if arity(1, self) {
-                    self.raw_tile_arg(prim, &args[0], &arg_types[0], false, &call_span);
-                }
-                i64_ty
-            }
-            "lane" | "lanes" => {
-                arity(0, self);
-                i64_ty
-            }
-            "load" => {
-                if !arity(2, self) {
-                    return unit();
-                }
-                self.raw_index_arg(prim, &arg_types[1], &call_span);
-                match self.raw_tile_arg(prim, &args[0], &arg_types[0], false, &call_span) {
-                    Some(tile) => {
-                        let elem = tile.elem.clone();
-                        self.raw_bounds_obligation(prim, &args[1], &[tile], &call_span);
-                        Type::Scalar(elem)
-                    }
-                    None => unit(),
-                }
-            }
-            "store" => {
-                if !arity(3, self) {
-                    return unit();
-                }
-                self.raw_index_arg(prim, &arg_types[1], &call_span);
-                if let Some(tile) =
-                    self.raw_tile_arg(prim, &args[0], &arg_types[0], true, &call_span)
-                {
-                    // #240 identical-only assignability: the stored value must be exactly the
-                    // tile's element type, no widening.
-                    if arg_types[2] != Type::Scalar(tile.elem.clone()) {
-                        self.errors.error_with_code(
-                            DiagnosticCode::E6017,
-                            format!(
-                                "`raw::store` writes a {:?} tile but the value has type {:?}",
-                                tile.elem, arg_types[2]
-                            ),
-                            Some(SourceSpan::from_ast_span(&call_span)),
-                        );
-                    }
-                    self.raw_bounds_obligation(prim, &args[1], &[tile], &call_span);
-                }
-                unit()
-            }
-            "barrier" => {
-                arity(0, self);
-                unit()
-            }
-            "async_copy" => {
-                if !arity(3, self) {
-                    return unit();
-                }
-                self.raw_index_arg(prim, &arg_types[2], &call_span);
-                // Capability, not choice: THIS lowering's machine must declare the engine on
-                // its own edge. Another machine declaring `copy_engine` on a like-named edge
-                // is another machine's hardware -- the lookup used to scan every declared
-                // topology, so one machine's declaration armed every machine's lowerings for
-                // that edge pair (found by review, Vx#353). Absence of the declaration IS
-                // absence of the capability.
-                if !self.edge_has_copy_engine(&from, &to, &machine) {
-                    self.errors.error_with_code(
-                        DiagnosticCode::E6020,
-                        format!(
-                            "`raw::async_copy` needs a copy engine on {} -> {}, and \
-                             Topology::{} does not declare one there. Add `copy_engine` to \
-                             {}'s own edge (`transfer Memory::{} -> Memory::{} copy_engine`) \
-                             if its hardware has the engine -- another machine declaring it \
-                             on a like-named edge is not this machine's capability",
-                            from.name(),
-                            to.name(),
-                            machine,
-                            machine,
-                            from.name(),
-                            to.name()
-                        ),
-                        Some(SourceSpan::from_ast_span(&call_span)),
-                    );
-                }
-                let dst = self.raw_tile_arg(prim, &args[0], &arg_types[0], true, &call_span);
-                let src = self.raw_tile_arg(prim, &args[1], &arg_types[1], false, &call_span);
-                let tiles: Vec<TileInfo> = dst.into_iter().chain(src).collect();
-                if !tiles.is_empty() {
-                    self.raw_bounds_obligation(prim, &args[2], &tiles, &call_span);
-                }
-                unit()
-            }
-            "async_wait" => {
-                arity(0, self);
-                unit()
-            }
-            _ => {
-                self.errors.error_with_code(
-                    DiagnosticCode::E6017,
-                    format!(
-                        "unknown primitive `raw::{prim}`; the primitive set is raw::{{{}}}",
-                        RAW_PRIMITIVES.join(", ")
-                    ),
-                    span,
-                );
-                unit()
-            }
+    /// Check that the call has exactly `n` arguments, and report an error when it does not.
+    fn raw_arity(&mut self, call: &RawCall<'_>, n: usize) -> bool {
+        let prim = call.prim;
+        if call.args.len() == n {
+            true
+        } else {
+            self.errors.error_with_code(
+                DiagnosticCode::E6017,
+                format!(
+                    "`raw::{prim}` expects {n} argument(s), got {}",
+                    call.args.len()
+                ),
+                Some(SourceSpan::from_ast_span(call.span)),
+            );
+            false
         }
     }
 
-    /// A tile argument must be a bare identifier (indexed, not addressed: no expression
-    /// computes a tile) whose type peels to a tensor. `need_mut` additionally demands the
-    /// `&mut` the store side of the contract requires -- exclusivity itself stays the
-    /// borrow checker's job.
+    /// Type `raw::load(tile, index)`: the result is one element of the tile.
+    fn check_raw_load(&mut self, call: &RawCall<'_>) -> Type {
+        let (prim, args, arg_types) = (call.prim, call.args, call.arg_types);
+        if !self.raw_arity(call, 2) {
+            return void_type();
+        }
+        self.raw_index_arg(prim, &arg_types[1], call.span);
+        match self.raw_tile_arg(call, 0, false) {
+            Some(tile) => {
+                let elem = tile.elem.clone();
+                self.raw_bounds_obligation(prim, &args[1], &[tile], call.span);
+                Type::Scalar(elem)
+            }
+            None => void_type(),
+        }
+    }
+
+    /// Type `raw::store(tile, index, value)`: the value must have the tile's element type.
+    fn check_raw_store(&mut self, call: &RawCall<'_>) -> Type {
+        let (prim, args, arg_types) = (call.prim, call.args, call.arg_types);
+        if !self.raw_arity(call, 3) {
+            return void_type();
+        }
+        self.raw_index_arg(prim, &arg_types[1], call.span);
+        if let Some(tile) = self.raw_tile_arg(call, 0, true) {
+            // #240 identical-only assignability: the stored value must be exactly the
+            // tile's element type, no widening.
+            if arg_types[2] != Type::Scalar(tile.elem.clone()) {
+                self.errors.error_with_code(
+                    DiagnosticCode::E6017,
+                    format!(
+                        "`raw::store` writes a {:?} tile but the value has type {:?}",
+                        tile.elem, arg_types[2]
+                    ),
+                    Some(SourceSpan::from_ast_span(call.span)),
+                );
+            }
+            self.raw_bounds_obligation(prim, &args[1], &[tile], call.span);
+        }
+        void_type()
+    }
+
+    /// Type `raw::async_copy(dst, src, index)` in a lowering for the edge `from -> to` of
+    /// `machine`. The machine must declare a copy engine on that edge.
+    fn check_raw_async_copy(
+        &mut self,
+        call: &RawCall<'_>,
+        from: &MemorySpace,
+        to: &MemorySpace,
+        machine: &str,
+    ) -> Type {
+        let (prim, args, arg_types) = (call.prim, call.args, call.arg_types);
+        if !self.raw_arity(call, 3) {
+            return void_type();
+        }
+        self.raw_index_arg(prim, &arg_types[2], call.span);
+        // Capability, not choice: THIS lowering's machine must declare the engine on
+        // its own edge. Another machine declaring `copy_engine` on a like-named edge
+        // is another machine's hardware -- the lookup used to scan every declared
+        // topology, so one machine's declaration armed every machine's lowerings for
+        // that edge pair (found by review, Vx#353). Absence of the declaration IS
+        // absence of the capability.
+        if !self.edge_has_copy_engine(from, to, machine) {
+            self.errors.error_with_code(
+                DiagnosticCode::E6020,
+                format!(
+                    "`raw::async_copy` needs a copy engine on {} -> {}, and \
+                     Topology::{} does not declare one there. Add `copy_engine` to \
+                     {}'s own edge (`transfer Memory::{} -> Memory::{} copy_engine`) \
+                     if its hardware has the engine -- another machine declaring it \
+                     on a like-named edge is not this machine's capability",
+                    from.name(),
+                    to.name(),
+                    machine,
+                    machine,
+                    from.name(),
+                    to.name()
+                ),
+                Some(SourceSpan::from_ast_span(call.span)),
+            );
+        }
+        let dst = self.raw_tile_arg(call, 0, true);
+        let src = self.raw_tile_arg(call, 1, false);
+        let tiles: Vec<TileInfo> = dst.into_iter().chain(src).collect();
+        if !tiles.is_empty() {
+            self.raw_bounds_obligation(prim, &args[2], &tiles, call.span);
+        }
+        void_type()
+    }
+
+    /// Argument number `index` of the call must be a tile. A tile argument must be a bare
+    /// identifier (indexed, not addressed: no expression computes a tile) whose type peels
+    /// to a tensor. `need_mut` additionally demands the `&mut` the store side of the
+    /// contract requires -- exclusivity itself stays the borrow checker's job.
     fn raw_tile_arg(
         &mut self,
-        prim: &str,
-        arg: &Expr,
-        arg_ty: &Type,
+        call: &RawCall<'_>,
+        index: usize,
         need_mut: bool,
-        call_span: &Span,
     ) -> Option<TileInfo> {
-        let span = Some(SourceSpan::from_ast_span(call_span));
+        let (prim, arg, arg_ty) = (call.prim, &call.args[index], &call.arg_types[index]);
+        let span = Some(SourceSpan::from_ast_span(call.span));
         let Expr::Identifier(id) = arg else {
             self.errors.error_with_code(
                 DiagnosticCode::E6017,
@@ -328,8 +382,8 @@ impl<'a> TypeChecker<'a> {
     /// i32 (#240) and the extent-driven form `for i in 0..raw::extent(t)` binds i64, and
     /// rejecting either would force a cast that proves nothing.
     fn raw_index_arg(&mut self, prim: &str, ty: &Type, call_span: &Span) {
-        use crate::syntax::ElementType::*;
-        if !matches!(ty, Type::Scalar(I32) | Type::Scalar(I64)) {
+        use crate::syntax::ElementType::{I32, I64};
+        if !matches!(ty, Type::Scalar(I32 | I64)) {
             self.errors.error_with_code(
                 DiagnosticCode::E6017,
                 format!("the index of `raw::{prim}` must be an integer, got {ty:?}"),
@@ -387,7 +441,7 @@ impl<'a> TypeChecker<'a> {
                 rhs: Box::new(Expr::RelationalOp(RelationalOpExpr {
                     lhs: Box::new(idx.clone()),
                     op: RelationalOp::Lt,
-                    rhs: Box::new(Self::number_expr(extent as i64)),
+                    rhs: Box::new(Self::number_expr(extent.cast_signed())),
                     span: Span::default(),
                     operand_ty: None,
                 })),
@@ -437,7 +491,7 @@ impl<'a> TypeChecker<'a> {
                     if let Some((ty, _)) = self.lookup(id.name.as_ref()) {
                         if let Some((_, dims, _)) = Self::as_tensor_operand(ty) {
                             if let Some(n) = Self::static_extent_of_dims(dims) {
-                                return Self::number_expr(n as i64);
+                                return Self::number_expr(n.cast_signed());
                             }
                         }
                     }
@@ -513,29 +567,6 @@ impl<'a> TypeChecker<'a> {
     ///     `Relaxed {{ published }}` and `hir/seam.rs`'s stale read is reachable.
     pub fn check_transfer_impl_bodies(&mut self, impls: &[crate::syntax::TransferImplDecl]) {
         for t in impls {
-            // The topology this lowering is FOR, and its declaration of this edge. Before the
-            // `for` clause existed this had to search every declared topology for one that
-            // declared the edge, and then hold every one of them to the visibility rule --
-            // including machines the lowering was never written for. Now it names its machine,
-            // so the check applies to that machine.
-            let declaring: Vec<(
-                &crate::symbol::Symbol,
-                &Vec<crate::syntax::MemorySpace>,
-                &crate::arch::TransferEdge,
-            )> = self
-                .env
-                .topologies
-                .values()
-                .filter(|topo| topo.name.as_ref() == t.topology.display_name())
-                .flat_map(|topo| {
-                    topo.descriptor
-                        .transfers
-                        .iter()
-                        .filter(|e| e.from == t.from && e.to == t.to)
-                        .map(move |e| (&topo.name, &topo.descriptor.visibility, e))
-                })
-                .collect();
-
             // The whole-body checks and the edge-level checks below apply to lowerings
             // written against the primitives. A body predating them that never says `raw::` is
             // carried code -- warning it (or refusing its edge) would fail every
@@ -550,195 +581,253 @@ impl<'a> TypeChecker<'a> {
                 })
                 .collect();
             let uses_raw = scans.iter().any(|s| !s.calls.is_empty());
-
-            if uses_raw && declaring.is_empty() {
-                self.errors.push_warning(format!(
-                    "`impl Transfer<Memory::{}, Memory::{}> for Topology::{}` matches no declared \
-                     topology edge; the lowering is carried but nothing can execute it",
-                    t.from.name(),
-                    t.to.name(),
-                    t.topology.display_name()
-                ));
-            }
-            if uses_raw {
-                for (topo_name, vis, _) in &declaring {
-                    for space in [&t.from, &t.to] {
-                        // The host side of a host link is exempt: every declared topology
-                        // reaches CPU_DRAM by construction (the unified-memory rule in
-                        // `arch.rs::is_type_accessible`), and the shipped fleet files all
-                        // declare host edges without listing CPU_DRAM as visible.
-                        if matches!(space, crate::syntax::MemorySpace::CPUDRAM) {
-                            continue;
-                        }
-                        if !vis.contains(space) {
-                            self.errors.error_with_code(
-                                DiagnosticCode::E6022,
-                                format!(
-                                    "topology {} declares the edge {} -> {} but cannot see \
-                                     Memory::{}; a lowering for this edge would run on a \
-                                     part that cannot address the space it moves bytes \
-                                     through (the space-visibility constraint)",
-                                    topo_name,
-                                    t.from.name(),
-                                    t.to.name(),
-                                    space.name()
-                                ),
-                                None,
-                            );
-                        }
-                    }
-                }
-            }
-            // The body requires a trailing barrier only when some declaring topology grades
-            // the edge synchronizing (the default). An edge every topology declares relaxed
-            // has opted out of the visibility guarantee -- and gets the seam engine's
-            // W1027 treatment at the declaration instead.
-            let edge_requires_sync =
-                declaring.is_empty() || declaring.iter().any(|(_, _, e)| e.sync);
+            let edge_requires_sync = self.check_lowering_edge(t, uses_raw);
 
             for (f, scan) in t.methods.iter().zip(&scans) {
                 if scan.calls.is_empty() {
                     continue; // Not written against the primitives (yet); it predates them.
                 }
 
-                for (name, span, in_closure) in &scan.calls {
-                    if *in_closure {
-                        self.errors.error_with_code(
-                            DiagnosticCode::E6017,
-                            format!(
-                                "`{name}` cannot appear inside a closure: a lowering's \
-                                 moves must run when the lowering runs"
-                            ),
-                            Some(SourceSpan::from_ast_span(span)),
-                        );
-                    }
-                }
+                self.report_raw_calls_in_closures(scan);
 
                 // "Top level" sees through `unsafe { }`: wrapping the body in unsafe is
                 // the documented escape for unprovable bounds, and it must not demote the
                 // barrier inside it to "under control flow".
                 let top = top_level_view(&f.body);
 
-                // Every barrier must be one of the body's own top-level statements.
-                let top_level_barriers: Vec<*const Expr> = top
-                    .iter()
-                    .filter_map(|s| match s {
-                        Statement::ExprStmt(es) if is_raw_call(&es.expr, "raw::barrier") => {
-                            Some(&es.expr as *const Expr)
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                for (ptr, span) in &scan.barriers {
-                    if !top_level_barriers.contains(ptr) {
-                        self.errors.error_with_code(
-                            DiagnosticCode::E6019,
-                            "`raw::barrier()` must be reachable by every lane, and inside \
-                             an `if`, `match`, or loop the compiler cannot guarantee \
-                             that. Move the barrier to the top level of the body"
-                                .to_string(),
-                            Some(SourceSpan::from_ast_span(span)),
-                        );
-                    }
-                }
-
-                // A publishing lowering on a synchronizing edge has ONE exit, at the
-                // bottom, past the barrier. An early return would leave a path that
-                // publishes and exits unsynchronized -- and if the exit is taken by some
-                // lanes only, the remaining lanes wait at a barrier the exited lanes
-                // never reach. Reviewed and reproduced before this check existed.
-                let final_return: Option<*const Statement> = match top.last() {
-                    Some(s @ Statement::Return(_)) => Some(*s as *const Statement),
-                    _ => None,
-                };
-                // Unconditional, for every lowering on every edge grade: the body is
-                // INLINED at the transfer site, so a `return` anywhere but the bottom
-                // returns from the function that contains the transfer. Reproduced
-                // before this dropped its edge-grade guard: a lowering on a `relaxed`
-                // edge returned 7 out of `main`, skipping the rest of the program, and
-                // the same shape inside a kernel produced invalid IR. On a
-                // synchronizing edge the rule is also what keeps every path past the
-                // trailing barrier.
-                for (ptr, span) in &scan.returns {
-                    if Some(*ptr) != final_return {
-                        self.errors.error_with_code(
-                            DiagnosticCode::E6021,
-                            "`return` before the end of a lowering: the body is inlined \
-                             at the transfer site, so this would return from whatever \
-                             function performs the transfer. A lowering returns once, \
-                             at the bottom"
-                                .to_string(),
-                            Some(SourceSpan::from_ast_span(span)),
-                        );
-                    }
-                }
-
-                // Forward walk for the async discipline. Early exits are real exits: a
-                // `return` records its in-flight state, and the leak check below unions
-                // every way out of the body.
-                let mut state = DiscState::default();
-                let mut cx = WalkCx::default();
-                self.discipline_stmts(&f.body, &mut state, &mut cx);
-                let mut leaks = state.outstanding;
-                for exit in cx.fn_exits {
-                    for (tile, span) in exit {
-                        leaks.entry(tile).or_insert(span);
-                    }
-                }
-                for (tile, span) in &leaks {
-                    self.errors.error_with_code(
-                        DiagnosticCode::E6021,
-                        format!(
-                            "`raw::async_copy` into `{tile}` has no matching \
-                             `raw::async_wait` on some path out of the body; the copy \
-                             may still be in flight when the transfer returns"
-                        ),
-                        Some(SourceSpan::from_ast_span(span)),
-                    );
-                }
+                self.check_barriers_at_top_level(&top, scan);
+                self.check_one_final_return(&top, scan);
+                self.check_async_copies_waited(&f.body);
 
                 // The trailing synchronization grade (the visibility clause, syntactic form).
                 if edge_requires_sync && scan.publishes {
-                    // Every Vx function ends with a `return` (the language has no void
-                    // functions), and a return carries no synchronization -- the barrier
-                    // is the last statement BEFORE it. The return's own expression must
-                    // not publish either: it runs after the barrier.
-                    let mut it = top.iter().rev();
-                    let mut last = it.next();
-                    let mut return_publishes = false;
-                    if let Some(Statement::Return(r)) = last {
-                        let mut ret_scan = RawScan::default();
-                        if let Some(e) = &r.expr {
-                            scan_expr(e, false, &mut ret_scan);
-                        }
-                        return_publishes = ret_scan.publishes;
-                        last = it.next();
+                    self.check_trailing_barrier(t, f, &top);
+                }
+            }
+        }
+    }
+
+    /// Check the edge `t` is written for against the machine it names: warn when the
+    /// machine does not declare the edge, and report an error when the machine cannot see
+    /// one of the edge's two memory spaces. Both checks run only when `uses_raw` is true.
+    /// Returns whether a body for this edge must end with `raw::barrier()`.
+    fn check_lowering_edge(&mut self, t: &crate::syntax::TransferImplDecl, uses_raw: bool) -> bool {
+        // The topology this lowering is FOR, and its declaration of this edge. Before the
+        // `for` clause existed this had to search every declared topology for one that
+        // declared the edge, and then hold every one of them to the visibility rule --
+        // including machines the lowering was never written for. Now it names its machine,
+        // so the check applies to that machine.
+        let declaring: Vec<(
+            &crate::symbol::Symbol,
+            &Vec<crate::syntax::MemorySpace>,
+            &crate::arch::TransferEdge,
+        )> = self
+            .env
+            .topologies
+            .values()
+            .filter(|topo| topo.name.as_ref() == t.topology.display_name())
+            .flat_map(|topo| {
+                topo.descriptor
+                    .transfers
+                    .iter()
+                    .filter(|e| e.from == t.from && e.to == t.to)
+                    .map(move |e| (&topo.name, &topo.descriptor.visibility, e))
+            })
+            .collect();
+
+        if uses_raw && declaring.is_empty() {
+            self.errors.push_warning(format!(
+                "`impl Transfer<Memory::{}, Memory::{}> for Topology::{}` matches no declared \
+                 topology edge; the lowering is carried but nothing can execute it",
+                t.from.name(),
+                t.to.name(),
+                t.topology.display_name()
+            ));
+        }
+        if uses_raw {
+            for (topo_name, vis, _) in &declaring {
+                for space in [&t.from, &t.to] {
+                    // The host side of a host link is exempt: every declared topology
+                    // reaches CPU_DRAM by construction (the unified-memory rule in
+                    // `arch.rs::is_type_accessible`), and the shipped fleet files all
+                    // declare host edges without listing CPU_DRAM as visible.
+                    if matches!(space, crate::syntax::MemorySpace::CPUDRAM) {
+                        continue;
                     }
-                    let ends_with_barrier = !return_publishes
-                        && matches!(
-                            last,
-                            Some(Statement::ExprStmt(es)) if is_raw_call(&es.expr, "raw::barrier")
-                        );
-                    if !ends_with_barrier {
-                        let anchor = top.last().map(|s| SourceSpan::from_ast_span(&stmt_span(s)));
+                    if !vis.contains(space) {
                         self.errors.error_with_code(
-                            DiagnosticCode::E6021,
+                            DiagnosticCode::E6022,
                             format!(
-                                "lowering `{}` for the synchronizing edge {} -> {} writes \
-                                 the destination but does not end with `raw::barrier()`, \
-                                 so another lane can read stale data (the transfer \
-                                 visibility rule). Add the barrier as the last statement \
-                                 before the return, or declare the edge `relaxed` in the \
-                                 machine file",
-                                f.name,
+                                "topology {} declares the edge {} -> {} but cannot see \
+                                 Memory::{}; a lowering for this edge would run on a \
+                                 part that cannot address the space it moves bytes \
+                                 through (the space-visibility constraint)",
+                                topo_name,
                                 t.from.name(),
-                                t.to.name()
+                                t.to.name(),
+                                space.name()
                             ),
-                            anchor,
+                            None,
                         );
                     }
                 }
             }
+        }
+        // The body requires a trailing barrier only when some declaring topology grades
+        // the edge synchronizing (the default). An edge every topology declares relaxed
+        // has opted out of the visibility guarantee -- and gets the seam engine's
+        // W1027 treatment at the declaration instead.
+        declaring.is_empty() || declaring.iter().any(|(_, _, e)| e.sync)
+    }
+
+    /// Report every `raw::` call the scan found inside a closure.
+    fn report_raw_calls_in_closures(&mut self, scan: &RawScan) {
+        for (name, span, in_closure) in &scan.calls {
+            if *in_closure {
+                self.errors.error_with_code(
+                    DiagnosticCode::E6017,
+                    format!(
+                        "`{name}` cannot appear inside a closure: a lowering's \
+                         moves must run when the lowering runs"
+                    ),
+                    Some(SourceSpan::from_ast_span(span)),
+                );
+            }
+        }
+    }
+
+    /// Every barrier must be one of the body's own top-level statements, given in `top`.
+    fn check_barriers_at_top_level(&mut self, top: &[&Statement], scan: &RawScan) {
+        let top_level_barriers: Vec<*const Expr> = top
+            .iter()
+            .filter_map(|s| match s {
+                Statement::ExprStmt(es) if is_raw_call(&es.expr, "raw::barrier") => {
+                    Some(&raw const es.expr)
+                }
+                _ => None,
+            })
+            .collect();
+        for (ptr, span) in &scan.barriers {
+            if !top_level_barriers.contains(ptr) {
+                self.errors.error_with_code(
+                    DiagnosticCode::E6019,
+                    "`raw::barrier()` must be reachable by every lane, and inside \
+                     an `if`, `match`, or loop the compiler cannot guarantee \
+                     that. Move the barrier to the top level of the body"
+                        .to_string(),
+                    Some(SourceSpan::from_ast_span(span)),
+                );
+            }
+        }
+    }
+
+    /// Report every `return` that is not the last top-level statement of the body.
+    fn check_one_final_return(&mut self, top: &[&Statement], scan: &RawScan) {
+        // A publishing lowering on a synchronizing edge has ONE exit, at the
+        // bottom, past the barrier. An early return would leave a path that
+        // publishes and exits unsynchronized -- and if the exit is taken by some
+        // lanes only, the remaining lanes wait at a barrier the exited lanes
+        // never reach. Reviewed and reproduced before this check existed.
+        let final_return: Option<*const Statement> = match top.last() {
+            Some(s @ Statement::Return(_)) => Some(std::ptr::from_ref::<Statement>(*s)),
+            _ => None,
+        };
+        // Unconditional, for every lowering on every edge grade: the body is
+        // INLINED at the transfer site, so a `return` anywhere but the bottom
+        // returns from the function that contains the transfer. Reproduced
+        // before this dropped its edge-grade guard: a lowering on a `relaxed`
+        // edge returned 7 out of `main`, skipping the rest of the program, and
+        // the same shape inside a kernel produced invalid IR. On a
+        // synchronizing edge the rule is also what keeps every path past the
+        // trailing barrier.
+        for (ptr, span) in &scan.returns {
+            if Some(*ptr) != final_return {
+                self.errors.error_with_code(
+                    DiagnosticCode::E6021,
+                    "`return` before the end of a lowering: the body is inlined \
+                     at the transfer site, so this would return from whatever \
+                     function performs the transfer. A lowering returns once, \
+                     at the bottom"
+                        .to_string(),
+                    Some(SourceSpan::from_ast_span(span)),
+                );
+            }
+        }
+    }
+
+    /// Walk the body forward and report every `raw::async_copy` that some way out of the
+    /// body leaves without a `raw::async_wait`.
+    fn check_async_copies_waited(&mut self, body: &[Statement]) {
+        // Forward walk for the async discipline. Early exits are real exits: a
+        // `return` records its in-flight state, and the leak check below unions
+        // every way out of the body.
+        let mut state = DiscState::default();
+        let mut cx = WalkCx::default();
+        self.discipline_stmts(body, &mut state, &mut cx);
+        let mut leaks = state.outstanding;
+        for exit in cx.fn_exits {
+            for (tile, span) in exit {
+                leaks.entry(tile).or_insert(span);
+            }
+        }
+        for (tile, span) in &leaks {
+            self.errors.error_with_code(
+                DiagnosticCode::E6021,
+                format!(
+                    "`raw::async_copy` into `{tile}` has no matching \
+                     `raw::async_wait` on some path out of the body; the copy \
+                     may still be in flight when the transfer returns"
+                ),
+                Some(SourceSpan::from_ast_span(span)),
+            );
+        }
+    }
+
+    /// Report an error unless the body of `f`, whose top-level statements are `top`, ends
+    /// with `raw::barrier()` just before its final `return`.
+    fn check_trailing_barrier(
+        &mut self,
+        t: &crate::syntax::TransferImplDecl,
+        f: &crate::syntax::Function,
+        top: &[&Statement],
+    ) {
+        // Every Vx function ends with a `return` (the language has no void
+        // functions), and a return carries no synchronization -- the barrier
+        // is the last statement BEFORE it. The return's own expression must
+        // not publish either: it runs after the barrier.
+        let mut it = top.iter().rev();
+        let mut last = it.next();
+        let mut return_publishes = false;
+        if let Some(Statement::Return(r)) = last {
+            let mut ret_scan = RawScan::default();
+            if let Some(e) = &r.expr {
+                scan_expr(e, false, &mut ret_scan);
+            }
+            return_publishes = ret_scan.publishes;
+            last = it.next();
+        }
+        let ends_with_barrier = !return_publishes
+            && matches!(
+                last,
+                Some(Statement::ExprStmt(es)) if is_raw_call(&es.expr, "raw::barrier")
+            );
+        if !ends_with_barrier {
+            let anchor = top.last().map(|s| SourceSpan::from_ast_span(&stmt_span(s)));
+            self.errors.error_with_code(
+                DiagnosticCode::E6021,
+                format!(
+                    "lowering `{}` for the synchronizing edge {} -> {} writes \
+                     the destination but does not end with `raw::barrier()`, \
+                     so another lane can read stale data (the transfer \
+                     visibility rule). Add the barrier as the last statement \
+                     before the return, or declare the edge `relaxed` in the \
+                     machine file",
+                    f.name,
+                    t.from.name(),
+                    t.to.name()
+                ),
+                anchor,
+            );
         }
     }
 
@@ -784,8 +873,8 @@ impl<'a> TypeChecker<'a> {
                         frame.push(st.outstanding.clone());
                     }
                 }
-                Statement::MacroCall(_) => {} // Expanded before checking; nothing survives here.
-                Statement::Drop(_) | Statement::Error(_) => {}
+                // A macro call is expanded before checking; nothing survives here.
+                Statement::MacroCall(_) | Statement::Drop(_) | Statement::Error(_) => {}
             }
         }
     }
@@ -826,99 +915,30 @@ impl<'a> TypeChecker<'a> {
     /// effect, and join branches by union.
     fn discipline_expr(&mut self, e: &Expr, st: &mut DiscState, cx: &mut WalkCx) {
         match e {
-            Expr::FunctionCall(fc) => {
-                for a in &fc.args {
-                    self.discipline_expr(a, st, cx);
-                }
-                self.apply_call_effect(fc, st);
-            }
-            Expr::If(ifx) => {
-                self.discipline_expr(&ifx.cond, st, cx);
-                let mut then_st = st.clone();
-                self.discipline_stmts(&ifx.then_block, &mut then_st, cx);
-                let mut else_st = st.clone();
-                if let Some(eb) = &ifx.else_block {
-                    self.discipline_stmts(eb, &mut else_st, cx);
-                }
-                *st = then_st.union(else_st);
-            }
-            Expr::Match(m) => {
-                self.discipline_expr(&m.expr, st, cx);
-                let entry = st.clone();
-                let mut joined: Option<DiscState> = None;
-                for arm in &m.arms {
-                    let mut arm_st = entry.clone();
-                    self.discipline_stmts(&arm.body, &mut arm_st, cx);
-                    joined = Some(match joined {
-                        None => arm_st,
-                        Some(j) => j.union(arm_st),
-                    });
-                }
-                if let Some(j) = joined {
-                    *st = j;
-                }
-            }
-            Expr::UnsafeBlock(u) => {
-                self.discipline_stmts(&u.stmts, st, cx);
-                if let Some(r) = &u.ret {
-                    self.discipline_expr(r, st, cx);
-                }
-            }
-            Expr::ComptimeBlock(c) => {
-                self.discipline_stmts(&c.stmts, st, cx);
-                if let Some(r) = &c.ret {
-                    self.discipline_expr(r, st, cx);
-                }
-            }
-            Expr::SpawnOn(sp) => {
-                self.discipline_stmts(&sp.stmts, st, cx);
-                if let Some(r) = &sp.ret {
-                    self.discipline_expr(r, st, cx);
-                }
-            }
-            // Closures are refused outright by the scan (E6017), so their bodies are not
-            // part of the discipline.
-            Expr::Closure(_) => {}
+            Expr::FunctionCall(fc) => self.discipline_call(fc, st, cx),
+            Expr::If(ifx) => self.discipline_if(ifx, st, cx),
+            Expr::Match(m) => self.discipline_match(m, st, cx),
+            Expr::UnsafeBlock(u) => self.discipline_block(&u.stmts, u.ret.as_deref(), st, cx),
+            Expr::ComptimeBlock(c) => self.discipline_block(&c.stmts, c.ret.as_deref(), st, cx),
+            Expr::SpawnOn(sp) => self.discipline_block(&sp.stmts, sp.ret.as_deref(), st, cx),
             Expr::EnumVariant(ev) => {
-                for a in ev.payload.iter().flatten() {
-                    self.discipline_expr(a, st, cx);
-                }
+                self.discipline_exprs(ev.payload.as_deref().unwrap_or_default(), st, cx);
             }
             Expr::Transfer(tr) => self.discipline_expr(&tr.expr, st, cx),
             Expr::IndirectCall(ic) => {
                 self.discipline_expr(&ic.callee, st, cx);
-                for a in &ic.args {
-                    self.discipline_expr(a, st, cx);
-                }
+                self.discipline_exprs(&ic.args, st, cx);
             }
-            Expr::Array(a) => {
-                for el in &a.elements {
-                    self.discipline_expr(el, st, cx);
-                }
-            }
+            Expr::Array(a) => self.discipline_exprs(&a.elements, st, cx),
             Expr::MemberAccess(m) => self.discipline_expr(&m.base, st, cx),
-            Expr::IndexAccess(ix) => {
-                self.discipline_expr(&ix.base, st, cx);
-                self.discipline_expr(&ix.index, st, cx);
-            }
+            Expr::IndexAccess(ix) => self.discipline_pair(&ix.base, &ix.index, st, cx),
             Expr::MethodCall(mc) => {
                 self.discipline_expr(&mc.base, st, cx);
-                for a in &mc.args {
-                    self.discipline_expr(a, st, cx);
-                }
+                self.discipline_exprs(&mc.args, st, cx);
             }
-            Expr::BinaryOp(b) => {
-                self.discipline_expr(&b.lhs, st, cx);
-                self.discipline_expr(&b.rhs, st, cx);
-            }
-            Expr::RelationalOp(r) => {
-                self.discipline_expr(&r.lhs, st, cx);
-                self.discipline_expr(&r.rhs, st, cx);
-            }
-            Expr::LogicalOp(l) => {
-                self.discipline_expr(&l.lhs, st, cx);
-                self.discipline_expr(&l.rhs, st, cx);
-            }
+            Expr::BinaryOp(b) => self.discipline_pair(&b.lhs, &b.rhs, st, cx),
+            Expr::RelationalOp(r) => self.discipline_pair(&r.lhs, &r.rhs, st, cx),
+            Expr::LogicalOp(l) => self.discipline_pair(&l.lhs, &l.rhs, st, cx),
             Expr::UnaryOp(u) => self.discipline_expr(&u.expr, st, cx),
             Expr::Borrow(b) => self.discipline_expr(&b.expr, st, cx),
             Expr::Dereference(d) => self.discipline_expr(&d.expr, st, cx),
@@ -927,52 +947,25 @@ impl<'a> TypeChecker<'a> {
                     self.discipline_expr(fe, st, cx);
                 }
             }
-            Expr::Range(r) => {
-                self.discipline_expr(&r.start, st, cx);
-                self.discipline_expr(&r.end, st, cx);
-            }
-            Expr::Grad(g) => {
-                for a in &g.args {
-                    self.discipline_expr(a, st, cx);
-                }
-            }
+            Expr::Range(r) => self.discipline_pair(&r.start, &r.end, st, cx),
+            Expr::Grad(g) => self.discipline_exprs(&g.args, st, cx),
             Expr::Vjp(v) => {
-                for a in &v.args {
-                    self.discipline_expr(a, st, cx);
-                }
+                self.discipline_exprs(&v.args, st, cx);
                 self.discipline_expr(&v.cotangent, st, cx);
             }
             Expr::Jvp(j) => {
-                for a in &j.args {
-                    self.discipline_expr(a, st, cx);
-                }
+                self.discipline_exprs(&j.args, st, cx);
                 self.discipline_expr(&j.tangent, st, cx);
             }
-            Expr::VecMacro(v) => {
-                for el in &v.elements {
-                    self.discipline_expr(el, st, cx);
-                }
-            }
+            Expr::VecMacro(v) => self.discipline_exprs(&v.elements, st, cx),
             Expr::AsCast(c) => self.discipline_expr(&c.expr, st, cx),
-            Expr::Print(p) => {
-                for a in &p.args {
-                    self.discipline_expr(a, st, cx);
-                }
-            }
-            Expr::Println(p) => {
-                for a in &p.args {
-                    self.discipline_expr(a, st, cx);
-                }
-            }
-            Expr::InlineMlir(im) => {
-                for (_, ie, _) in &im.inputs {
-                    self.discipline_expr(ie, st, cx);
-                }
-                for cl in &im.clobbers {
-                    self.discipline_expr(cl, st, cx);
-                }
-            }
-            Expr::Identifier(_)
+            Expr::Print(p) => self.discipline_exprs(&p.args, st, cx),
+            Expr::Println(p) => self.discipline_exprs(&p.args, st, cx),
+            Expr::InlineMlir(im) => self.discipline_inline_mlir(im, st, cx),
+            // Closures are refused outright by the scan (E6017), so their bodies are not
+            // part of the discipline.
+            Expr::Closure(_)
+            | Expr::Identifier(_)
             | Expr::Number(_)
             | Expr::StringLiteral(_)
             | Expr::TransferPredicate(_)
@@ -980,6 +973,136 @@ impl<'a> TypeChecker<'a> {
             | Expr::Topology(_)
             | Expr::MacroCall(_)
             | Expr::SizeOf(_) => {}
+        }
+    }
+
+    /// Walk a call: its arguments first, then the call's own effect.
+    fn discipline_call(&mut self, fc: &FunctionCallExpr, st: &mut DiscState, cx: &mut WalkCx) {
+        self.discipline_exprs(&fc.args, st, cx);
+        self.apply_call_effect(fc, st);
+    }
+
+    /// Walk a list of expressions in order.
+    fn discipline_exprs(&mut self, exprs: &[Expr], st: &mut DiscState, cx: &mut WalkCx) {
+        for e in exprs {
+            self.discipline_expr(e, st, cx);
+        }
+    }
+
+    /// Walk two expressions, `first` and then `second`.
+    fn discipline_pair(
+        &mut self,
+        first: &Expr,
+        second: &Expr,
+        st: &mut DiscState,
+        cx: &mut WalkCx,
+    ) {
+        self.discipline_expr(first, st, cx);
+        self.discipline_expr(second, st, cx);
+    }
+
+    /// Walk the statements of a block, then the expression the block ends with, if any.
+    fn discipline_block(
+        &mut self,
+        stmts: &[Statement],
+        ret: Option<&Expr>,
+        st: &mut DiscState,
+        cx: &mut WalkCx,
+    ) {
+        self.discipline_stmts(stmts, st, cx);
+        if let Some(r) = ret {
+            self.discipline_expr(r, st, cx);
+        }
+    }
+
+    /// Walk an `if`: the condition, then both branches from the same starting state. A
+    /// copy that is outstanding after either branch is outstanding after the `if`.
+    fn discipline_if(&mut self, ifx: &IfExpr, st: &mut DiscState, cx: &mut WalkCx) {
+        self.discipline_expr(&ifx.cond, st, cx);
+        let mut then_st = st.clone();
+        self.discipline_stmts(&ifx.then_block, &mut then_st, cx);
+        let mut else_st = st.clone();
+        if let Some(eb) = &ifx.else_block {
+            self.discipline_stmts(eb, &mut else_st, cx);
+        }
+        *st = then_st.union(else_st);
+    }
+
+    /// Walk a `match`: the matched expression, then every arm from the same starting
+    /// state. A copy that is outstanding after any arm is outstanding after the `match`.
+    fn discipline_match(&mut self, m: &MatchExpr, st: &mut DiscState, cx: &mut WalkCx) {
+        self.discipline_expr(&m.expr, st, cx);
+        let entry = st.clone();
+        let mut joined: Option<DiscState> = None;
+        for arm in &m.arms {
+            let mut arm_st = entry.clone();
+            self.discipline_stmts(&arm.body, &mut arm_st, cx);
+            joined = Some(match joined {
+                None => arm_st,
+                Some(j) => j.union(arm_st),
+            });
+        }
+        if let Some(j) = joined {
+            *st = j;
+        }
+    }
+
+    /// Walk the inputs of an inline MLIR block, then its clobbers.
+    fn discipline_inline_mlir(&mut self, im: &InlineMlirExpr, st: &mut DiscState, cx: &mut WalkCx) {
+        for (_, ie, _) in &im.inputs {
+            self.discipline_expr(ie, st, cx);
+        }
+        for cl in &im.clobbers {
+            self.discipline_expr(cl, st, cx);
+        }
+    }
+
+    /// Report a `raw::load` or `raw::store` of `t` that runs while an `async_copy` that
+    /// uses `t` has not been waited for. Each call is reported at most once.
+    fn check_tile_not_in_flight(
+        &mut self,
+        fc: &FunctionCallExpr,
+        t: &crate::symbol::Symbol,
+        st: &DiscState,
+    ) {
+        let name = fc.name.as_ref();
+        if name == "raw::store"
+            && st.outstanding_src.contains_key(t)
+            && st
+                .reported
+                .borrow_mut()
+                .insert((fc.span.line, fc.span.column))
+        {
+            self.errors.error_with_code(
+                DiagnosticCode::E6021,
+                format!(
+                    "`{t}` is written while it is the source of an in-flight \
+                     `raw::async_copy`; the engine is still reading it, so \
+                     `raw::async_wait()` must come first"
+                ),
+                Some(SourceSpan::from_ast_span(&fc.span)),
+            );
+        }
+        if st.outstanding.contains_key(t)
+            && st
+                .reported
+                .borrow_mut()
+                .insert((fc.span.line, fc.span.column))
+        {
+            let verb = if name == "raw::load" {
+                "read"
+            } else {
+                "written"
+            };
+            self.errors.error_with_code(
+                DiagnosticCode::E6021,
+                format!(
+                    "`{t}` is {verb} while a `raw::async_copy` into it is \
+                     still outstanding; `raw::async_wait()` must come first \
+                     (its contents are unspecified until the wait)"
+                ),
+                Some(SourceSpan::from_ast_span(&fc.span)),
+            );
         }
     }
 
@@ -1007,44 +1130,7 @@ impl<'a> TypeChecker<'a> {
             }
             "raw::load" | "raw::store" => {
                 if let Some(t) = tile_name(0) {
-                    if name == "raw::store"
-                        && st.outstanding_src.contains_key(&t)
-                        && st
-                            .reported
-                            .borrow_mut()
-                            .insert((fc.span.line, fc.span.column))
-                    {
-                        self.errors.error_with_code(
-                            DiagnosticCode::E6021,
-                            format!(
-                                "`{t}` is written while it is the source of an in-flight \
-                                 `raw::async_copy`; the engine is still reading it, so \
-                                 `raw::async_wait()` must come first"
-                            ),
-                            Some(SourceSpan::from_ast_span(&fc.span)),
-                        );
-                    }
-                    if st.outstanding.contains_key(&t)
-                        && st
-                            .reported
-                            .borrow_mut()
-                            .insert((fc.span.line, fc.span.column))
-                    {
-                        let verb = if name == "raw::load" {
-                            "read"
-                        } else {
-                            "written"
-                        };
-                        self.errors.error_with_code(
-                            DiagnosticCode::E6021,
-                            format!(
-                                "`{t}` is {verb} while a `raw::async_copy` into it is \
-                                 still outstanding; `raw::async_wait()` must come first \
-                                 (its contents are unspecified until the wait)"
-                            ),
-                            Some(SourceSpan::from_ast_span(&fc.span)),
-                        );
-                    }
+                    self.check_tile_not_in_flight(fc, &t, st);
                 }
             }
             _ => {}
@@ -1109,7 +1195,7 @@ struct RawScan {
     /// Every `raw::barrier` call, identified by node address so the top-level check can
     /// tell the body's own statements from occurrences nested anywhere deeper.
     barriers: Vec<(*const Expr, crate::syntax::Span)>,
-    /// Does the body write at all (store or async_copy)? A read-only body publishes
+    /// Does the body write at all (store or `async_copy`)? A read-only body publishes
     /// nothing and needs no trailing barrier.
     publishes: bool,
     /// Every `return` statement, by node address and span. The whole-body pass allows
@@ -1129,7 +1215,8 @@ fn scan_stmts(stmts: &[Statement], in_closure: bool, out: &mut RawScan) {
         match s {
             Statement::LetDecl(l) => scan_expr(&l.expr, in_closure, out),
             Statement::Return(r) => {
-                out.returns.push((s as *const Statement, r.span));
+                out.returns
+                    .push((std::ptr::from_ref::<Statement>(s), r.span));
                 if let Some(e) = &r.expr {
                     scan_expr(e, in_closure, out);
                 }
@@ -1157,10 +1244,78 @@ fn scan_stmts(stmts: &[Statement], in_closure: bool, out: &mut RawScan) {
                 }
                 scan_stmts(&lp.body, in_closure, out);
             }
-            Statement::Break(_) | Statement::Continue(_) | Statement::Drop(_) => {}
-            Statement::MacroCall(_) => {}
-            Statement::Error(_) => {}
+            Statement::Break(_)
+            | Statement::Continue(_)
+            | Statement::Drop(_)
+            | Statement::MacroCall(_)
+            | Statement::Error(_) => {}
         }
+    }
+}
+
+/// Scan every expression of a list, in order.
+fn scan_exprs(exprs: &[Expr], in_closure: bool, out: &mut RawScan) {
+    for e in exprs {
+        scan_expr(e, in_closure, out);
+    }
+}
+
+/// Scan two expressions, `first` and then `second`.
+fn scan_pair(first: &Expr, second: &Expr, in_closure: bool, out: &mut RawScan) {
+    scan_expr(first, in_closure, out);
+    scan_expr(second, in_closure, out);
+}
+
+/// Scan the statements of a block, then the expression the block ends with, if any.
+fn scan_block(stmts: &[Statement], ret: Option<&Expr>, in_closure: bool, out: &mut RawScan) {
+    scan_stmts(stmts, in_closure, out);
+    if let Some(r) = ret {
+        scan_expr(r, in_closure, out);
+    }
+}
+
+/// Scan a function call. `e` is the call expression itself, the node that holds `fc`.
+/// A call to a `raw::` primitive is recorded before its arguments are scanned.
+fn scan_call(e: &Expr, fc: &FunctionCallExpr, in_closure: bool, out: &mut RawScan) {
+    let name = fc.name.as_ref();
+    if let Some(prim) = name.strip_prefix("raw::") {
+        out.calls.push((fc.name.clone(), fc.span, in_closure));
+        if prim == "barrier" {
+            out.barriers.push((std::ptr::from_ref::<Expr>(e), fc.span));
+        }
+        if prim == "store" || prim == "async_copy" {
+            out.publishes = true;
+        }
+    }
+    for a in &fc.args {
+        scan_expr(a, in_closure, out);
+    }
+}
+
+/// Scan an `if`: the condition, then both branches.
+fn scan_if(ifx: &IfExpr, in_closure: bool, out: &mut RawScan) {
+    scan_expr(&ifx.cond, in_closure, out);
+    scan_stmts(&ifx.then_block, in_closure, out);
+    if let Some(eb) = &ifx.else_block {
+        scan_stmts(eb, in_closure, out);
+    }
+}
+
+/// Scan a `match`: the matched expression, then every arm.
+fn scan_match(m: &MatchExpr, in_closure: bool, out: &mut RawScan) {
+    scan_expr(&m.expr, in_closure, out);
+    for arm in &m.arms {
+        scan_stmts(&arm.body, in_closure, out);
+    }
+}
+
+/// Scan the inputs of an inline MLIR block, then its clobbers.
+fn scan_inline_mlir(im: &InlineMlirExpr, in_closure: bool, out: &mut RawScan) {
+    for (_, ie, _) in &im.inputs {
+        scan_expr(ie, in_closure, out);
+    }
+    for cl in &im.clobbers {
+        scan_expr(cl, in_closure, out);
     }
 }
 
@@ -1168,93 +1323,31 @@ fn scan_stmts(stmts: &[Statement], in_closure: bool, out: &mut RawScan) {
 /// new syntax node cannot silently hide a `raw::` call from the whole-body checks.
 fn scan_expr(e: &Expr, in_closure: bool, out: &mut RawScan) {
     match e {
-        Expr::FunctionCall(fc) => {
-            let name = fc.name.as_ref();
-            if let Some(prim) = name.strip_prefix("raw::") {
-                out.calls.push((fc.name.clone(), fc.span, in_closure));
-                if prim == "barrier" {
-                    out.barriers.push((e as *const Expr, fc.span));
-                }
-                if prim == "store" || prim == "async_copy" {
-                    out.publishes = true;
-                }
-            }
-            for a in &fc.args {
-                scan_expr(a, in_closure, out);
-            }
-        }
-        Expr::If(ifx) => {
-            scan_expr(&ifx.cond, in_closure, out);
-            scan_stmts(&ifx.then_block, in_closure, out);
-            if let Some(eb) = &ifx.else_block {
-                scan_stmts(eb, in_closure, out);
-            }
-        }
-        Expr::Match(m) => {
-            scan_expr(&m.expr, in_closure, out);
-            for arm in &m.arms {
-                scan_stmts(&arm.body, in_closure, out);
-            }
-        }
-        Expr::UnsafeBlock(u) => {
-            scan_stmts(&u.stmts, in_closure, out);
-            if let Some(r) = &u.ret {
-                scan_expr(r, in_closure, out);
-            }
-        }
-        Expr::ComptimeBlock(c) => {
-            scan_stmts(&c.stmts, in_closure, out);
-            if let Some(r) = &c.ret {
-                scan_expr(r, in_closure, out);
-            }
-        }
-        Expr::SpawnOn(sp) => {
-            scan_stmts(&sp.stmts, in_closure, out);
-            if let Some(r) = &sp.ret {
-                scan_expr(r, in_closure, out);
-            }
-        }
+        Expr::FunctionCall(fc) => scan_call(e, fc, in_closure, out),
+        Expr::If(ifx) => scan_if(ifx, in_closure, out),
+        Expr::Match(m) => scan_match(m, in_closure, out),
+        Expr::UnsafeBlock(u) => scan_block(&u.stmts, u.ret.as_deref(), in_closure, out),
+        Expr::ComptimeBlock(c) => scan_block(&c.stmts, c.ret.as_deref(), in_closure, out),
+        Expr::SpawnOn(sp) => scan_block(&sp.stmts, sp.ret.as_deref(), in_closure, out),
         Expr::Closure(cl) => scan_expr(&cl.body, true, out),
         Expr::EnumVariant(ev) => {
-            for a in ev.payload.iter().flatten() {
-                scan_expr(a, in_closure, out);
-            }
+            scan_exprs(ev.payload.as_deref().unwrap_or_default(), in_closure, out);
         }
         Expr::Transfer(tr) => scan_expr(&tr.expr, in_closure, out),
         Expr::IndirectCall(ic) => {
             scan_expr(&ic.callee, in_closure, out);
-            for a in &ic.args {
-                scan_expr(a, in_closure, out);
-            }
+            scan_exprs(&ic.args, in_closure, out);
         }
-        Expr::Array(a) => {
-            for el in &a.elements {
-                scan_expr(el, in_closure, out);
-            }
-        }
+        Expr::Array(a) => scan_exprs(&a.elements, in_closure, out),
         Expr::MemberAccess(m) => scan_expr(&m.base, in_closure, out),
-        Expr::IndexAccess(ix) => {
-            scan_expr(&ix.base, in_closure, out);
-            scan_expr(&ix.index, in_closure, out);
-        }
+        Expr::IndexAccess(ix) => scan_pair(&ix.base, &ix.index, in_closure, out),
         Expr::MethodCall(mc) => {
             scan_expr(&mc.base, in_closure, out);
-            for a in &mc.args {
-                scan_expr(a, in_closure, out);
-            }
+            scan_exprs(&mc.args, in_closure, out);
         }
-        Expr::BinaryOp(b) => {
-            scan_expr(&b.lhs, in_closure, out);
-            scan_expr(&b.rhs, in_closure, out);
-        }
-        Expr::RelationalOp(r) => {
-            scan_expr(&r.lhs, in_closure, out);
-            scan_expr(&r.rhs, in_closure, out);
-        }
-        Expr::LogicalOp(l) => {
-            scan_expr(&l.lhs, in_closure, out);
-            scan_expr(&l.rhs, in_closure, out);
-        }
+        Expr::BinaryOp(b) => scan_pair(&b.lhs, &b.rhs, in_closure, out),
+        Expr::RelationalOp(r) => scan_pair(&r.lhs, &r.rhs, in_closure, out),
+        Expr::LogicalOp(l) => scan_pair(&l.lhs, &l.rhs, in_closure, out),
         Expr::UnaryOp(u) => scan_expr(&u.expr, in_closure, out),
         Expr::Borrow(b) => scan_expr(&b.expr, in_closure, out),
         Expr::Dereference(d) => scan_expr(&d.expr, in_closure, out),
@@ -1263,51 +1356,21 @@ fn scan_expr(e: &Expr, in_closure: bool, out: &mut RawScan) {
                 scan_expr(fe, in_closure, out);
             }
         }
-        Expr::Range(r) => {
-            scan_expr(&r.start, in_closure, out);
-            scan_expr(&r.end, in_closure, out);
-        }
-        Expr::Grad(g) => {
-            for a in &g.args {
-                scan_expr(a, in_closure, out);
-            }
-        }
+        Expr::Range(r) => scan_pair(&r.start, &r.end, in_closure, out),
+        Expr::Grad(g) => scan_exprs(&g.args, in_closure, out),
         Expr::Vjp(v) => {
-            for a in &v.args {
-                scan_expr(a, in_closure, out);
-            }
+            scan_exprs(&v.args, in_closure, out);
             scan_expr(&v.cotangent, in_closure, out);
         }
         Expr::Jvp(j) => {
-            for a in &j.args {
-                scan_expr(a, in_closure, out);
-            }
+            scan_exprs(&j.args, in_closure, out);
             scan_expr(&j.tangent, in_closure, out);
         }
-        Expr::VecMacro(v) => {
-            for el in &v.elements {
-                scan_expr(el, in_closure, out);
-            }
-        }
+        Expr::VecMacro(v) => scan_exprs(&v.elements, in_closure, out),
         Expr::AsCast(c) => scan_expr(&c.expr, in_closure, out),
-        Expr::Print(p) => {
-            for a in &p.args {
-                scan_expr(a, in_closure, out);
-            }
-        }
-        Expr::Println(p) => {
-            for a in &p.args {
-                scan_expr(a, in_closure, out);
-            }
-        }
-        Expr::InlineMlir(im) => {
-            for (_, ie, _) in &im.inputs {
-                scan_expr(ie, in_closure, out);
-            }
-            for cl in &im.clobbers {
-                scan_expr(cl, in_closure, out);
-            }
-        }
+        Expr::Print(p) => scan_exprs(&p.args, in_closure, out),
+        Expr::Println(p) => scan_exprs(&p.args, in_closure, out),
+        Expr::InlineMlir(im) => scan_inline_mlir(im, in_closure, out),
         Expr::Identifier(_)
         | Expr::Number(_)
         | Expr::StringLiteral(_)
@@ -1319,7 +1382,7 @@ fn scan_expr(e: &Expr, in_closure: bool, out: &mut RawScan) {
     }
 }
 
-impl<'a> TypeChecker<'a> {
+impl TypeChecker<'_> {
     /// Overwrite every recorded prover fact that mentions `name` with `0 == 0`.
     /// Called when `name` is rebound (a shadowing `let`, a loop induction variable):
     /// facts are keyed by bare symbol name, so a fact about the OUTER binding would
@@ -1327,7 +1390,7 @@ impl<'a> TypeChecker<'a> {
     /// as a forged out-of-bounds proof. Overwritten in place rather than removed so
     /// the scope-exit truncation (`constraints.truncate(prev_len)`) keeps its meaning.
     pub(crate) fn neutralize_facts_mentioning(&mut self, name: &str) {
-        for c in self.consteval.constraints.iter_mut() {
+        for c in &mut self.consteval.constraints {
             if expr_mentions(c, name) {
                 *c = Expr::RelationalOp(RelationalOpExpr {
                     lhs: Box::new(Expr::Number(NumberExpr {
@@ -1373,18 +1436,22 @@ pub(crate) fn expr_mentions(e: &Expr, name: &str) -> bool {
     }
 }
 
-/// Can the prover's QF_LIA lowering express this fact? Range facts with a bound the
+/// Can the prover's `QF_LIA` lowering express this fact? Range facts with a bound the
 /// prover cannot lower (a function call, a method call) must not be recorded: every
 /// later `prove_expr` in the function would warn about the unlowerable constraint --
 /// reviewed as new warnings on previously-clean programs.
 pub(crate) fn prover_expressible(e: &Expr) -> bool {
     match e {
-        Expr::Number(_) | Expr::Identifier(_) | Expr::EnumVariant(_) | Expr::Topology(_) => true,
+        Expr::Number(_)
+        | Expr::Identifier(_)
+        | Expr::EnumVariant(_)
+        | Expr::Topology(_)
+        | Expr::MemberAccess(_)
+        | Expr::IndexAccess(_) => true,
         Expr::BinaryOp(b) => prover_expressible(&b.lhs) && prover_expressible(&b.rhs),
         Expr::RelationalOp(r) => prover_expressible(&r.lhs) && prover_expressible(&r.rhs),
         Expr::LogicalOp(l) => prover_expressible(&l.lhs) && prover_expressible(&l.rhs),
         Expr::UnaryOp(u) => prover_expressible(&u.expr),
-        Expr::MemberAccess(_) | Expr::IndexAccess(_) => true,
         _ => false,
     }
 }
@@ -1432,110 +1499,119 @@ fn stmt_span(s: &Statement) -> crate::syntax::Span {
 /// induction variable must not keep its range facts, because the checker does not
 /// version mutated symbols.
 pub(crate) fn body_reassigns(body: &[Statement], name: &str) -> bool {
-    fn base_is(e: &Expr, name: &str) -> bool {
-        match e {
-            Expr::Identifier(id) => id.name.as_ref() == name,
-            Expr::IndexAccess(ix) => base_is(&ix.base, name),
-            Expr::MemberAccess(m) => base_is(&m.base, name),
-            Expr::Dereference(d) => base_is(&d.expr, name),
-            _ => false,
+    stmts_reassign(body, name)
+}
+
+/// Is `e` the variable `name`, or an index, member or dereference of it?
+fn assign_base_is(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Identifier(id) => id.name.as_ref() == name,
+        Expr::IndexAccess(ix) => assign_base_is(&ix.base, name),
+        Expr::MemberAccess(m) => assign_base_is(&m.base, name),
+        Expr::Dereference(d) => assign_base_is(&d.expr, name),
+        _ => false,
+    }
+}
+
+/// Does any of these statements, or a block nested in them, assign to `name`?
+// Assignments are statements, so a statement-level walk sees them all; expressions
+// are entered only where they can carry statement blocks.
+fn stmts_reassign(stmts: &[Statement], name: &str) -> bool {
+    for s in stmts {
+        match s {
+            Statement::Assign(a) if assign_base_is(&a.lhs, name) => return true,
+            Statement::CompoundAssign(c) if assign_base_is(&c.lhs, name) => return true,
+            Statement::ForLoop(fl) => {
+                if stmts_reassign(&fl.body, name) {
+                    return true;
+                }
+            }
+            Statement::Loop(lp) => {
+                if stmts_reassign(&lp.body, name) {
+                    return true;
+                }
+            }
+            Statement::LetDecl(l) => {
+                if expr_blocks_reassign(&l.expr, name) {
+                    return true;
+                }
+            }
+            Statement::ExprStmt(e) => {
+                if expr_blocks_reassign(&e.expr, name) {
+                    return true;
+                }
+            }
+            Statement::Return(r) => {
+                if r.expr
+                    .as_ref()
+                    .is_some_and(|e| expr_blocks_reassign(e, name))
+                {
+                    return true;
+                }
+            }
+            Statement::Assign(a) => {
+                if expr_blocks_reassign(&a.rhs, name) {
+                    return true;
+                }
+            }
+            Statement::CompoundAssign(c) => {
+                if expr_blocks_reassign(&c.rhs, name) {
+                    return true;
+                }
+            }
+            Statement::Assert(a) => {
+                if expr_blocks_reassign(&a.expr, name) {
+                    return true;
+                }
+            }
+            Statement::Break(_) | Statement::Continue(_) | Statement::Drop(_) => {}
+            // A macro call cannot be seen inside, so the answer is the conservative one.
+            Statement::MacroCall(_) | Statement::Error(_) => return true,
         }
     }
-    // Assignments are statements, so a statement-level walk sees them all; expressions
-    // are entered only where they can carry statement blocks.
-    fn walk(stmts: &[Statement], name: &str) -> bool {
-        for s in stmts {
-            match s {
-                Statement::Assign(a) if base_is(&a.lhs, name) => return true,
-                Statement::CompoundAssign(c) if base_is(&c.lhs, name) => return true,
-                Statement::ForLoop(fl) => {
-                    if walk(&fl.body, name) {
-                        return true;
-                    }
-                }
-                Statement::Loop(lp) => {
-                    if walk(&lp.body, name) {
-                        return true;
-                    }
-                }
-                Statement::LetDecl(l) => {
-                    if expr_blocks_reassign(&l.expr, name) {
-                        return true;
-                    }
-                }
-                Statement::ExprStmt(e) => {
-                    if expr_blocks_reassign(&e.expr, name) {
-                        return true;
-                    }
-                }
-                Statement::Return(r) => {
-                    if r.expr
-                        .as_ref()
-                        .is_some_and(|e| expr_blocks_reassign(e, name))
-                    {
-                        return true;
-                    }
-                }
-                Statement::Assign(a) => {
-                    if expr_blocks_reassign(&a.rhs, name) {
-                        return true;
-                    }
-                }
-                Statement::CompoundAssign(c) => {
-                    if expr_blocks_reassign(&c.rhs, name) {
-                        return true;
-                    }
-                }
-                Statement::Assert(a) => {
-                    if expr_blocks_reassign(&a.expr, name) {
-                        return true;
-                    }
-                }
-                Statement::Break(_) | Statement::Continue(_) | Statement::Drop(_) => {}
-                Statement::MacroCall(_) => return true, // Cannot see inside: conservative.
-                Statement::Error(_) => return true,
-            }
+    false
+}
+
+/// Does a statement block inside the expression `e` assign to `name`?
+fn expr_blocks_reassign(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::If(ifx) => {
+            stmts_reassign(&ifx.then_block, name)
+                || ifx
+                    .else_block
+                    .as_ref()
+                    .is_some_and(|eb| stmts_reassign(eb, name))
+                || expr_blocks_reassign(&ifx.cond, name)
         }
-        false
-    }
-    fn expr_blocks_reassign(e: &Expr, name: &str) -> bool {
-        match e {
-            Expr::If(ifx) => {
-                walk(&ifx.then_block, name)
-                    || ifx.else_block.as_ref().is_some_and(|eb| walk(eb, name))
-                    || expr_blocks_reassign(&ifx.cond, name)
-            }
-            Expr::Match(m) => {
-                m.arms.iter().any(|arm| walk(&arm.body, name))
-                    || expr_blocks_reassign(&m.expr, name)
-            }
-            Expr::UnsafeBlock(u) => {
-                walk(&u.stmts, name)
-                    || u.ret
-                        .as_ref()
-                        .is_some_and(|r| expr_blocks_reassign(r, name))
-            }
-            Expr::ComptimeBlock(c) => {
-                walk(&c.stmts, name)
-                    || c.ret
-                        .as_ref()
-                        .is_some_and(|r| expr_blocks_reassign(r, name))
-            }
-            Expr::SpawnOn(sp) => {
-                walk(&sp.stmts, name)
-                    || sp
-                        .ret
-                        .as_ref()
-                        .is_some_and(|r| expr_blocks_reassign(r, name))
-            }
-            Expr::Closure(cl) => expr_blocks_reassign(&cl.body, name),
-            // Leaf and operator shapes cannot contain a statement block on any path the
-            // parser produces; if one grows a block later, the exhaustive scan_expr above
-            // is the walker that must learn it first.
-            _ => false,
+        Expr::Match(m) => {
+            m.arms.iter().any(|arm| stmts_reassign(&arm.body, name))
+                || expr_blocks_reassign(&m.expr, name)
         }
+        Expr::UnsafeBlock(u) => {
+            stmts_reassign(&u.stmts, name)
+                || u.ret
+                    .as_ref()
+                    .is_some_and(|r| expr_blocks_reassign(r, name))
+        }
+        Expr::ComptimeBlock(c) => {
+            stmts_reassign(&c.stmts, name)
+                || c.ret
+                    .as_ref()
+                    .is_some_and(|r| expr_blocks_reassign(r, name))
+        }
+        Expr::SpawnOn(sp) => {
+            stmts_reassign(&sp.stmts, name)
+                || sp
+                    .ret
+                    .as_ref()
+                    .is_some_and(|r| expr_blocks_reassign(r, name))
+        }
+        Expr::Closure(cl) => expr_blocks_reassign(&cl.body, name),
+        // Leaf and operator shapes cannot contain a statement block on any path the
+        // parser produces; if one grows a block later, the exhaustive scan_expr above
+        // is the walker that must learn it first.
+        _ => false,
     }
-    walk(body, name)
 }
 
 /// Bytes read and written per space, while a lowering body is being counted.
@@ -1556,7 +1632,32 @@ pub(crate) fn overflowed() -> String {
     "the byte count overflows a 64-bit counter".to_string()
 }
 
+/// What stays fixed while one lowering body is being counted, except `mult`, which
+/// changes inside each loop.
+#[derive(Clone, Copy)]
+struct TrafficCx<'a> {
+    /// How many times the code being counted runs: the product of the trip counts of
+    /// the loops around it.
+    mult: u64,
+    /// The size of one tile element, in bytes.
+    elem: u64,
+    /// The name of the lowering's source tile.
+    src: &'a crate::symbol::Symbol,
+    /// The name of the lowering's destination tile.
+    dst: &'a crate::symbol::Symbol,
+    /// The element counts of the source and the destination tile.
+    exts: (u64, u64),
+    /// Set to `false` when the count is a maximum over branches rather than an exact
+    /// figure. Every branch writes the same flag, so it is shared, not copied.
+    exact: &'a std::cell::Cell<bool>,
+}
+
 impl TrafficAcc {
+    /// Add `bytes` read from the destination space (`to_dst`) or the source space.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason from [`overflowed`] when the total does not fit in a `u64`.
     fn add_read(&mut self, to_dst: bool, bytes: u64) -> Result<(), String> {
         let slot = if to_dst {
             &mut self.to_read
@@ -1567,6 +1668,11 @@ impl TrafficAcc {
         Ok(())
     }
 
+    /// Add `bytes` written to the destination space (`to_dst`) or the source space.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason from [`overflowed`] when the total does not fit in a `u64`.
     fn add_written(&mut self, to_dst: bool, bytes: u64) -> Result<(), String> {
         let slot = if to_dst {
             &mut self.to_written
@@ -1590,7 +1696,7 @@ impl TrafficAcc {
     }
 }
 
-impl<'a> TypeChecker<'a> {
+impl TypeChecker<'_> {
     /// Count the bytes a user `impl transfer` body moves, per space (#353).
     ///
     /// This is where "cost is derived, not declared" cashes out: the figures come from the
@@ -1603,6 +1709,17 @@ impl<'a> TypeChecker<'a> {
     /// counted exactly: a loop whose trip count is not static, an unbounded `loop`, a
     /// `break`/`continue` that makes trip counts a fiction. The reason travels into the
     /// record, because "uncountable" and "zero" must not look alike to a consumer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the body cannot be counted exactly: a tile without a static
+    /// extent, a loop without a static trip count, `loop`, `break` or `continue`, a
+    /// `raw::` call on a tile that is not the source or destination, a `raw::` call in a
+    /// place the counter does not handle, or a count that overflows a `u64`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "callers are in other files; check/transfer.rs passes each value separately"
+    )]
     pub(crate) fn derive_lowering_traffic(
         &self,
         body: &[Statement],
@@ -1634,10 +1751,17 @@ impl<'a> TypeChecker<'a> {
             })?,
         );
         let mut acc = TrafficAcc::default();
-        let mut exact = true;
-        self.traffic_stmts(
-            body, 1, &mut acc, &mut exact, elem_bytes, src_name, dst_name, exts,
-        )?;
+        let exact = std::cell::Cell::new(true);
+        let cx = TrafficCx {
+            mult: 1,
+            elem: elem_bytes,
+            src: src_name,
+            dst: dst_name,
+            exts,
+            exact: &exact,
+        };
+        self.traffic_stmts(body, &mut acc, &cx)?;
+        let exact = exact.get();
         Ok(crate::report::Traffic {
             per_space: vec![
                 crate::report::SpaceTraffic {
@@ -1656,54 +1780,54 @@ impl<'a> TypeChecker<'a> {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Add the bytes these statements move to `acc`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the statements cannot be counted exactly, as described on
+    /// `derive_lowering_traffic`.
     fn traffic_stmts(
         &self,
         stmts: &[Statement],
-        mult: u64,
         acc: &mut TrafficAcc,
-        exact: &mut bool,
-        elem: u64,
-        src: &crate::symbol::Symbol,
-        dst: &crate::symbol::Symbol,
-        exts: (u64, u64),
+        cx: &TrafficCx<'_>,
     ) -> Result<(), String> {
         for s in stmts {
             match s {
                 Statement::LetDecl(l) => {
-                    self.traffic_expr(&l.expr, mult, acc, exact, elem, src, dst, exts)?
+                    self.traffic_expr(&l.expr, acc, cx)?;
                 }
                 Statement::Return(r) => {
                     if let Some(e) = &r.expr {
-                        self.traffic_expr(e, mult, acc, exact, elem, src, dst, exts)?
+                        self.traffic_expr(e, acc, cx)?;
                     }
                 }
                 Statement::ExprStmt(e) => {
-                    self.traffic_expr(&e.expr, mult, acc, exact, elem, src, dst, exts)?
+                    self.traffic_expr(&e.expr, acc, cx)?;
                 }
                 Statement::Assign(a) => {
-                    self.traffic_expr(&a.rhs, mult, acc, exact, elem, src, dst, exts)?;
-                    self.traffic_expr(&a.lhs, mult, acc, exact, elem, src, dst, exts)?;
+                    self.traffic_expr(&a.rhs, acc, cx)?;
+                    self.traffic_expr(&a.lhs, acc, cx)?;
                 }
                 Statement::CompoundAssign(c) => {
-                    self.traffic_expr(&c.rhs, mult, acc, exact, elem, src, dst, exts)?;
-                    self.traffic_expr(&c.lhs, mult, acc, exact, elem, src, dst, exts)?;
+                    self.traffic_expr(&c.rhs, acc, cx)?;
+                    self.traffic_expr(&c.lhs, acc, cx)?;
                 }
                 Statement::Assert(a) => {
-                    self.traffic_expr(&a.expr, mult, acc, exact, elem, src, dst, exts)?
+                    self.traffic_expr(&a.expr, acc, cx)?;
                 }
                 Statement::ForLoop(fl) => {
                     let trips = self
-                        .static_trip_count(&fl.iterable, src, dst, exts)
+                        .static_trip_count(&fl.iterable, cx.src, cx.dst, cx.exts)
                         .ok_or_else(|| {
                             "a loop bound is not statically known, so the number of times its \
                          body runs cannot be counted"
                                 .to_string()
                         })?;
-                    let next = mult.checked_mul(trips).ok_or_else(|| {
+                    let next = cx.mult.checked_mul(trips).ok_or_else(|| {
                         "the loop nest's trip count overflows a 64-bit counter".to_string()
                     })?;
-                    self.traffic_stmts(&fl.body, next, acc, exact, elem, src, dst, exts)?;
+                    self.traffic_stmts(&fl.body, acc, &TrafficCx { mult: next, ..*cx })?;
                 }
                 Statement::Loop(_) => {
                     return Err("an unbounded `loop` runs an unknown number of times".to_string())
@@ -1719,197 +1843,35 @@ impl<'a> TypeChecker<'a> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Add the bytes this expression moves to `acc`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the expression cannot be counted exactly, as described on
+    /// `derive_lowering_traffic`.
     fn traffic_expr(
         &self,
         e: &Expr,
-        mult: u64,
         acc: &mut TrafficAcc,
-        exact: &mut bool,
-        elem: u64,
-        src: &crate::symbol::Symbol,
-        dst: &crate::symbol::Symbol,
-        exts: (u64, u64),
+        cx: &TrafficCx<'_>,
     ) -> Result<(), String> {
         match e {
-            Expr::FunctionCall(fc) => {
-                // Arguments first: `raw::store(dst, i, raw::load(src, i))` is a write and a
-                // read, and the read is nested in the write's arguments.
-                for a in &fc.args {
-                    self.traffic_expr(a, mult, acc, exact, elem, src, dst, exts)?;
-                }
-                let tile = |i: usize| -> Option<&crate::symbol::Symbol> {
-                    match fc.args.get(i) {
-                        Some(Expr::Identifier(id)) => Some(&id.name),
-                        _ => None,
-                    }
-                };
-                let bytes = elem.checked_mul(mult).ok_or_else(overflowed)?;
-                // Which side of the edge a tile name denotes: `false` = source space,
-                // `true` = destination.
-                let side = |t: Option<&crate::symbol::Symbol>| -> Option<bool> {
-                    match t {
-                        Some(t) if t == src => Some(false),
-                        Some(t) if t == dst => Some(true),
-                        _ => None,
-                    }
-                };
-                match fc.name.as_ref() {
-                    "raw::load" => match side(tile(0)) {
-                        Some(to_dst) => acc.add_read(to_dst, bytes)?,
-                        None => {
-                            return Err("a `raw::load` names a tile that is not this \
-                                         lowering's source or destination"
-                                .to_string())
-                        }
-                    },
-                    "raw::store" => match side(tile(0)) {
-                        Some(to_dst) => acc.add_written(to_dst, bytes)?,
-                        None => {
-                            return Err("a `raw::store` names a tile that is not this \
-                                         lowering's source or destination"
-                                .to_string())
-                        }
-                    },
-                    // One chunk out of the source and into the destination. The chunk is
-                    // one element while the copy engine is unimplemented and `async_copy`
-                    // lowers to a load and a store; when the real engine lands, its chunk
-                    // size joins the machine file beside `copy_engine` and multiplies here.
-                    "raw::async_copy" => {
-                        match side(tile(1)) {
-                            Some(to_dst) => acc.add_read(to_dst, bytes)?,
-                            None => {
-                                return Err("a `raw::async_copy` reads a tile that is not \
-                                            this lowering's source or destination"
-                                    .to_string())
-                            }
-                        }
-                        match side(tile(0)) {
-                            Some(to_dst) => acc.add_written(to_dst, bytes)?,
-                            None => {
-                                return Err("a `raw::async_copy` writes a tile that is not \
-                                            this lowering's source or destination"
-                                    .to_string())
-                            }
-                        }
-                    }
-                    // extent/lane/lanes/barrier/async_wait move nothing, and an ordinary
-                    // call cannot appear here -- the primitives are the whole vocabulary a
-                    // lowering body has for touching memory.
-                    _ => {}
-                }
-                Ok(())
-            }
-            Expr::If(ifx) => {
-                self.traffic_expr(&ifx.cond, mult, acc, exact, elem, src, dst, exts)?;
-                // `if comptime` decides at compile time, so only one arm exists in the
-                // emitted code and the traffic is exactly known. Weighing it as a runtime
-                // branch reported the maximum of two arms -- twice the truth on a body
-                // whose answer is not in doubt -- and flagged inexact a figure the
-                // compiler had already resolved.
-                if ifx.is_comptime {
-                    if let Some(crate::hir::env::Value::Bool(taken)) =
-                        self.eval_expr(&ifx.cond, &std::collections::HashMap::new())
-                    {
-                        let block = if taken {
-                            Some(&ifx.then_block)
-                        } else {
-                            ifx.else_block.as_ref()
-                        };
-                        if let Some(b) = block {
-                            self.traffic_stmts(b, mult, acc, exact, elem, src, dst, exts)?;
-                        }
-                        return Ok(());
-                    }
-                }
-                let mut then_acc = acc.clone();
-                self.traffic_stmts(
-                    &ifx.then_block,
-                    mult,
-                    &mut then_acc,
-                    exact,
-                    elem,
-                    src,
-                    dst,
-                    exts,
-                )?;
-                let mut else_acc = acc.clone();
-                if let Some(eb) = &ifx.else_block {
-                    self.traffic_stmts(eb, mult, &mut else_acc, exact, elem, src, dst, exts)?;
-                }
-                if then_acc != else_acc {
-                    *exact = false;
-                }
-                *acc = then_acc.max_with(&else_acc);
-                Ok(())
-            }
-            Expr::Match(m) => {
-                self.traffic_expr(&m.expr, mult, acc, exact, elem, src, dst, exts)?;
-                let entry = acc.clone();
-                let mut outcomes: Vec<TrafficAcc> = Vec::new();
-                for arm in &m.arms {
-                    let mut arm_acc = entry.clone();
-                    self.traffic_stmts(&arm.body, mult, &mut arm_acc, exact, elem, src, dst, exts)?;
-                    outcomes.push(arm_acc);
-                }
-                // Inexact only when the arms DISAGREE, matching `if`. Flagging on "some arm
-                // moved something" made a match whose arms move identical bytes report
-                // inexact while the same program written as an `if` reported exact -- a
-                // difference in the record with no difference in the code.
-                if outcomes.windows(2).any(|w| w[0] != w[1]) {
-                    *exact = false;
-                }
-                let mut worst = entry;
-                for o in &outcomes {
-                    worst = worst.max_with(o);
-                }
-                *acc = worst;
-                Ok(())
-            }
+            Expr::FunctionCall(fc) => self.traffic_call(fc, acc, cx),
+            Expr::If(ifx) => self.traffic_if(ifx, acc, cx),
+            Expr::Match(m) => self.traffic_match(m, acc, cx),
             // `unsafe` is the documented bounds escape, not control flow: transparent here.
-            Expr::UnsafeBlock(u) => {
-                self.traffic_stmts(&u.stmts, mult, acc, exact, elem, src, dst, exts)?;
-                if let Some(r) = &u.ret {
-                    self.traffic_expr(r, mult, acc, exact, elem, src, dst, exts)?;
-                }
-                Ok(())
-            }
-            Expr::ComptimeBlock(c) => {
-                self.traffic_stmts(&c.stmts, mult, acc, exact, elem, src, dst, exts)?;
-                if let Some(r) = &c.ret {
-                    self.traffic_expr(r, mult, acc, exact, elem, src, dst, exts)?;
-                }
-                Ok(())
-            }
-            Expr::BinaryOp(b) => {
-                self.traffic_expr(&b.lhs, mult, acc, exact, elem, src, dst, exts)?;
-                self.traffic_expr(&b.rhs, mult, acc, exact, elem, src, dst, exts)
-            }
-            Expr::RelationalOp(r) => {
-                self.traffic_expr(&r.lhs, mult, acc, exact, elem, src, dst, exts)?;
-                self.traffic_expr(&r.rhs, mult, acc, exact, elem, src, dst, exts)
-            }
-            Expr::LogicalOp(l) => {
-                self.traffic_expr(&l.lhs, mult, acc, exact, elem, src, dst, exts)?;
-                self.traffic_expr(&l.rhs, mult, acc, exact, elem, src, dst, exts)
-            }
-            Expr::UnaryOp(u) => self.traffic_expr(&u.expr, mult, acc, exact, elem, src, dst, exts),
-            Expr::Borrow(b) => self.traffic_expr(&b.expr, mult, acc, exact, elem, src, dst, exts),
-            Expr::Dereference(d) => {
-                self.traffic_expr(&d.expr, mult, acc, exact, elem, src, dst, exts)
-            }
-            Expr::AsCast(c) => self.traffic_expr(&c.expr, mult, acc, exact, elem, src, dst, exts),
-            Expr::Range(r) => {
-                self.traffic_expr(&r.start, mult, acc, exact, elem, src, dst, exts)?;
-                self.traffic_expr(&r.end, mult, acc, exact, elem, src, dst, exts)
-            }
-            Expr::IndexAccess(ix) => {
-                self.traffic_expr(&ix.base, mult, acc, exact, elem, src, dst, exts)?;
-                self.traffic_expr(&ix.index, mult, acc, exact, elem, src, dst, exts)
-            }
-            Expr::MemberAccess(m) => {
-                self.traffic_expr(&m.base, mult, acc, exact, elem, src, dst, exts)
-            }
+            Expr::UnsafeBlock(u) => self.traffic_block(&u.stmts, u.ret.as_deref(), acc, cx),
+            Expr::ComptimeBlock(c) => self.traffic_block(&c.stmts, c.ret.as_deref(), acc, cx),
+            Expr::BinaryOp(b) => self.traffic_pair(&b.lhs, &b.rhs, acc, cx),
+            Expr::RelationalOp(r) => self.traffic_pair(&r.lhs, &r.rhs, acc, cx),
+            Expr::LogicalOp(l) => self.traffic_pair(&l.lhs, &l.rhs, acc, cx),
+            Expr::UnaryOp(u) => self.traffic_expr(&u.expr, acc, cx),
+            Expr::Borrow(b) => self.traffic_expr(&b.expr, acc, cx),
+            Expr::Dereference(d) => self.traffic_expr(&d.expr, acc, cx),
+            Expr::AsCast(c) => self.traffic_expr(&c.expr, acc, cx),
+            Expr::Range(r) => self.traffic_pair(&r.start, &r.end, acc, cx),
+            Expr::IndexAccess(ix) => self.traffic_pair(&ix.base, &ix.index, acc, cx),
+            Expr::MemberAccess(m) => self.traffic_expr(&m.base, acc, cx),
             Expr::Identifier(_) | Expr::Number(_) | Expr::StringLiteral(_) => Ok(()),
             // Anything else is refused rather than assumed empty -- but only when it could
             // hide a movement. A subtree with no `raw::` call in it moves nothing by
@@ -1928,6 +1890,204 @@ impl<'a> TypeChecker<'a> {
                 }
             }
         }
+    }
+
+    /// Add the bytes of two expressions, `first` and then `second`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason either expression cannot be counted exactly.
+    fn traffic_pair(
+        &self,
+        first: &Expr,
+        second: &Expr,
+        acc: &mut TrafficAcc,
+        cx: &TrafficCx<'_>,
+    ) -> Result<(), String> {
+        self.traffic_expr(first, acc, cx)?;
+        self.traffic_expr(second, acc, cx)
+    }
+
+    /// Add the bytes of a block's statements, then of the expression it ends with, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the block cannot be counted exactly.
+    fn traffic_block(
+        &self,
+        stmts: &[Statement],
+        ret: Option<&Expr>,
+        acc: &mut TrafficAcc,
+        cx: &TrafficCx<'_>,
+    ) -> Result<(), String> {
+        self.traffic_stmts(stmts, acc, cx)?;
+        if let Some(r) = ret {
+            self.traffic_expr(r, acc, cx)?;
+        }
+        Ok(())
+    }
+
+    /// Add the bytes one call moves: first those of its arguments, then those of the call
+    /// itself when it is `raw::load`, `raw::store` or `raw::async_copy`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an argument cannot be counted, when the call names a tile
+    /// that is not the lowering's source or destination, or when a count overflows.
+    fn traffic_call(
+        &self,
+        fc: &FunctionCallExpr,
+        acc: &mut TrafficAcc,
+        cx: &TrafficCx<'_>,
+    ) -> Result<(), String> {
+        let (src, dst) = (cx.src, cx.dst);
+        // Arguments first: `raw::store(dst, i, raw::load(src, i))` is a write and a
+        // read, and the read is nested in the write's arguments.
+        for a in &fc.args {
+            self.traffic_expr(a, acc, cx)?;
+        }
+        let tile = |i: usize| -> Option<&crate::symbol::Symbol> {
+            match fc.args.get(i) {
+                Some(Expr::Identifier(id)) => Some(&id.name),
+                _ => None,
+            }
+        };
+        let bytes = cx.elem.checked_mul(cx.mult).ok_or_else(overflowed)?;
+        // Which side of the edge a tile name denotes: `false` = source space,
+        // `true` = destination.
+        let side = |t: Option<&crate::symbol::Symbol>| -> Option<bool> {
+            match t {
+                Some(t) if t == src => Some(false),
+                Some(t) if t == dst => Some(true),
+                _ => None,
+            }
+        };
+        match fc.name.as_ref() {
+            "raw::load" => match side(tile(0)) {
+                Some(to_dst) => acc.add_read(to_dst, bytes)?,
+                None => {
+                    return Err("a `raw::load` names a tile that is not this \
+                                 lowering's source or destination"
+                        .to_string())
+                }
+            },
+            "raw::store" => match side(tile(0)) {
+                Some(to_dst) => acc.add_written(to_dst, bytes)?,
+                None => {
+                    return Err("a `raw::store` names a tile that is not this \
+                                 lowering's source or destination"
+                        .to_string())
+                }
+            },
+            // One chunk out of the source and into the destination. The chunk is
+            // one element while the copy engine is unimplemented and `async_copy`
+            // lowers to a load and a store; when the real engine lands, its chunk
+            // size joins the machine file beside `copy_engine` and multiplies here.
+            "raw::async_copy" => {
+                match side(tile(1)) {
+                    Some(to_dst) => acc.add_read(to_dst, bytes)?,
+                    None => {
+                        return Err("a `raw::async_copy` reads a tile that is not \
+                                    this lowering's source or destination"
+                            .to_string())
+                    }
+                }
+                match side(tile(0)) {
+                    Some(to_dst) => acc.add_written(to_dst, bytes)?,
+                    None => {
+                        return Err("a `raw::async_copy` writes a tile that is not \
+                                    this lowering's source or destination"
+                            .to_string())
+                    }
+                }
+            }
+            // extent/lane/lanes/barrier/async_wait move nothing, and an ordinary
+            // call cannot appear here -- the primitives are the whole vocabulary a
+            // lowering body has for touching memory.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Add the bytes of an `if`. A runtime `if` adds the larger of its two branches and
+    /// marks the count inexact when the branches differ.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the condition or a branch cannot be counted exactly.
+    fn traffic_if(
+        &self,
+        ifx: &IfExpr,
+        acc: &mut TrafficAcc,
+        cx: &TrafficCx<'_>,
+    ) -> Result<(), String> {
+        self.traffic_expr(&ifx.cond, acc, cx)?;
+        // `if comptime` decides at compile time, so only one arm exists in the
+        // emitted code and the traffic is exactly known. Weighing it as a runtime
+        // branch reported the maximum of two arms -- twice the truth on a body
+        // whose answer is not in doubt -- and flagged inexact a figure the
+        // compiler had already resolved.
+        if ifx.is_comptime {
+            if let Some(crate::hir::env::Value::Bool(taken)) =
+                self.eval_expr(&ifx.cond, &std::collections::HashMap::new())
+            {
+                let block = if taken {
+                    Some(&ifx.then_block)
+                } else {
+                    ifx.else_block.as_ref()
+                };
+                if let Some(b) = block {
+                    self.traffic_stmts(b, acc, cx)?;
+                }
+                return Ok(());
+            }
+        }
+        let mut then_acc = acc.clone();
+        self.traffic_stmts(&ifx.then_block, &mut then_acc, cx)?;
+        let mut else_acc = acc.clone();
+        if let Some(eb) = &ifx.else_block {
+            self.traffic_stmts(eb, &mut else_acc, cx)?;
+        }
+        if then_acc != else_acc {
+            cx.exact.set(false);
+        }
+        *acc = then_acc.max_with(&else_acc);
+        Ok(())
+    }
+
+    /// Add the bytes of a `match`: the largest of its arms, marked inexact when the arms
+    /// differ.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the matched expression or an arm cannot be counted exactly.
+    fn traffic_match(
+        &self,
+        m: &MatchExpr,
+        acc: &mut TrafficAcc,
+        cx: &TrafficCx<'_>,
+    ) -> Result<(), String> {
+        self.traffic_expr(&m.expr, acc, cx)?;
+        let entry = acc.clone();
+        let mut outcomes: Vec<TrafficAcc> = Vec::new();
+        for arm in &m.arms {
+            let mut arm_acc = entry.clone();
+            self.traffic_stmts(&arm.body, &mut arm_acc, cx)?;
+            outcomes.push(arm_acc);
+        }
+        // Inexact only when the arms DISAGREE, matching `if`. Flagging on "some arm
+        // moved something" made a match whose arms move identical bytes report
+        // inexact while the same program written as an `if` reported exact -- a
+        // difference in the record with no difference in the code.
+        if outcomes.windows(2).any(|w| w[0] != w[1]) {
+            cx.exact.set(false);
+        }
+        let mut worst = entry;
+        for o in &outcomes {
+            worst = worst.max_with(o);
+        }
+        *acc = worst;
+        Ok(())
     }
 
     /// Trip count of `for _ in a..b` when both bounds are static after the `raw::extent`
@@ -1949,10 +2109,10 @@ impl<'a> TypeChecker<'a> {
                 if fc.name.as_ref() == "raw::extent" && fc.args.len() == 1 {
                     if let Expr::Identifier(id) = &fc.args[0] {
                         if &id.name == src {
-                            return Some(exts.0 as i64);
+                            return Some(exts.0.cast_signed());
                         }
                         if &id.name == dst {
-                            return Some(exts.1 as i64);
+                            return Some(exts.1.cast_signed());
                         }
                     }
                 }
@@ -1963,6 +2123,6 @@ impl<'a> TypeChecker<'a> {
             }
         };
         let (a, b) = (lit(&r.start)?, lit(&r.end)?);
-        Some(if b > a { (b - a) as u64 } else { 0 })
+        Some(if b > a { (b - a).cast_unsigned() } else { 0 })
     }
 }

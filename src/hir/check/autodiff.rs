@@ -11,9 +11,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::{ElementType, Expr, Function, GradExpr, JvpExpr, Type, TypeChecker, VjpExpr};
 
-impl<'a> TypeChecker<'a> {
+impl TypeChecker<'_> {
     /// The element type a differentiable value is made of. `None` for a type autodiff has no
     /// shape for at all, such as a struct or a pointer.
     fn differentiable_elem(ty: &Type) -> Option<&ElementType> {
@@ -107,12 +107,17 @@ impl<'a> TypeChecker<'a> {
         let seed_type = self.check_expr_type_expecting(seed, expected.clone());
         if !self.is_assignable(expected, &seed_type) {
             self.errors.push(format!(
-                "Type mismatch in the seed for {} target {}: expected {:?}, got {:?}",
-                form, target_fn, expected, seed_type
+                "Type mismatch in the seed for {form} target {target_fn}: expected {expected:?}, got {seed_type:?}"
             ));
         }
     }
 
+    /// The type of a `grad` expression: the return type of the function it differentiates.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `expr` is not a `grad` expression. The caller picks this function by that
+    /// variant.
     pub(crate) fn check_grad_expr(&mut self, expr: &mut Expr) -> Type {
         match expr {
             Expr::Grad(GradExpr {
@@ -124,8 +129,7 @@ impl<'a> TypeChecker<'a> {
                     f.clone()
                 } else {
                     self.errors.push(format!(
-                        "Cannot differentiate unknown function '{}'",
-                        target_fn
+                        "Cannot differentiate unknown function '{target_fn}'"
                     ));
                     return Type::Unknown;
                 };
@@ -134,10 +138,17 @@ impl<'a> TypeChecker<'a> {
                 self.check_autodiff_args("grad", &*target_fn, &func, args);
                 func.return_type.clone()
             }
-            _ => panic!("Expected IndexAccess, got {:?}", expr),
+            _ => panic!("Expected IndexAccess, got {expr:?}"),
         }
     }
 
+    /// The type of a `vjp` expression: the return type of the function it differentiates.
+    /// Also checks the seed against that return type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `expr` is not a `vjp` expression. The caller picks this function by that
+    /// variant.
     pub(crate) fn check_vjp_expr(&mut self, expr: &mut Expr) -> Type {
         match expr {
             Expr::Vjp(VjpExpr {
@@ -150,7 +161,7 @@ impl<'a> TypeChecker<'a> {
                     f.clone()
                 } else {
                     self.errors
-                        .push(format!("Cannot vjp unknown function '{}'", target_fn));
+                        .push(format!("Cannot vjp unknown function '{target_fn}'"));
                     return Type::Unknown;
                 };
                 self.check_differentiability(&func);
@@ -160,10 +171,17 @@ impl<'a> TypeChecker<'a> {
                 self.check_autodiff_seed("vjp", &*target_fn, cotangent, &func.return_type);
                 func.return_type.clone()
             }
-            _ => panic!("Expected IndexAccess, got {:?}", expr),
+            _ => panic!("Expected IndexAccess, got {expr:?}"),
         }
     }
 
+    /// The type of a `jvp` expression: the return type of the function it differentiates.
+    /// Also checks the seed against the type of the one parameter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `expr` is not a `jvp` expression. The caller picks this function by that
+    /// variant.
     pub(crate) fn check_jvp_expr(&mut self, expr: &mut Expr) -> Type {
         match expr {
             Expr::Jvp(JvpExpr {
@@ -176,7 +194,7 @@ impl<'a> TypeChecker<'a> {
                     f.clone()
                 } else {
                     self.errors
-                        .push(format!("Cannot jvp unknown function '{}'", target_fn));
+                        .push(format!("Cannot jvp unknown function '{target_fn}'"));
                     return Type::Unknown;
                 };
                 self.check_differentiability(&func);
@@ -200,7 +218,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 func.return_type.clone()
             }
-            _ => panic!("Expected IndexAccess, got {:?}", expr),
+            _ => panic!("Expected IndexAccess, got {expr:?}"),
         }
     }
 }

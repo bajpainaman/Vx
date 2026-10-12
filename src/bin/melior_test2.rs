@@ -10,8 +10,15 @@
 //
 //===----------------------------------------------------------------------===//
 
+//! A scratch program that checks the MLIR bindings can parse an LLVM function type.
+
 use anyhow::{Context, Result};
 
+/// Parses one LLVM function type through MLIR and prints it.
+///
+/// # Errors
+///
+/// Returns an error when MLIR cannot parse the type.
 fn main() -> Result<()> {
     let registry = melior::dialect::DialectRegistry::new();
     melior::utility::register_all_dialects(&registry);
@@ -21,6 +28,6 @@ fn main() -> Result<()> {
     melior::utility::register_all_llvm_translations(&context);
     let f = melior::ir::Type::parse(&context, "!llvm.func<i32 (!llvm.ptr, ...)>")
         .context("Failed to parse function type")?;
-    println!("func type: {:?}", f);
+    println!("func type: {f:?}");
     Ok(())
 }

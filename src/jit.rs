@@ -343,6 +343,7 @@ pub fn execute_mlir(
         program_args,
         opt_level,
         disable_llvm_optimizations,
+        &LinkOptions::default(),
     )?;
     Ok(format!("{}{}", out.stdout, out.stderr))
 }
@@ -435,6 +436,16 @@ pub fn compile_mlir_to_object(
     Ok(temp_obj)
 }
 
+/// What the program asks to be linked with, beyond what every Vx program needs: the `-l` and
+/// `-L` flags, for an `extern` block that calls a C library.
+#[derive(Clone, Debug, Default)]
+pub struct LinkOptions {
+    /// Library names, as `-l` gives them: `z` for zlib.
+    pub libraries: Vec<String>,
+    /// Directories searched for those libraries, at link time and at run time.
+    pub library_dirs: Vec<std::path::PathBuf>,
+}
+
 /// Compile MLIR text to a native executable at `exe`: the object from `compile_mlir_to_object`,
 /// linked with the runtime libraries a Vx program needs. `run-jit` builds its program this way
 /// and then runs it; `emit-exe` keeps the file.
@@ -443,6 +454,7 @@ pub fn build_executable(
     exe: &std::path::Path,
     opt_level: u8,
     disable_llvm_optimizations: bool,
+    link: &LinkOptions,
 ) -> Result<(), String> {
     let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let obj = compile_mlir_to_object(
@@ -451,13 +463,14 @@ pub fn build_executable(
         opt_level,
         disable_llvm_optimizations,
     )?;
-    link_executable(&obj, exe)
+    link_executable(&obj, exe, link)
 }
 
 /// Link the object file `obj` into the executable `exe` with clang, naming every library a Vx
 /// program needs: MLIR's runner utilities, `libvx_std_core`, the half-precision print shims,
 /// the dispatch backend for `spawn on`, and libm. This is the one list; nothing else knows it.
-pub fn link_executable(obj: &str, exe: &std::path::Path) -> Result<(), String> {
+/// The program's own `-l` and `-L` flags come in through `link`.
+pub fn link_executable(obj: &str, exe: &std::path::Path, link: &LinkOptions) -> Result<(), String> {
     // The dispatch backend built alongside this compiler, overridable at run
     // time. The compile-time path names a file in the build machine's OUT_DIR,
     // which is the right answer when the compiler runs where it was built and
@@ -589,6 +602,17 @@ pub fn link_executable(obj: &str, exe: &std::path::Path) -> Result<(), String> {
         }
     }
 
+    // The program's own libraries. A `-L` directory is also an rpath, for the same reason as the
+    // directories above: a shared library found at link time and not at run time is a program
+    // that builds and then cannot start.
+    for dir in &link.library_dirs {
+        clang_cmd.arg(format!("-L{}", dir.display()));
+        clang_cmd.arg(format!("-Wl,-rpath,{}", dir.display()));
+    }
+    for name in &link.libraries {
+        clang_cmd.arg(format!("-l{name}"));
+    }
+
     clang_cmd.arg("-lm");
 
     run_cmd(clang_cmd, "clang")?;
@@ -600,10 +624,17 @@ pub fn execute_mlir_streams(
     program_args: Vec<String>,
     opt_level: u8,
     disable_llvm_optimizations: bool,
+    link: &LinkOptions,
 ) -> Result<ProgramOutput, String> {
     let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let temp_exe = temp_dir.path().join("temp.out");
-    build_executable(mlir_src, &temp_exe, opt_level, disable_llvm_optimizations)?;
+    build_executable(
+        mlir_src,
+        &temp_exe,
+        opt_level,
+        disable_llvm_optimizations,
+        link,
+    )?;
 
     println!("[JIT] Executing native binary...");
     let mut exe_cmd = Command::new(&temp_exe);

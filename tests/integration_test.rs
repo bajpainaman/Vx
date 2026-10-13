@@ -25,6 +25,7 @@ mod integration_test {
     mod gemm_plan_test;
     mod graph_workload_test;
     mod kernel_launch_test;
+    mod link_a_c_library;
     mod lint_test;
     mod loopback_test;
     mod manifest_test;

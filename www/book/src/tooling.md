@@ -24,6 +24,14 @@ vxc --emit-mlir program.vx
 
 Optimization is `-O0` through `-O3`, defaulting to `-O0`.
 
+A program whose `extern` block calls a C library names it with `-l`, and a directory to find it
+in with `-L`, as with a C compiler. Both apply to `--run` and to `emit-exe`:
+
+```bash
+vxc --run -l z crc.vx
+vxc -a emit-exe -l z -o crc crc.vx
+```
+
 ## Hardware and machine models
 
 | Flag | What it does |

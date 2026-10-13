@@ -136,7 +136,7 @@ by the chain up to `llc`.
 | `emit-mlir` | Print the generated MLIR. |
 | `emit-llvm` | Print LLVM IR. |
 | `emit-obj` | Write an object file. |
-| `emit-exe` | Build an executable: the chain above, stopping before the run. `-o` names it; without `-o` it is the input's name with no extension. |
+| `emit-exe` | Build an executable: the chain above, stopping before the run. `-o` names it; without `-o` it is the input's name with no extension. `-l NAME` and `-L DIR` add a C library to the link, for `run` too. |
 | `emit-interface` | Write the module's public interface. |
 | `run` | Compile and execute. `--run` is the shorthand. |
 

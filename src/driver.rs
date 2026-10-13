@@ -112,6 +112,16 @@ pub struct DriverOptions {
     #[arg(long = "package", value_name = "NAME=DIR", value_parser = parse_package)]
     pub packages: Vec<(String, PathBuf)>,
 
+    /// Link a C library, as `-l` does for a C compiler: `-l z` links zlib for an `extern` block
+    /// that calls it. Can be given more than once. Applies to `run-jit` and `emit-exe`.
+    #[arg(short = 'l', long = "link", value_name = "NAME")]
+    pub libraries: Vec<String>,
+
+    /// A directory to search for the libraries `-l` names, as `-L` does for a C compiler. The
+    /// built program also looks there at run time. Can be given more than once.
+    #[arg(short = 'L', long = "library-dir", value_name = "DIR")]
+    pub library_dirs: Vec<PathBuf>,
+
     /// The host the program runs on: a file declaring `Memory::CPU_DRAM`, or
     /// `default` for the machine compiling it.
     ///
@@ -609,6 +619,7 @@ impl CompilerDriver {
                 self.options.program_args.clone(),
                 self.options.opt_level,
                 self.options.disable_llvm_optimizations,
+                &self.link_options(),
             )
             .map_err(|e| e.to_string())?;
             print_program_output(&out);
@@ -621,6 +632,7 @@ impl CompilerDriver {
                 &self.executable_output_path(main_file)?,
                 self.options.opt_level,
                 self.options.disable_llvm_optimizations,
+                &self.link_options(),
             );
         }
 
@@ -1545,6 +1557,7 @@ impl CompilerDriver {
                     self.options.program_args.clone(),
                     self.options.opt_level,
                     self.options.disable_llvm_optimizations,
+                    &self.link_options(),
                 )
                 .map_err(|e| e.to_string())?;
                 print_program_output(&out);
@@ -1556,6 +1569,7 @@ impl CompilerDriver {
                     &self.executable_output_path(main_file)?,
                     self.options.opt_level,
                     self.options.disable_llvm_optimizations,
+                    &self.link_options(),
                 )?;
             }
             Action::EmitObj => {
@@ -1616,6 +1630,14 @@ impl CompilerDriver {
         }
 
         Ok(())
+    }
+
+    /// The `-l` and `-L` flags, for the link step.
+    fn link_options(&self) -> crate::jit::LinkOptions {
+        crate::jit::LinkOptions {
+            libraries: self.options.libraries.clone(),
+            library_dirs: self.options.library_dirs.clone(),
+        }
     }
 
     /// Where `emit-exe` writes the program: `-o`, or the input's name without its extension, as

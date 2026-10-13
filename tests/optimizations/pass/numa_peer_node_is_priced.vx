@@ -46,8 +46,8 @@
 // assume one stands for the other.
 //
 // REQUIRES: flat-codegen
-// RUN: vxc %s --host default --machine fleet/xeon-e5-2666v3.vx --action emit-mlir -o /dev/null --diagnostics-json 2>/dev/null | FileCheck %s
-// RUN: vxc %s --legacy-codegen --host default --machine fleet/xeon-e5-2666v3.vx --action emit-mlir -o /dev/null --diagnostics-json 2>/dev/null | FileCheck %s
+// RUN: vxc %s --host default --machine fleet/xeon-e5-2666v3.vx --action emit-mlir --diagnostics-json 2>/dev/null | FileCheck %s
+// RUN: vxc %s --legacy-codegen --host default --machine fleet/xeon-e5-2666v3.vx --action emit-mlir --diagnostics-json 2>/dev/null | FileCheck %s
 // CHECK: "verdict": "admitted"
 // CHECK: "path": ["CPU_DRAM", "HBM"]
 // CHECK-SAME: "derived_cost": 126322567530

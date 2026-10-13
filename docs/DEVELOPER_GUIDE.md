@@ -133,8 +133,8 @@ by the chain up to `llc`.
 | --- | --- |
 | `parse-only` | Parse and check, produce nothing. The fastest way to ask "is this legal Vx?" |
 | `print-ast` | Print the AST. |
-| `emit-mlir` | Print the generated MLIR. |
-| `emit-llvm` | Print LLVM IR. |
+| `emit-mlir` | Print the generated MLIR, or write it to `-o`. |
+| `emit-llvm` | Print LLVM IR, or write it to `-o`. |
 | `emit-obj` | Write an object file. |
 | `emit-exe` | Build an executable: the chain above, stopping before the run. `-o` names it; without `-o` it is the input's name with no extension. `-l NAME` and `-L DIR` add a C library to the link, for `run` too. |
 | `emit-interface` | Write the module's public interface. |

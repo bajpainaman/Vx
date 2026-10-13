@@ -339,8 +339,8 @@ impl CompilerDriver {
 
     /// With several inputs, `-o` names a directory for the actions that write a file, and each
     /// input's output goes there under the input's own name with the action's extension. One
-    /// file path cannot hold two outputs, so it is refused. The actions that print ignore `-o`,
-    /// as they do with one input.
+    /// file path cannot hold two outputs, so it is refused. `parse-only` and `print-ast` ignore
+    /// `-o`, as they do with one input.
     fn output_dir_for_several_inputs(&self) -> Result<Option<(PathBuf, &'static str)>, String> {
         let Some(out) = &self.options.output else {
             return Ok(None);
@@ -349,6 +349,8 @@ impl CompilerDriver {
             Action::EmitObj => ("o", ".o"),
             Action::EmitInterface => ("vxlib", ".vxlib"),
             Action::EmitExe => ("", "executable"),
+            Action::EmitMlir => ("mlir", ".mlir"),
+            Action::EmitLlvm => ("ll", ".ll"),
             _ => return Ok(None),
         };
         if !out.is_dir() {
@@ -604,13 +606,12 @@ impl CompilerDriver {
 
         if self.options.action == Action::EmitMlir || self.options.action == Action::EmitLlvm {
             let optimized_mlir = apply_mlir_opt(&mlir_src, mlir_args, main_file)?;
-            if self.options.action == Action::EmitLlvm {
-                let llvm_ir = translate_to_llvm_ir(&optimized_mlir, main_file)?;
-                println!("{}", llvm_ir);
+            let text = if self.options.action == Action::EmitLlvm {
+                translate_to_llvm_ir(&optimized_mlir, main_file)?
             } else {
-                println!("{}", optimized_mlir);
-            }
-            return Ok(());
+                optimized_mlir
+            };
+            return self.write_text_output(&format!("{text}\n"), main_file);
         }
 
         if self.options.action == Action::RunJit {
@@ -1548,7 +1549,10 @@ impl CompilerDriver {
                         );
                     }
                 }
-                crate::intern_mode::timed("mlir_print", || println!("{}", module.as_operation()));
+                let text = crate::intern_mode::timed("mlir_print", || {
+                    format!("{}\n", module.as_operation())
+                });
+                self.write_text_output(&text, main_file)?;
             }
             Action::RunJit => {
                 let mlir_str = format!("{}", module.as_operation());
@@ -1630,6 +1634,27 @@ impl CompilerDriver {
         }
 
         Ok(())
+    }
+
+    /// Where `emit-mlir` and `emit-llvm` put their text: the file `-o` names, or standard output
+    /// when there is no `-o` or it is `-`, as with a C compiler.
+    fn write_text_output(&self, text: &str, main_file: &std::path::Path) -> Result<(), String> {
+        let Some(out) = self
+            .options
+            .output
+            .as_ref()
+            .filter(|o| o.as_os_str() != "-")
+        else {
+            print!("{text}");
+            return Ok(());
+        };
+        std::fs::write(out, text).map_err(|e| {
+            format!(
+                "could not write the output of '{}' to '{}': {e}",
+                main_file.display(),
+                out.display()
+            )
+        })
     }
 
     /// The `-l` and `-L` flags, for the link step.

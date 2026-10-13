@@ -20,7 +20,11 @@ vxc --run program.vx
 vxc -a emit-exe program.vx -o program
 vxc -c program.vx -o program.o
 vxc --emit-mlir program.vx
+vxc --emit-mlir program.vx -o program.mlir
 ```
+
+`--emit-mlir` and `--emit-llvm` print to standard output, or to the file `-o` names; `-o -` is
+standard output.
 
 Optimization is `-O0` through `-O3`, defaulting to `-O0`.
 

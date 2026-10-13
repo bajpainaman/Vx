@@ -16,6 +16,7 @@ mod integration_test {
     mod device_pool_test;
     mod differential_pairs_hold;
     mod emit_exe_builds_a_program;
+    mod emit_mlir_and_emit_llvm_write_to_o;
     mod emit_obj_produces_objects;
     mod entry_block_allocas_test;
     mod flat_codegen_differential;

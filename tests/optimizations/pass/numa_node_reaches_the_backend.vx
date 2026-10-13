@@ -26,8 +26,8 @@
 // rule is exactly the shape that drifts.
 //
 // REQUIRES: flat-codegen
-// RUN: vxc %s --host default --machine fleet/xeon-8275cl.vx --action emit-mlir -o /dev/null 2>&1 | FileCheck %s
-// RUN: vxc %s --legacy-codegen --host default --machine fleet/xeon-8275cl.vx --action emit-mlir -o /dev/null 2>&1 | FileCheck %s
+// RUN: vxc %s --host default --machine fleet/xeon-8275cl.vx --action emit-mlir 2>&1 | FileCheck %s
+// RUN: vxc %s --legacy-codegen --host default --machine fleet/xeon-8275cl.vx --action emit-mlir 2>&1 | FileCheck %s
 // CHECK: vx.transfer
 // CHECK-SAME: target_topology = 1000
 // CHECK-SAME: space = "HBM"

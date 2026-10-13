@@ -41,6 +41,8 @@ pub enum Action {
     RunJit,
     /// Compile to an object file
     EmitObj,
+    /// Build a native executable, linked the way `run-jit` links the program it runs
+    EmitExe,
     /// Parse, typecheck, emit MLIR, lower to LLVM dialect, and translate to LLVM IR
     EmitLlvm,
     /// Serialize this module's import interface (frozen registry + flat-HIR bodies) to a `.vxlib`
@@ -333,18 +335,19 @@ impl CompilerDriver {
         let Some(out) = &self.options.output else {
             return Ok(None);
         };
-        let extension = match self.options.action {
-            Action::EmitObj => "o",
-            Action::EmitInterface => "vxlib",
+        let (extension, what) = match self.options.action {
+            Action::EmitObj => ("o", ".o"),
+            Action::EmitInterface => ("vxlib", ".vxlib"),
+            Action::EmitExe => ("", "executable"),
             _ => return Ok(None),
         };
         if !out.is_dir() {
             return Err(format!(
-                "-o '{}' names one file, but {} inputs were given and each writes its own .{}; \
+                "-o '{}' names one file, but {} inputs were given and each writes its own {}; \
                  give a directory and each input's output is written there under its own name",
                 out.display(),
                 self.options.inputs.len(),
-                extension
+                what
             ));
         }
         Ok(Some((out.clone(), extension)))
@@ -378,7 +381,11 @@ impl CompilerDriver {
             let jobs = jobs as usize;
             let compiles = matches!(
                 self.options.action,
-                Action::EmitMlir | Action::EmitLlvm | Action::EmitObj | Action::RunJit
+                Action::EmitMlir
+                    | Action::EmitLlvm
+                    | Action::EmitObj
+                    | Action::EmitExe
+                    | Action::RunJit
             );
             if compiles {
                 if self
@@ -606,6 +613,15 @@ impl CompilerDriver {
             .map_err(|e| e.to_string())?;
             print_program_output(&out);
             return Ok(());
+        }
+
+        if self.options.action == Action::EmitExe {
+            return crate::jit::build_executable(
+                &mlir_src,
+                &self.executable_output_path(main_file)?,
+                self.options.opt_level,
+                self.options.disable_llvm_optimizations,
+            );
         }
 
         Err(format!(
@@ -1446,7 +1462,7 @@ impl CompilerDriver {
 
         let llvm_lower = matches!(
             self.options.action,
-            Action::EmitLlvm | Action::RunJit | Action::EmitObj
+            Action::EmitLlvm | Action::RunJit | Action::EmitObj | Action::EmitExe
         );
         let pipeline_str = get_optimization_pipeline(
             self.options.opt_level,
@@ -1533,6 +1549,15 @@ impl CompilerDriver {
                 .map_err(|e| e.to_string())?;
                 print_program_output(&out);
             }
+            Action::EmitExe => {
+                let mlir_str = format!("{}", module.as_operation());
+                crate::jit::build_executable(
+                    &mlir_str,
+                    &self.executable_output_path(main_file)?,
+                    self.options.opt_level,
+                    self.options.disable_llvm_optimizations,
+                )?;
+            }
             Action::EmitObj => {
                 let output_path = self.options.output.clone().unwrap_or_else(|| {
                     let mut p = main_file.to_path_buf();
@@ -1591,6 +1616,24 @@ impl CompilerDriver {
         }
 
         Ok(())
+    }
+
+    /// Where `emit-exe` writes the program: `-o`, or the input's name without its extension, as
+    /// `cc` does with `-o` and `go build` do by default. An input with no extension would be
+    /// overwritten by its own executable, so it needs `-o`.
+    fn executable_output_path(&self, main_file: &std::path::Path) -> Result<PathBuf, String> {
+        if let Some(out) = &self.options.output {
+            return Ok(out.clone());
+        }
+        let out = main_file.with_extension("");
+        if out == main_file {
+            return Err(format!(
+                "'{}' has no extension to drop, so the executable would overwrite it; \
+                 name the output with -o",
+                main_file.display()
+            ));
+        }
+        Ok(out)
     }
 
     /// Build the MLIR module via the flat-array codegen path, or `None` if any function is outside the

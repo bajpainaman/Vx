@@ -45,12 +45,15 @@ fn main() -> i32 {
 
 ## Compiling ahead of time
 
-The JIT is convenient for iterating. For anything you intend to keep, compile to a native
-executable:
+The JIT is convenient for iterating. For anything you intend to keep, build a native
+executable and run it like any other program:
 
 ```bash
-vxc -c hello.vx -o hello.o
+vxc -a emit-exe hello.vx -o hello
+./hello
 ```
+
+`-c` stops one step earlier and writes an object file, `hello.o`, for a build you link yourself.
 
 `vxc --help` lists the other actions — `--emit-mlir` and `--emit-llvm` are the two you will reach
 for most when you want to see what the compiler did with your code.

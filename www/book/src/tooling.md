@@ -7,6 +7,7 @@
 | Flag | What it does |
 | --- | --- |
 | `--run` | Compile and execute immediately, propagating the program's exit code |
+| `-a emit-exe` | Build an executable, named by `-o` or by the input with no extension |
 | `-c` | Compile to an object file |
 | `--emit-mlir` | Emit the MLIR representation |
 | `--emit-llvm` | Emit LLVM IR |
@@ -16,6 +17,7 @@
 
 ```bash
 vxc --run program.vx
+vxc -a emit-exe program.vx -o program
 vxc -c program.vx -o program.o
 vxc --emit-mlir program.vx
 ```

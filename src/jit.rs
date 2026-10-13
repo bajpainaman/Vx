@@ -435,21 +435,29 @@ pub fn compile_mlir_to_object(
     Ok(temp_obj)
 }
 
-pub fn execute_mlir_streams(
+/// Compile MLIR text to a native executable at `exe`: the object from `compile_mlir_to_object`,
+/// linked with the runtime libraries a Vx program needs. `run-jit` builds its program this way
+/// and then runs it; `emit-exe` keeps the file.
+pub fn build_executable(
     mlir_src: &str,
-    program_args: Vec<String>,
+    exe: &std::path::Path,
     opt_level: u8,
     disable_llvm_optimizations: bool,
-) -> Result<ProgramOutput, String> {
+) -> Result<(), String> {
     let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-
-    let temp_obj = compile_mlir_to_object(
+    let obj = compile_mlir_to_object(
         mlir_src,
         temp_dir.path(),
         opt_level,
         disable_llvm_optimizations,
     )?;
+    link_executable(&obj, exe)
+}
 
+/// Link the object file `obj` into the executable `exe` with clang, naming every library a Vx
+/// program needs: MLIR's runner utilities, `libvx_std_core`, the half-precision print shims,
+/// the dispatch backend for `spawn on`, and libm. This is the one list; nothing else knows it.
+pub fn link_executable(obj: &str, exe: &std::path::Path) -> Result<(), String> {
     // The dispatch backend built alongside this compiler, overridable at run
     // time. The compile-time path names a file in the build machine's OUT_DIR,
     // which is the right answer when the compiler runs where it was built and
@@ -459,11 +467,6 @@ pub fn execute_mlir_streams(
         .unwrap_or_else(|_| std::env!("NPU_SHARED_LIB_PATH").to_string());
 
     println!("[JIT] Linking native executable...");
-    let temp_exe = temp_dir
-        .path()
-        .join("temp.out")
-        .to_string_lossy()
-        .into_owned();
     let current_dir = std::env::current_dir().unwrap();
     let profile_dir = if cfg!(debug_assertions) {
         "debug"
@@ -526,7 +529,7 @@ pub fn execute_mlir_streams(
     }
 
     // Input obj and output exe
-    clang_cmd.args([&temp_obj, "-o", &temp_exe]);
+    clang_cmd.args([obj, "-o"]).arg(exe);
 
     // Libraries
     clang_cmd.args([
@@ -589,6 +592,18 @@ pub fn execute_mlir_streams(
     clang_cmd.arg("-lm");
 
     run_cmd(clang_cmd, "clang")?;
+    Ok(())
+}
+
+pub fn execute_mlir_streams(
+    mlir_src: &str,
+    program_args: Vec<String>,
+    opt_level: u8,
+    disable_llvm_optimizations: bool,
+) -> Result<ProgramOutput, String> {
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let temp_exe = temp_dir.path().join("temp.out");
+    build_executable(mlir_src, &temp_exe, opt_level, disable_llvm_optimizations)?;
 
     println!("[JIT] Executing native binary...");
     let mut exe_cmd = Command::new(&temp_exe);

@@ -255,7 +255,8 @@ fn large_transfers_still_have_a_cost() {
     let expected = (bytes * 1_000_000_000_000).div_ceil(100_000_000_000)
         + (bytes * 1_000_000_000_000).div_ceil(3_000_000_000_000);
     assert_eq!(
-        c.value as u128, expected,
+        u128::from(c.value),
+        expected,
         "DRAM->HBM should charge DRAM's 100 GB/s and HBM's 3 TB/s"
     );
 }
@@ -299,5 +300,5 @@ fn main() -> i32 { return 0; }
     // still spent.
     let smem_ps = (128u128 * 1_000_000_000_000).div_ceil(1_980_000_000);
     let l2_ps = (16_384u128 * 1_000_000_000_000).div_ceil(12_000_000_000_000);
-    assert_eq!(c.value as u128, smem_ps + l2_ps);
+    assert_eq!(u128::from(c.value), smem_ps + l2_ps);
 }

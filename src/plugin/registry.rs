@@ -21,7 +21,8 @@ pub struct PluginRegistry {
 }
 
 impl PluginRegistry {
-    /// Initializes a new PluginRegistry.
+    /// Initializes a new `PluginRegistry`.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             plugins: HashMap::new(),
@@ -35,6 +36,7 @@ impl PluginRegistry {
     }
 
     /// Fetches a plugin reference for the given topology ID.
+    #[must_use]
     pub fn get(&self, topology_id: TopologyID) -> Option<Arc<dyn VxHardwarePlugin + Send + Sync>> {
         self.plugins.get(&topology_id).cloned()
     }
@@ -47,6 +49,11 @@ impl Default for PluginRegistry {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use crate::plugin::hardware_trait::{mlir, PluginError, TensorLayout};

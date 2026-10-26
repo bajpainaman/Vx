@@ -21,9 +21,13 @@ use crate::gid::TypeId;
 /// Structural layout definition of a nominal type.
 #[derive(Debug, Clone)]
 pub struct TypeDefinition {
+    /// The type's GID.
     pub id: TypeId,
+    /// The name the type was declared with.
     pub name: String,
+    /// The size of a value of the type, in bytes.
     pub size_bytes: usize,
+    /// The alignment of the type, in bytes. Zero marks a type whose layout is not modelled.
     pub align_bytes: usize,
     /// Per-field byte offsets/sizes in declaration order (structs only; empty for
     /// enums or when the layout is not yet computable). See `crate::layout` (#199).
@@ -40,11 +44,13 @@ pub struct TypeDefinition {
 /// *imported* call whose AST is absent (#265 step 7).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnSig {
+    /// The function's GID.
     pub gid: TypeId,
     /// Parameter types in declaration order. The borrow checker needs each parameter's reference-ness
     /// to decide reborrow conflicts for a call resolved from the registry (no AST). Enriched for the
     /// cross-module borrow check; also the enrichment #219's imported-call type-check flip needs.
     pub params: Vec<crate::syntax::Type>,
+    /// The declared return type.
     pub ret_ty: crate::syntax::Type,
     /// The return-provenance code (`hir::provenance::encode_return_provenance`): which parameter an
     /// imported reference return derives from — `0` none, `1..=4` parameter slot 0..3, `7` conservative
@@ -63,7 +69,7 @@ pub struct FnSig {
 /// frozen `layouts` deliberately erase a pointer field's pointee (every pointer is `FieldTy::Opaque`,
 /// pointer-sized), so this carries the AST field `Type`s the substitution needs — the flat-path
 /// analogue of the AST codegen's `gen.structs`. Keyed by the *base* struct's GID (`Vec<i32>`'s entry
-/// sits under `Vec`'s TypeId), so two modules' same-named structs never collide (#291). (#242)
+/// sits under `Vec`'s `TypeId`), so two modules' same-named structs never collide (#291). (#242)
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructFields {
     /// Generic parameter names in declaration order (`[T]` for `Vec<T>`) — the substitution keys.
@@ -79,7 +85,9 @@ pub struct StructFields {
 /// declaration order, so a variant's index is its discriminant ordinal. (#242)
 #[derive(Debug, Clone)]
 pub struct EnumData {
+    /// Generic parameter names in declaration order.
     pub generics: Vec<crate::symbol::Symbol>,
+    /// Each variant's name and declared payload types, in declaration order.
     pub variants: Vec<(crate::symbol::Symbol, Vec<crate::syntax::Type>)>,
 }
 
@@ -92,8 +100,11 @@ pub struct EnumData {
 pub struct FnBody {
     /// The MLIR symbol / mangled emit name of the function.
     pub name: crate::symbol::Symbol,
+    /// Parameter types in declaration order.
     pub params: Vec<crate::syntax::Type>,
+    /// The declared return type.
     pub ret_ty: crate::syntax::Type,
+    /// The body's instruction stream.
     pub hir: Vec<crate::bytecode::HirInstruction>,
     /// The body's type stream (global GIDs), indexed by each instruction's `type_idx`.
     pub types: Vec<TypeId>,
@@ -102,7 +113,9 @@ pub struct FnBody {
 /// The globally frozen type registry for parallel compilation phases.
 #[derive(Debug, Clone)]
 pub struct ImmutableGlobalRegistry {
+    /// The layout of every struct and enum, by GID.
     pub layouts: FxHashMap<TypeId, TypeDefinition>,
+    /// For each module, by its module hash: the GID of each type it declares, by name.
     pub module_indices: FxHashMap<u64, FxHashMap<crate::symbol::Symbol, TypeId>>,
     /// Function signatures by name, for call resolution in the flat HIR. A name defined in more than
     /// one module (distinct GIDs) is omitted -- the name-keyed map can't disambiguate, so such a
@@ -161,11 +174,16 @@ pub struct ImmutableGlobalRegistry {
 /// index the table has outgrown.
 #[derive(Debug, Clone, Default)]
 pub struct LayoutNameIndex {
+    /// How many layouts the table had when this index was built.
     built_from: usize,
+    /// The GID for each base name, or `None` for a name that two layouts share.
     by_base_name: FxHashMap<String, Option<TypeId>>,
 }
 
 impl LayoutNameIndex {
+    /// Builds the index over `layouts`. A layout whose alignment is zero is not modelled and is
+    /// left out.
+    #[must_use]
     pub fn build(layouts: &FxHashMap<TypeId, TypeDefinition>) -> Self {
         let mut by_base_name: FxHashMap<String, Option<TypeId>> = FxHashMap::default();
         for def in layouts.values() {
@@ -194,8 +212,11 @@ impl LayoutNameIndex {
 /// the module, which every use reads from.
 #[derive(Debug, Clone)]
 pub struct ConstTable {
+    /// The name the `const` was declared with.
     pub name: crate::symbol::Symbol,
+    /// The type of each element.
     pub elem: crate::syntax::ElementType,
+    /// How many elements the table has.
     pub len: usize,
     /// Each element as MLIR writes it inside `dense<[..]>`: a float as its bits in hex, so no
     /// digit is rounded twice, and an integer as a signed decimal of its width.
@@ -205,21 +226,25 @@ pub struct ConstTable {
 impl ConstTable {
     /// The table `decl` declares, `Ok(None)` when it declares a number or `bool` instead, and
     /// `Err` with the reason when it is a tensor `const` this compiler cannot build yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the table is placed in a memory, does not have one dimension with
+    /// a number as its length, holds an element type other than a whole number or `f32`/`f64`,
+    /// is not written as a list of that many number literals, or holds a number that does not
+    /// fit its type.
     pub fn from_decl(decl: &crate::syntax::ConstDecl) -> Result<Option<ConstTable>, String> {
-        use crate::syntax::{Dim, ElementType::*, Expr, Type, UnaryOp};
+        use crate::syntax::{
+            ElementType::{F32, F64, I16, I32, I64, I8, U16, U32, U64, U8},
+            Expr, Type,
+        };
         let Type::Tensor(elem, dims, placement) = &decl.ty else {
             return Ok(None);
         };
         if placement.is_some() {
             return Err("cannot be placed: a table lives with the program".into());
         }
-        let len = match dims.as_slice() {
-            [Dim::Static(Expr::Number(n))] => n
-                .value
-                .parse::<usize>()
-                .map_err(|_| "must have a whole number as its length".to_string())?,
-            _ => return Err("must have one dimension whose length is a number".into()),
-        };
+        let len = Self::declared_len(dims)?;
         if !matches!(
             elem,
             F32 | F64 | I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64
@@ -238,75 +263,7 @@ impl ConstTable {
         }
         let mut values = Vec::with_capacity(len);
         for element in &array.elements {
-            let (negative, n) = match element {
-                Expr::Number(n) => (false, n),
-                Expr::UnaryOp(u) if u.op == UnaryOp::Neg => match &*u.expr {
-                    Expr::Number(n) => (true, n),
-                    _ => return Err("must hold only number literals".into()),
-                },
-                _ => return Err("must hold only number literals".into()),
-            };
-            if n.ty.as_ref().is_some_and(|t| t != elem) {
-                return Err("has a number whose type differs from the table's".into());
-            }
-            let text = n.value.replace('_', "");
-            let value = match elem {
-                F32 | F64 => {
-                    let f: f64 = text
-                        .parse()
-                        .map_err(|_| format!("has `{}`, which is not a number", n.value))?;
-                    let f = if negative { -f } else { f };
-                    if *elem == F32 {
-                        // Parsed straight to f32: rounding through f64 first could land one
-                        // step away from the nearest f32.
-                        let f: f32 = text.parse().map_err(|_| "is not a number".to_string())?;
-                        let f = if negative { -f } else { f };
-                        format!("0x{:08X}", f.to_bits())
-                    } else {
-                        format!("0x{:016X}", f.to_bits())
-                    }
-                }
-                I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64 => {
-                    if text.contains('.') {
-                        return Err(format!("has `{}`, which is not a whole number", n.value));
-                    }
-                    let parsed = match text.strip_prefix("0x") {
-                        Some(hex) => i128::from_str_radix(hex, 16),
-                        None => text.parse::<i128>(),
-                    };
-                    let v =
-                        parsed.map_err(|_| format!("has `{}`, which is not a number", n.value))?;
-                    let v = if negative { -v } else { v };
-                    let (bits, signed) = match elem {
-                        I8 => (8, true),
-                        I16 => (16, true),
-                        I32 => (32, true),
-                        I64 => (64, true),
-                        U8 => (8, false),
-                        U16 => (16, false),
-                        U32 => (32, false),
-                        _ => (64, false),
-                    };
-                    let (lo, hi) = if signed {
-                        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
-                    } else {
-                        (0, (1i128 << bits) - 1)
-                    };
-                    if v < lo || v > hi {
-                        return Err(format!("has `{}`, which does not fit in its type", n.value));
-                    }
-                    // MLIR's integers have no sign of their own: an unsigned value past the
-                    // signed range is written as the negative number with the same bits.
-                    let wrapped = if v > (1i128 << (bits - 1)) - 1 {
-                        v - (1i128 << bits)
-                    } else {
-                        v
-                    };
-                    wrapped.to_string()
-                }
-                _ => unreachable!("the element type was checked above"),
-            };
-            values.push(value);
+            values.push(Self::element_text(element, elem)?);
         }
         Ok(Some(ConstTable {
             name: decl.name.clone(),
@@ -316,12 +273,155 @@ impl ConstTable {
         }))
     }
 
+    /// The length a table's type declares: its one dimension, which must be a number literal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when there is not exactly one dimension, or it is not a whole number.
+    fn declared_len(dims: &[crate::syntax::Dim]) -> Result<usize, String> {
+        use crate::syntax::{Dim, Expr};
+        match dims {
+            // The parser's own error is dropped: the message already says what must change.
+            [Dim::Static(Expr::Number(n))] => n
+                .value
+                .parse::<usize>()
+                .map_err(|_not_a_number| "must have a whole number as its length".to_string()),
+            _ => Err("must have one dimension whose length is a number".into()),
+        }
+    }
+
+    /// One element of a table of `elem` values, as MLIR writes it inside `dense<[..]>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the element is not a number literal, is typed differently from
+    /// the table, or does not fit in `elem`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `elem` is not one of the element types `from_decl` accepts.
+    fn element_text(
+        element: &crate::syntax::Expr,
+        elem: &crate::syntax::ElementType,
+    ) -> Result<String, String> {
+        use crate::syntax::{
+            ElementType::{F32, F64, I16, I32, I64, I8, U16, U32, U64, U8},
+            Expr, UnaryOp,
+        };
+        let (negative, n) = match element {
+            Expr::Number(n) => (false, n),
+            Expr::UnaryOp(u) if u.op == UnaryOp::Neg => match &*u.expr {
+                Expr::Number(n) => (true, n),
+                _ => return Err("must hold only number literals".into()),
+            },
+            _ => return Err("must hold only number literals".into()),
+        };
+        if n.ty.as_ref().is_some_and(|t| t != elem) {
+            return Err("has a number whose type differs from the table's".into());
+        }
+        let text = n.value.replace('_', "");
+        match elem {
+            F32 | F64 => Self::float_text(&text, n, negative, *elem == F32),
+            I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64 => Self::int_text(&text, n, negative, elem),
+            _ => unreachable!("the element type was checked above"),
+        }
+    }
+
+    /// A float element as its bits in hex. `text` is the literal `n` with `_` removed, and
+    /// `single` says the table holds `f32` rather than `f64`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when `text` is not a number.
+    fn float_text(
+        text: &str,
+        n: &crate::syntax::NumberExpr,
+        negative: bool,
+        single: bool,
+    ) -> Result<String, String> {
+        // The parser's own error is dropped in both places: the message names the literal.
+        let f: f64 = text
+            .parse()
+            .map_err(|_not_a_number| format!("has `{}`, which is not a number", n.value))?;
+        let f = if negative { -f } else { f };
+        if single {
+            // Parsed straight to f32: rounding through f64 first could land one
+            // step away from the nearest f32.
+            let f: f32 = text
+                .parse()
+                .map_err(|_not_a_number| "is not a number".to_string())?;
+            let f = if negative { -f } else { f };
+            Ok(format!("0x{:08X}", f.to_bits()))
+        } else {
+            Ok(format!("0x{:016X}", f.to_bits()))
+        }
+    }
+
+    /// A whole-number element as a signed decimal of the width of `elem`. `text` is the literal
+    /// `n` with `_` removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when `text` is not a whole number or does not fit in `elem`.
+    fn int_text(
+        text: &str,
+        n: &crate::syntax::NumberExpr,
+        negative: bool,
+        elem: &crate::syntax::ElementType,
+    ) -> Result<String, String> {
+        use crate::syntax::ElementType::{I16, I32, I64, I8, U16, U32, U8};
+        if text.contains('.') {
+            return Err(format!("has `{}`, which is not a whole number", n.value));
+        }
+        let parsed = match text.strip_prefix("0x") {
+            Some(hex) => i128::from_str_radix(hex, 16),
+            None => text.parse::<i128>(),
+        };
+        // The parser's own error is dropped: the message names the literal.
+        let v =
+            parsed.map_err(|_not_a_number| format!("has `{}`, which is not a number", n.value))?;
+        let v = if negative { -v } else { v };
+        let (bits, signed) = match elem {
+            I8 => (8, true),
+            I16 => (16, true),
+            I32 => (32, true),
+            I64 => (64, true),
+            U8 => (8, false),
+            U16 => (16, false),
+            U32 => (32, false),
+            _ => (64, false),
+        };
+        let (lo, hi) = if signed {
+            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+        } else {
+            (0, (1i128 << bits) - 1)
+        };
+        if v < lo || v > hi {
+            return Err(format!("has `{}`, which does not fit in its type", n.value));
+        }
+        // MLIR's integers have no sign of their own: an unsigned value past the
+        // signed range is written as the negative number with the same bits.
+        let wrapped = if v > (1i128 << (bits - 1)) - 1 {
+            v - (1i128 << bits)
+        } else {
+            v
+        };
+        Ok(wrapped.to_string())
+    }
+
     /// The global's name in the module. The prefix keeps it apart from functions.
+    #[must_use]
     pub fn symbol(&self) -> String {
         format!("__vx_const_{}", self.name)
     }
 
     /// The MLIR type of the table, `memref<64xf64>`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the element type has no MLIR spelling. `from_decl` only builds tables of
+    /// element types that have one.
+    #[must_use]
     pub fn memref_type(&self) -> String {
         let elem =
             crate::mlir_ty::mlir_scalar(&self.elem).expect("a table's element has an MLIR type");
@@ -329,6 +429,7 @@ impl ConstTable {
     }
 
     /// The table's read-only global, one line of MLIR.
+    #[must_use]
     pub fn global_op(&self) -> String {
         format!(
             "memref.global \"private\" constant @{} : {} = dense<[{}]>\n",
@@ -344,19 +445,28 @@ impl ConstTable {
 /// from "defined twice and deliberately tombstoned" (#294).
 #[derive(Debug, Default, Clone)]
 pub struct MergeState {
+    /// Function names that came from an imported interface.
     pub imported_fns: FxHashSet<crate::symbol::Symbol>,
+    /// Function names two imported interfaces define differently, so neither is used.
     pub poisoned_fns: FxHashSet<crate::symbol::Symbol>,
+    /// Methods that came from an imported interface.
     pub imported_methods: FxHashSet<(TypeId, crate::symbol::Symbol)>,
+    /// Methods two imported interfaces define differently, so neither is used.
     pub poisoned_methods: FxHashSet<(TypeId, crate::symbol::Symbol)>,
+    /// Enum names that came from an imported interface.
     pub imported_enums: FxHashSet<crate::symbol::Symbol>,
+    /// Enum names two imported interfaces define differently, so neither is used.
     pub poisoned_enums: FxHashSet<crate::symbol::Symbol>,
 }
 
 /// Which table a poisoned name was tombstoned in — see [`ImmutableGlobalRegistry::poisoned_reason`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoisonKind {
+    /// The name is in the function table.
     Function,
+    /// The name is in the method table.
     Method,
+    /// The name is in the table of enum variants.
     EnumVariant,
 }
 
@@ -410,6 +520,7 @@ impl ImmutableGlobalRegistry {
     /// design describes (doc §7, Step 3) — the frozen-registry counterpart of the `symbol_map`
     /// lookup `resolve_names` uses on the AST (#194). Returns `None` if the module or symbol is
     /// absent.
+    #[must_use]
     pub fn resolve_in_module(
         &self,
         module_hash: u64,
@@ -420,6 +531,16 @@ impl ImmutableGlobalRegistry {
 
     /// Builds and validates the registry from a collection of local module thread maps.
     /// Runs a fast cycle-detection pass to ensure no infinite-sized recursive layouts exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when two different types have the same GID, when a type holds by
+    /// value a type that is not in `definitions`, or when a type holds itself by value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a registered layout has no graph node. Every layout is given one as it is
+    /// registered, so this cannot happen.
     pub fn build_and_validate(definitions: Vec<TypeDefinition>) -> Result<Self, String> {
         let mut layouts: FxHashMap<TypeId, TypeDefinition> = FxHashMap::default();
         let mut module_indices: FxHashMap<u64, FxHashMap<crate::symbol::Symbol, TypeId>> =
@@ -460,7 +581,7 @@ impl ImmutableGlobalRegistry {
                 if let Some(target_idx) = node_map.get(dep) {
                     graph.add_edge(source_idx, *target_idx, ());
                 } else {
-                    return Err(format!("Unresolved by-value dependency: {:?}", dep));
+                    return Err(format!("Unresolved by-value dependency: {dep:?}"));
                 }
             }
         }
@@ -496,6 +617,7 @@ impl ImmutableGlobalRegistry {
 
     /// An enum whose variants carry no data: its layout has no fields, and its value is an
     /// `i32` tag.
+    #[must_use]
     pub fn is_payload_free_enum(&self, gid: TypeId) -> bool {
         self.layouts.get(&gid).is_some_and(|d| {
             d.align_bytes != 0 && d.fields.is_empty() && !self.structs.contains_key(&gid)
@@ -503,6 +625,7 @@ impl ImmutableGlobalRegistry {
     }
 
     /// The `const` table named `name`, with its position in `const_tables`.
+    #[must_use]
     pub fn const_table(&self, name: &str) -> Option<(usize, &ConstTable)> {
         let at = self
             .const_tables
@@ -520,6 +643,11 @@ impl ImmutableGlobalRegistry {
     /// parameter the lowerer met, and on a 1,000-module corpus that scan was 80% of the compile.
     /// The index is checked on every call, because `layouts` is a public field: a table grown
     /// behind the index would otherwise answer from a table that no longer exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `layouts` has a different number of entries than when the index was built.
+    #[must_use]
     pub fn layout_gid_by_base_name(&self, name: &str) -> Option<TypeId> {
         let base = name.split('<').next().unwrap_or(name);
         assert_eq!(
@@ -536,6 +664,7 @@ impl ImmutableGlobalRegistry {
 
     /// Resolve a method `recv.method(..)` to its signature by `(receiver GID, method name)` -- the
     /// registry-backed method lookup that replaces the `GlobalAstEnv` `impl`-block walk (#218).
+    #[must_use]
     pub fn resolve_method(&self, recv: TypeId, method: &crate::symbol::Symbol) -> Option<&FnSig> {
         self.methods.get(&(recv, method.clone()))
     }
@@ -546,6 +675,7 @@ impl ImmutableGlobalRegistry {
     /// decline than to attach the wrong identity. This is the registry-backed replacement for
     /// `GlobalAstEnv::struct_gids` (the same bare-name -> GID index the borrowed-AST env kept for
     /// `StructInit` annotation, with the same ambiguity policy) -- #219.
+    #[must_use]
     pub fn resolve_unique_nominal(&self, name: &crate::symbol::Symbol) -> Option<TypeId> {
         let mut found: Option<TypeId> = None;
         for by_name in self.module_indices.values() {
@@ -562,6 +692,7 @@ impl ImmutableGlobalRegistry {
     /// The precompiled flat-HIR body of the function identified by `gid`, if the registry carries one
     /// (i.e. it was deserialized from an artifact and the body was portable). `None` in a from-scratch
     /// compile, where bodies live in the per-worker streams instead (#220).
+    #[must_use]
     pub fn body_of(&self, gid: TypeId) -> Option<&FnBody> {
         self.bodies.get(&gid)
     }
@@ -623,6 +754,7 @@ impl ImmutableGlobalRegistry {
     /// imported artifact and deliberately removed — and from which table. Diagnostic paths consult
     /// this *before* reporting "undefined", so a poisoned name reports the ambiguity instead of
     /// sending the reader hunting for a missing import when the cause is a duplicate one (#294).
+    #[must_use]
     pub fn poisoned_reason(&self, name: &crate::symbol::Symbol) -> Option<PoisonKind> {
         if self.merge_state.poisoned_fns.contains(name) {
             return Some(PoisonKind::Function);
@@ -645,6 +777,7 @@ impl ImmutableGlobalRegistry {
     /// `resolve_unique_nominal` declines. Lets a diagnostic report "ambiguous across imported
     /// modules" instead of a misleading "unknown struct" when two artifacts both define the name
     /// (#291).
+    #[must_use]
     pub fn is_ambiguous_nominal(&self, name: &crate::symbol::Symbol) -> bool {
         let mut found: Option<TypeId> = None;
         for by_name in self.module_indices.values() {
@@ -664,6 +797,7 @@ impl ImmutableGlobalRegistry {
     /// `None` when the type is not a nominal struct form, the bare name is defined in several
     /// modules with distinct GIDs, or the registry has no entry -- the caller declines rather than
     /// guessing between same-named structs (#291).
+    #[must_use]
     pub fn struct_fields_of(&self, ty: &crate::syntax::Type) -> Option<&StructFields> {
         use crate::syntax::Type;
         let (name, attached) = match ty {
@@ -728,6 +862,11 @@ impl ModuleInterface for ImmutableGlobalRegistry {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use crate::gid::TypeId;
@@ -856,8 +995,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             err.contains("Infinite-sized recursive layout"),
-            "Got: {}",
-            err
+            "Got: {err}"
         );
     }
 
@@ -870,8 +1008,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             err.contains("Infinite-sized recursive layout detected in struct 'SelfRef'"),
-            "Got: {}",
-            err
+            "Got: {err}"
         );
     }
 
@@ -882,11 +1019,7 @@ mod tests {
         let result = ImmutableGlobalRegistry::build_and_validate(vec![a]);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            err.contains("Unresolved by-value dependency"),
-            "Got: {}",
-            err
-        );
+        assert!(err.contains("Unresolved by-value dependency"), "Got: {err}");
     }
 
     #[test]

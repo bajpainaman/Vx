@@ -52,7 +52,7 @@ fn which(tool: &str) -> Result<PathBuf, ()> {
         .arg("-c")
         .arg(format!("command -v {tool}"))
         .output()
-        .map_err(|_| ())?;
+        .map_err(|_sh_did_not_start| ())?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() {
         Err(())
@@ -68,7 +68,7 @@ fn which_in(dir: &Path, tool: &str) -> Option<PathBuf> {
 
 /// A topology whose `relaxed` edge has a visibility obligation. Whether it is coherent is exactly
 /// what the solver decides, so with no solver the answer is unknown -- not "fine".
-const RELAXED: &str = r#"Topology RelaxedTPU {
+const RELAXED: &str = r"Topology RelaxedTPU {
   memory: Memory::Local_SRAM
   transfer Memory::CPU_DRAM -> Memory::Local_SRAM : 5 relaxed
 }
@@ -79,7 +79,7 @@ fn main() -> i32 {
   }
   return 0;
 }
-"#;
+";
 
 fn write_program(tmp: &Path) -> PathBuf {
     std::fs::create_dir_all(tmp).expect("tmp");

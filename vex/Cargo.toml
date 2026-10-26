@@ -1,0 +1,32 @@
+#===- Cargo.toml - Vx Package Tool ------------------------------*- TOML -*-===#
+#
+# Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+# See LICENSE for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+#===----------------------------------------------------------------------===#
+[package]
+name = "vex"
+version = "0.0.3"
+edition = "2021"
+description = "Builds a Vx package and the packages it depends on."
+license = "Apache-2.0 WITH LLVM-exception"
+repository = "https://github.com/vx-lang/Vx"
+
+# Deliberately does not depend on `vxc`: this tool runs the compiler as a program, so it builds in
+# seconds and needs no LLVM.
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[[bin]]
+name = "vex"
+path = "src/main.rs"
+
+[lints]
+workspace = true

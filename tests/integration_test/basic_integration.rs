@@ -18,7 +18,7 @@ use vxc::parser::Parser;
 
 #[test]
 fn test_distributed_matmul_integration() -> Result<(), String> {
-    let input = r#"fn custom_matmul(a: Pinned<Tensor<f32, [?, ?]>, Topology::NPU[0]>, b: Pinned<Tensor<f32, [?, ?]>, Topology::NPU[0]>) on Topology::NPU[0] -> Pinned<Tensor<f32, [?, ?]>, Topology::NPU[0]> {
+    let input = r"fn custom_matmul(a: Pinned<Tensor<f32, [?, ?]>, Topology::NPU[0]>, b: Pinned<Tensor<f32, [?, ?]>, Topology::NPU[0]>) on Topology::NPU[0] -> Pinned<Tensor<f32, [?, ?]>, Topology::NPU[0]> {
     return a;
 }
 
@@ -30,7 +30,7 @@ fn distributed_matmul(a: Tensor<f32, [?, ?]>, b: Tensor<f32, [?, ?]>) -> Pinned<
         result
     }
 }
-    "#;
+    ";
 
     // 1. Lexing
     let mut lexer = Lexer::new(input);
@@ -63,7 +63,7 @@ fn distributed_matmul(a: Tensor<f32, [?, ?]>, b: Tensor<f32, [?, ?]>) -> Pinned<
 
     if checker.errors.error_count() > 0 {
         for err in &checker.errors {
-            println!("Semantic Error: {}", err);
+            println!("Semantic Error: {err}");
         }
     }
 
@@ -95,7 +95,12 @@ fn run_pipeline(input: &str) -> Result<vxc::syntax::Program, Vec<vxc::diagnostic
         .iter()
         .any(|d| d.level == vxc::diagnostic::DiagnosticLevel::Error);
 
-    if !has_errors {
+    if has_errors {
+        for err in &checker.errors {
+            println!("run_pipeline semantic error: {err}");
+        }
+        Err(checker.errors.inner)
+    } else {
         let monomorphized_ast = program;
         let module_syntaxes = std::collections::HashMap::new();
         let context = melior::Context::new();
@@ -112,24 +117,19 @@ fn run_pipeline(input: &str) -> Result<vxc::syntax::Program, Vec<vxc::diagnostic
         vxc::codegen::lower_to_llvm(&context, &mut module).unwrap();
         let _mlir_str = module.as_operation();
         Ok(monomorphized_ast)
-    } else {
-        for err in &checker.errors {
-            println!("run_pipeline semantic error: {}", err);
-        }
-        Err(checker.errors.inner)
     }
 }
 
 #[test]
 fn test_integration_operators() -> Result<(), String> {
-    let input = r#"
+    let input = r"
     fn math_ops() -> Tensor<f32, []> {
         let mut x = 10.0;
         let y = x * 5.0;
         x += y + 2.0;
         return x;
     }
-    "#;
+    ";
     if run_pipeline(input).is_err() {
         return Err("Assertion failed: run_pipeline(input).is_ok()".to_string());
     }
@@ -139,7 +139,7 @@ fn test_integration_operators() -> Result<(), String> {
 
 #[test]
 fn test_integration_loops() -> Result<(), String> {
-    let input = r#"
+    let input = r"
     fn loop_test() -> i32 {
         let mut sum = 0;
         for i in 0..10 {
@@ -147,7 +147,7 @@ fn test_integration_loops() -> Result<(), String> {
         }
         return sum;
     }
-    "#;
+    ";
     if run_pipeline(input).is_err() {
         return Err("Assertion failed: run_pipeline(input).is_ok()".to_string());
     }
@@ -157,13 +157,13 @@ fn test_integration_loops() -> Result<(), String> {
 
 #[test]
 fn test_integration_arrays_and_indexing() -> Result<(), String> {
-    let input = r#"
+    let input = r"
     fn array_test(a: Tensor<f32, [2, 2]>, b: Tensor<f32, [2, 2]>) -> Tensor<f32, [2, 2]> {
         let mut arr = Tensor<f32>(2, 2);
         arr[0][0] = a[0][1] * b[1][0];
         return arr;
     }
-    "#;
+    ";
     if run_pipeline(input).is_err() {
         return Err("Assertion failed: run_pipeline(input).is_ok()".to_string());
     }
@@ -173,12 +173,12 @@ fn test_integration_arrays_and_indexing() -> Result<(), String> {
 
 #[test]
 fn a_placed_tensor_round_trips_through_the_pipeline() -> Result<(), String> {
-    let input = r#"
+    let input = r"
     fn memory_test() -> Tensor<f32, [10], Memory::NPU_HBM> {
         let mut mem = Tensor<f32, [10], Memory::NPU_HBM>::uninit();
         return mem;
     }
-    "#;
+    ";
     if run_pipeline(input).is_err() {
         return Err("Assertion failed: run_pipeline(input).is_ok()".to_string());
     }
@@ -188,7 +188,7 @@ fn a_placed_tensor_round_trips_through_the_pipeline() -> Result<(), String> {
 
 #[test]
 fn test_integration_function_calls() -> Result<(), String> {
-    let input = r#"
+    let input = r"
     fn helper(x: Tensor<f32, []>) -> Tensor<f32, []> {
         return x + 1.0;
     }
@@ -198,7 +198,7 @@ fn test_integration_function_calls() -> Result<(), String> {
         let _z = helper(y);
         return 0;
     }
-    "#;
+    ";
     if run_pipeline(input).is_err() {
         return Err("Assertion failed: run_pipeline(input).is_ok()".to_string());
     }
@@ -208,14 +208,14 @@ fn test_integration_function_calls() -> Result<(), String> {
 
 #[test]
 fn test_integration_logical_ops() -> Result<(), String> {
-    let input = r#"
+    let input = r"
     fn logic_test(a: Tensor<f32, []>, b: Tensor<f32, []>) -> Tensor<f32, []> {
         let is_less = a < b;
         let is_eq = a == b;
         let c = is_less && is_eq;
         return a;
     }
-    "#;
+    ";
     if run_pipeline(input).is_err() {
         return Err("Assertion failed: run_pipeline(input).is_ok()".to_string());
     }
@@ -225,7 +225,7 @@ fn test_integration_logical_ops() -> Result<(), String> {
 
 #[test]
 fn test_integration_linear_variable_consumption() -> Result<(), String> {
-    let input = r#"
+    let input = r"
     fn helper(t: Tensor<f32, [2, 2]>) -> Tensor<f32, [2, 2]> {
         return t;
     }
@@ -243,7 +243,7 @@ fn test_integration_linear_variable_consumption() -> Result<(), String> {
 
         return 0;
     }
-    "#;
+    ";
     if run_pipeline(input).is_err() {
         return Err("Assertion failed: run_pipeline(input).is_ok()".to_string());
     }

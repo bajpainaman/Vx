@@ -16,7 +16,8 @@ use crate::bytecode::{HirInstruction, Opcode, Register, TypeIdx};
 use crate::gid::{deserialize_metadata_symbols, serialize_metadata_symbols, TypeId};
 use crate::layout::{FieldLayout, FieldTy};
 use crate::registry::{
-    FnBody, FnSig, ImmutableGlobalRegistry, LayoutNameIndex, StructFields, TypeDefinition,
+    FnBody, FnSig, ImmutableGlobalRegistry, LayoutNameIndex, MergeState, StructFields,
+    TypeDefinition,
 };
 use crate::symbol::Symbol;
 use crate::syntax::{Dim, ElementType, Expr, MemorySpace, Placement, Topology, Type};
@@ -28,7 +29,7 @@ use std::path::Path;
 
 /// Represents the serialized metadata dictionary for a specific module/crate.
 pub struct VxMetadata<'a> {
-    /// The zero-copy slice of 256-bit TypeIds directly mapped from the file buffer
+    /// The zero-copy slice of 256-bit `TypeIds` directly mapped from the file buffer
     pub type_dictionary: &'a [TypeId],
     /// The serialized **module interface** that trails the type dictionary: the registry-backed
     /// import oracle (`serialize_registry_interface`), not AST. A downstream compile resolves against
@@ -39,6 +40,10 @@ pub struct VxMetadata<'a> {
 
 impl<'a> VxMetadata<'a> {
     /// Save the fully deduplicated Type Dictionary to disk (no interface section).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file cannot be created or written.
     pub fn save_to_file(type_dictionary: &[TypeId], path: &Path) -> io::Result<()> {
         let file = fs::File::create(path)?;
         let mut writer = io::BufWriter::new(file);
@@ -51,6 +56,10 @@ impl<'a> VxMetadata<'a> {
     /// Save the type dictionary followed by a serialized module interface (`interface_bytes`, from
     /// [`serialize_registry_interface`]). `load_from_buffer` returns the interface bytes as
     /// `interface_data`, which [`deserialize_registry_interface`] turns back into a queryable registry.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file cannot be created or written.
     pub fn save_with_interface(
         type_dictionary: &[TypeId],
         interface_bytes: &[u8],
@@ -66,6 +75,7 @@ impl<'a> VxMetadata<'a> {
     /// Load the Type Dictionary directly from disk using a Zero-Copy memory cast.
     /// This requires the caller to own the `[u8]` backing buffer, returning
     /// a struct containing slice references mapped over that buffer.
+    #[must_use]
     pub fn load_from_buffer(buffer: &'a [u8]) -> Self {
         let (type_dictionary, interface_data) = deserialize_metadata_symbols(buffer);
         Self {
@@ -137,6 +147,11 @@ impl<'a> Reader<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
+    /// Takes the next `n` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Fails when fewer than `n` bytes are left.
     fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
         let end = self
             .pos
@@ -147,21 +162,59 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(s)
     }
+    /// Reads one byte.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the buffer has ended.
     fn u8(&mut self) -> Result<u8, String> {
         Ok(self.take(1)?[0])
     }
+    /// Reads a little-endian `u64`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when fewer than 8 bytes are left.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: `take(8)` returns exactly 8 bytes.
     fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
+    /// Reads a `u64` that is a count, a size or an index.
+    ///
+    /// # Errors
+    ///
+    /// Fails when fewer than 8 bytes are left, or when the number does not fit in `usize`.
+    fn usize(&mut self) -> Result<usize, String> {
+        let n = self.u64()?;
+        usize::try_from(n).map_err(|e| format!("vxlib: {n} does not fit in usize: {e}"))
+    }
+    /// Reads a length, then that many bytes.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the buffer ends early.
     fn bytes(&mut self) -> Result<&'a [u8], String> {
-        let n = self.u64()? as usize;
+        let n = self.usize()?;
         self.take(n)
     }
+    /// Reads a string that was written with its length in front.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the buffer ends early or the string is not UTF-8.
     fn sym(&mut self) -> Result<crate::symbol::Symbol, String> {
         let b = self.bytes()?;
         let s = std::str::from_utf8(b).map_err(|e| format!("vxlib: bad utf-8 symbol: {e}"))?;
         Ok(crate::symbol::Symbol::from(s))
     }
+    /// Reads the four words of a `TypeId`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the buffer ends early.
     fn typeid(&mut self) -> Result<TypeId, String> {
         let mut words = [0u64; 4];
         for w in &mut words {
@@ -172,7 +225,10 @@ impl<'a> Reader<'a> {
 }
 
 fn write_element_type(w: &mut Writer, e: &ElementType) {
-    use ElementType::*;
+    use ElementType::{
+        Bool, Generic, USize, BF16, F16, F32, F4E2M1, F64, F8E4M3, F8E5M2, I128, I16, I32, I4, I64,
+        I8, U128, U16, U32, U4, U64, U8,
+    };
     let tag: u8 = match e {
         F16 => 0,
         F32 => 1,
@@ -204,8 +260,16 @@ fn write_element_type(w: &mut Writer, e: &ElementType) {
     }
 }
 
-fn read_element_type(r: &mut Reader) -> Result<ElementType, String> {
-    use ElementType::*;
+/// Reads what `write_element_type` wrote.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_element_type(r: &mut Reader<'_>) -> Result<ElementType, String> {
+    use ElementType::{
+        Bool, Generic, USize, BF16, F16, F32, F4E2M1, F64, F8E4M3, F8E5M2, I128, I16, I32, I4, I64,
+        I8, U128, U16, U32, U4, U64, U8,
+    };
     Ok(match r.u8()? {
         0 => F16,
         1 => F32,
@@ -257,18 +321,23 @@ fn write_field_ty(w: &mut Writer, ty: &FieldTy) {
     }
 }
 
-fn read_field_ty(r: &mut Reader) -> Result<FieldTy, String> {
+/// Reads what `write_field_ty` wrote.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_field_ty(r: &mut Reader<'_>) -> Result<FieldTy, String> {
     Ok(match r.u8()? {
         0 => FieldTy::Scalar(read_element_type(r)?),
         1 => FieldTy::Nominal(r.typeid()?),
         2 => FieldTy::Opaque,
         3 => {
             let e = read_element_type(r)?;
-            FieldTy::Tensor(e, r.u64()? as usize)
+            FieldTy::Tensor(e, r.usize()?)
         }
         4 => {
             let e = read_element_type(r)?;
-            FieldTy::Vector(e, r.u64()? as usize)
+            FieldTy::Vector(e, r.usize()?)
         }
         t => return Err(format!("vxlib: bad FieldTy tag {t}")),
     })
@@ -292,17 +361,22 @@ fn write_type_definition(w: &mut Writer, def: &TypeDefinition) {
     }
 }
 
-fn read_type_definition(r: &mut Reader) -> Result<TypeDefinition, String> {
+/// Reads what `write_type_definition` wrote.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_type_definition(r: &mut Reader<'_>) -> Result<TypeDefinition, String> {
     let id = r.typeid()?;
     let name = r.sym()?.to_string();
-    let size_bytes = r.u64()? as usize;
-    let align_bytes = r.u64()? as usize;
-    let n_fields = r.u64()? as usize;
+    let size_bytes = r.usize()?;
+    let align_bytes = r.usize()?;
+    let n_fields = r.usize()?;
     let mut fields = Vec::with_capacity(n_fields);
     for _ in 0..n_fields {
         let fname = r.sym()?;
-        let offset = r.u64()? as usize;
-        let size = r.u64()? as usize;
+        let offset = r.usize()?;
+        let size = r.usize()?;
         let ty = read_field_ty(r)?;
         fields.push(FieldLayout {
             name: fname,
@@ -311,7 +385,7 @@ fn read_type_definition(r: &mut Reader) -> Result<TypeDefinition, String> {
             ty,
         });
     }
-    let n_deps = r.u64()? as usize;
+    let n_deps = r.usize()?;
     let mut by_value_dependencies = Vec::with_capacity(n_deps);
     for _ in 0..n_deps {
         by_value_dependencies.push(r.typeid()?);
@@ -326,7 +400,7 @@ fn read_type_definition(r: &mut Reader) -> Result<TypeDefinition, String> {
     })
 }
 
-fn write_opt_typeid(w: &mut Writer, id: &Option<TypeId>) {
+fn write_opt_typeid(w: &mut Writer, id: Option<&TypeId>) {
     match id {
         None => w.u8(0),
         Some(t) => {
@@ -336,7 +410,12 @@ fn write_opt_typeid(w: &mut Writer, id: &Option<TypeId>) {
     }
 }
 
-fn read_opt_typeid(r: &mut Reader) -> Result<Option<TypeId>, String> {
+/// Reads what `write_opt_typeid` wrote.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_opt_typeid(r: &mut Reader<'_>) -> Result<Option<TypeId>, String> {
     Ok(match r.u8()? {
         0 => None,
         1 => Some(r.typeid()?),
@@ -345,7 +424,7 @@ fn read_opt_typeid(r: &mut Reader) -> Result<Option<TypeId>, String> {
 }
 
 fn write_memory_space(w: &mut Writer, m: &MemorySpace) {
-    use MemorySpace::*;
+    use MemorySpace::{Custom, GpuHbm, LocalSRAM, NicRam, RemoteHbm, CPUDRAM, NPUHBM};
     match m {
         CPUDRAM => w.u8(0),
         NPUHBM => w.u8(1),
@@ -360,8 +439,13 @@ fn write_memory_space(w: &mut Writer, m: &MemorySpace) {
     }
 }
 
-fn read_memory_space(r: &mut Reader) -> Result<MemorySpace, String> {
-    use MemorySpace::*;
+/// Reads what `write_memory_space` wrote.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_memory_space(r: &mut Reader<'_>) -> Result<MemorySpace, String> {
+    use MemorySpace::{Custom, GpuHbm, LocalSRAM, NicRam, RemoteHbm, CPUDRAM, NPUHBM};
     Ok(match r.u8()? {
         0 => CPUDRAM,
         1 => NPUHBM,
@@ -374,7 +458,7 @@ fn read_memory_space(r: &mut Reader) -> Result<MemorySpace, String> {
     })
 }
 
-fn write_opt_memory_space(w: &mut Writer, o: &Option<MemorySpace>) {
+fn write_opt_memory_space(w: &mut Writer, o: Option<&MemorySpace>) {
     match o {
         None => w.u8(0),
         Some(m) => {
@@ -384,7 +468,12 @@ fn write_opt_memory_space(w: &mut Writer, o: &Option<MemorySpace>) {
     }
 }
 
-fn read_opt_memory_space(r: &mut Reader) -> Result<Option<MemorySpace>, String> {
+/// Reads what `write_opt_memory_space` wrote.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_opt_memory_space(r: &mut Reader<'_>) -> Result<Option<MemorySpace>, String> {
     Ok(match r.u8()? {
         0 => None,
         1 => Some(read_memory_space(r)?),
@@ -400,8 +489,13 @@ fn read_opt_memory_space(r: &mut Reader) -> Result<Option<MemorySpace>, String> 
 /// else joins the `Err` group, since a device chosen at run time is not an interface fact. The
 /// format tag is bumped alongside, so an artifact written before this is detected as stale rather
 /// than read as `GPU[0]` followed by whatever came next.
+///
+/// # Errors
+///
+/// Fails for a topology that carries a dimension expression, and for a `GPU` whose device
+/// index is not an integer literal.
 fn write_topology(w: &mut Writer, t: &Topology) -> Result<(), String> {
-    use Topology::*;
+    use Topology::{AccCore, CpuAvx512, CpuNeon, Current, Custom, Slice, AMX, ANE, CPU, GPU, NPU};
     match t {
         CPU => w.u8(0),
         AMX => w.u8(1),
@@ -410,12 +504,11 @@ fn write_topology(w: &mut Writer, t: &Topology) -> Result<(), String> {
             let Expr::Number(n) = &**e else {
                 return Err("vxlib: GPU device index is not a literal".into());
             };
-            let idx: i64 = n
-                .value
-                .parse()
-                .map_err(|_| "vxlib: GPU device index is not an integer".to_string())?;
+            let idx: i64 = n.value.parse().map_err(|_not_an_integer| {
+                "vxlib: GPU device index is not an integer".to_string()
+            })?;
             w.u8(3);
-            w.u64(idx as u64);
+            w.u64(idx.cast_unsigned());
         }
         CpuAvx512 => w.u8(4),
         CpuNeon => w.u8(5),
@@ -433,13 +526,18 @@ fn write_topology(w: &mut Writer, t: &Topology) -> Result<(), String> {
     Ok(())
 }
 
-fn read_topology(r: &mut Reader) -> Result<Topology, String> {
-    use Topology::*;
+/// Reads what `write_topology` wrote.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_topology(r: &mut Reader<'_>) -> Result<Topology, String> {
+    use Topology::{CpuAvx512, CpuNeon, Current, Custom, AMX, ANE, CPU};
     Ok(match r.u8()? {
         0 => CPU,
         1 => AMX,
         2 => ANE,
-        3 => Topology::gpu(r.u64()? as i64),
+        3 => Topology::gpu(r.u64()?.cast_signed()),
         4 => CpuAvx512,
         5 => CpuNeon,
         6 => Current,
@@ -448,7 +546,12 @@ fn read_topology(r: &mut Reader) -> Result<Topology, String> {
     })
 }
 
-fn write_opt_placement(w: &mut Writer, o: &Option<Placement>) -> Result<(), String> {
+/// Writes a 0 byte for no placement, or a 1 byte, the topology and the memory space.
+///
+/// # Errors
+///
+/// Fails when [`write_topology`] cannot write the topology.
+fn write_opt_placement(w: &mut Writer, o: Option<&Placement>) -> Result<(), String> {
     match o {
         None => w.u8(0),
         Some(p) => {
@@ -460,7 +563,12 @@ fn write_opt_placement(w: &mut Writer, o: &Option<Placement>) -> Result<(), Stri
     Ok(())
 }
 
-fn read_opt_placement(r: &mut Reader) -> Result<Option<Placement>, String> {
+/// Reads what `write_opt_placement` wrote.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_opt_placement(r: &mut Reader<'_>) -> Result<Option<Placement>, String> {
     Ok(match r.u8()? {
         0 => None,
         1 => {
@@ -477,8 +585,17 @@ fn read_opt_placement(r: &mut Reader) -> Result<Option<Placement>, String> {
 /// Encode a `syntax::Type`. The closed variants round-trip faithfully; the `Expr`-bearing paths
 /// (a tensor with symbolic dimensions, `Const`, `Module`) return `Err` so the caller can skip the
 /// enclosing signature rather than write a lossy type. See the module header.
+///
+/// # Errors
+///
+/// Fails when the type, or a type inside it, cannot be written yet: a tensor dimension that
+/// is not `?` or a literal, a `Const` or `Module` type, or a topology that
+/// [`write_topology`] refuses.
 fn write_type(w: &mut Writer, ty: &Type) -> Result<(), String> {
-    use Type::*;
+    use Type::{
+        Borrow, Closure, Const, Enum, Function, Generic, GenericInstance, Matrix, Module, Pinned,
+        Pointer, Ref, Scalar, Simd, Struct, Tensor, Unknown, Verified,
+    };
     match ty {
         Scalar(e) => {
             w.u8(0);
@@ -487,18 +604,55 @@ fn write_type(w: &mut Writer, ty: &Type) -> Result<(), String> {
         Struct(name, id) => {
             w.u8(1);
             w.sym(name);
-            write_opt_typeid(w, id);
+            write_opt_typeid(w, id.as_ref());
         }
         Enum(name, id) => {
             w.u8(2);
             w.sym(name);
-            write_opt_typeid(w, id);
+            write_opt_typeid(w, id.as_ref());
         }
         Generic(name, id) => {
             w.u8(3);
             w.sym(name);
-            write_opt_typeid(w, id);
+            write_opt_typeid(w, id.as_ref());
         }
+        Ref(..)
+        | Pointer(..)
+        | Borrow { .. }
+        | Pinned(..)
+        | Verified(..)
+        | GenericInstance(..)
+        | Function(..)
+        | Closure(..) => write_compound_type(w, ty)?,
+        Simd(e, n) => {
+            w.u8(12);
+            write_element_type(w, e);
+            w.u64(*n as u64);
+        }
+        Matrix => w.u8(13),
+        Unknown => w.u8(14),
+        // A dimension is `?` or a literal. A const-generic name or an arithmetic dimension
+        // belongs to a template, and a template is not an interface.
+        Tensor(e, dims, top) => write_tensor_type(w, e, dims, top.as_ref())?,
+        Const(_) => return Err("vxlib: const-expression type not yet serializable".into()),
+        Module(_, _) => return Err("vxlib: module type not serializable".into()),
+    }
+    Ok(())
+}
+
+/// Writes the types that are built from other types: references, pointers, borrows,
+/// generic instances, functions and closures. The rest of [`write_type`].
+///
+/// # Errors
+///
+/// Fails when a type inside this one cannot be written. See [`write_type`].
+///
+/// # Panics
+///
+/// Panics when given any other kind of type. [`write_type`] never sends one.
+fn write_compound_type(w: &mut Writer, ty: &Type) -> Result<(), String> {
+    use Type::{Borrow, Closure, Function, GenericInstance, Pinned, Pointer, Ref, Verified};
+    match ty {
         Ref(inner, mem) => {
             w.u8(4);
             write_type(w, inner)?;
@@ -507,8 +661,8 @@ fn write_type(w: &mut Writer, ty: &Type) -> Result<(), String> {
         Pointer(inner, mem, is_mut) => {
             w.u8(5);
             write_type(w, inner)?;
-            write_opt_placement(w, mem)?;
-            w.u8(*is_mut as u8);
+            write_opt_placement(w, mem.as_ref())?;
+            w.u8(u8::from(*is_mut));
         }
         Borrow {
             inner,
@@ -518,8 +672,8 @@ fn write_type(w: &mut Writer, ty: &Type) -> Result<(), String> {
         } => {
             w.u8(6);
             write_type(w, inner)?;
-            write_opt_memory_space(w, mem_space);
-            w.u8(*is_mut as u8);
+            write_opt_memory_space(w, mem_space.as_ref());
+            w.u8(u8::from(*is_mut));
             w.u64(*region_id as u64);
         }
         Pinned(inner, top) => {
@@ -534,65 +688,79 @@ fn write_type(w: &mut Writer, ty: &Type) -> Result<(), String> {
         GenericInstance(base, args) => {
             w.u8(9);
             write_type(w, base)?;
-            w.u64(args.len() as u64);
-            for a in args {
-                write_type(w, a)?;
-            }
+            write_type_list(w, args)?;
         }
         Function(params, ret, unsafe_fn) => {
             w.u8(10);
             w.u8(u8::from(*unsafe_fn));
-            w.u64(params.len() as u64);
-            for p in params {
-                write_type(w, p)?;
-            }
+            write_type_list(w, params)?;
             write_type(w, ret)?;
         }
         Closure(params, ret) => {
             w.u8(11);
-            w.u64(params.len() as u64);
-            for p in params {
-                write_type(w, p)?;
-            }
+            write_type_list(w, params)?;
             write_type(w, ret)?;
         }
-        Simd(e, n) => {
-            w.u8(12);
-            write_element_type(w, e);
-            w.u64(*n as u64);
-        }
-        Matrix => w.u8(13),
-        Unknown => w.u8(14),
-        // A dimension is `?` or a literal. A const-generic name or an arithmetic dimension
-        // belongs to a template, and a template is not an interface.
-        Tensor(e, dims, top) => {
-            w.u8(15);
-            write_element_type(w, e);
-            write_opt_placement(w, top)?;
-            w.u64(dims.len() as u64);
-            for d in dims {
-                match d {
-                    Dim::Dyn => w.u8(0),
-                    Dim::Static(_) => {
-                        let Some(v) = d.literal() else {
-                            return Err("vxlib: tensor type with dimension expressions not \
-                                        serializable"
-                                .into());
-                        };
-                        w.u8(1);
-                        w.sym(v);
-                    }
-                }
-            }
-        }
-        Const(_) => return Err("vxlib: const-expression type not yet serializable".into()),
-        Module(_, _) => return Err("vxlib: module type not serializable".into()),
+        _ => unreachable!("write_type sends only types built from other types"),
     }
     Ok(())
 }
 
-fn read_type(r: &mut Reader) -> Result<Type, String> {
-    use Type::*;
+/// Writes how many types there are, then each type.
+///
+/// # Errors
+///
+/// Fails when one of the types cannot be written. See [`write_type`].
+fn write_type_list(w: &mut Writer, types: &[Type]) -> Result<(), String> {
+    w.u64(types.len() as u64);
+    for t in types {
+        write_type(w, t)?;
+    }
+    Ok(())
+}
+
+/// Writes a tensor type: tag 15, the element type, the placement and the dimensions.
+///
+/// # Errors
+///
+/// Fails when a dimension is not `?` or a literal, or the placement cannot be written.
+fn write_tensor_type(
+    w: &mut Writer,
+    e: &ElementType,
+    dims: &[Dim],
+    top: Option<&Placement>,
+) -> Result<(), String> {
+    w.u8(15);
+    write_element_type(w, e);
+    write_opt_placement(w, top)?;
+    w.u64(dims.len() as u64);
+    for d in dims {
+        match d {
+            Dim::Dyn => w.u8(0),
+            Dim::Static(_) => {
+                let Some(v) = d.literal() else {
+                    return Err("vxlib: tensor type with dimension expressions not \
+                                serializable"
+                        .into());
+                };
+                w.u8(1);
+                w.sym(v);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads what `write_type` wrote.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_type(r: &mut Reader<'_>) -> Result<Type, String> {
+    use Type::{
+        Closure, Enum, Function, Generic, GenericInstance, Matrix, Pinned, Pointer, Ref, Scalar,
+        Simd, Struct, Unknown, Verified,
+    };
     Ok(match r.u8()? {
         0 => Scalar(read_element_type(r)?),
         1 => Struct(r.sym()?, read_opt_typeid(r)?),
@@ -608,18 +776,7 @@ fn read_type(r: &mut Reader) -> Result<Type, String> {
             let is_mut = r.u8()? != 0;
             Pointer(inner, mem, is_mut)
         }
-        6 => {
-            let inner = Box::new(read_type(r)?);
-            let mem_space = read_opt_memory_space(r)?;
-            let is_mut = r.u8()? != 0;
-            let region_id = r.u64()? as usize;
-            Borrow {
-                inner,
-                mem_space,
-                is_mut,
-                region_id,
-            }
-        }
+        6 => read_borrow_type(r)?,
         7 => {
             let inner = Box::new(read_type(r)?);
             Pinned(inner, read_topology(r)?)
@@ -627,66 +784,102 @@ fn read_type(r: &mut Reader) -> Result<Type, String> {
         8 => Verified(Box::new(read_type(r)?)),
         9 => {
             let base = Box::new(read_type(r)?);
-            let n = r.u64()? as usize;
-            let mut args = Vec::with_capacity(n);
-            for _ in 0..n {
-                args.push(read_type(r)?);
-            }
+            let args = read_type_list(r)?;
             GenericInstance(base, args)
         }
         10 => {
             let unsafe_fn = r.u8()? != 0;
-            let n = r.u64()? as usize;
-            let mut params = Vec::with_capacity(n);
-            for _ in 0..n {
-                params.push(read_type(r)?);
-            }
+            let params = read_type_list(r)?;
             let ret = Box::new(read_type(r)?);
             Function(params, ret, unsafe_fn)
         }
         11 => {
-            let n = r.u64()? as usize;
-            let mut params = Vec::with_capacity(n);
-            for _ in 0..n {
-                params.push(read_type(r)?);
-            }
+            let params = read_type_list(r)?;
             let ret = Box::new(read_type(r)?);
             Closure(params, ret)
         }
-        12 => Simd(read_element_type(r)?, r.u64()? as usize),
+        12 => Simd(read_element_type(r)?, r.usize()?),
         13 => Matrix,
         14 => Unknown,
-        15 => {
-            let e = read_element_type(r)?;
-            let top = read_opt_placement(r)?;
-            let n = r.u64()? as usize;
-            let mut dims = Vec::with_capacity(n);
-            for _ in 0..n {
-                dims.push(match r.u8()? {
-                    0 => Dim::Dyn,
-                    1 => Dim::Static(crate::syntax::Expr::Number(crate::syntax::NumberExpr::new(
-                        r.sym()?.as_ref().to_string(),
-                        Some(ElementType::I32),
-                        crate::syntax::Span::default(),
-                    ))),
-                    t => return Err(format!("vxlib: bad Dim tag {t}")),
-                });
-            }
-            Tensor(e, dims, top)
-        }
+        15 => read_tensor_type(r)?,
         t => return Err(format!("vxlib: bad Type tag {t}")),
     })
 }
 
+/// Reads what `write_type_list` wrote: a count, then that many types.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_type_list(r: &mut Reader<'_>) -> Result<Vec<Type>, String> {
+    let n = r.usize()?;
+    let mut types = Vec::with_capacity(n);
+    for _ in 0..n {
+        types.push(read_type(r)?);
+    }
+    Ok(types)
+}
+
+/// Reads the rest of a borrow type, after its tag.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_borrow_type(r: &mut Reader<'_>) -> Result<Type, String> {
+    let inner = Box::new(read_type(r)?);
+    let mem_space = read_opt_memory_space(r)?;
+    let is_mut = r.u8()? != 0;
+    let region_id = r.usize()?;
+    Ok(Type::Borrow {
+        inner,
+        mem_space,
+        is_mut,
+        region_id,
+    })
+}
+
+/// Reads the rest of a tensor type, after its tag.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_tensor_type(r: &mut Reader<'_>) -> Result<Type, String> {
+    let e = read_element_type(r)?;
+    let top = read_opt_placement(r)?;
+    let n = r.usize()?;
+    let mut dims = Vec::with_capacity(n);
+    for _ in 0..n {
+        dims.push(match r.u8()? {
+            0 => Dim::Dyn,
+            1 => Dim::Static(crate::syntax::Expr::Number(crate::syntax::NumberExpr::new(
+                r.sym()?.as_ref().to_string(),
+                Some(ElementType::I32),
+                crate::syntax::Span::default(),
+            ))),
+            t => return Err(format!("vxlib: bad Dim tag {t}")),
+        });
+    }
+    Ok(Type::Tensor(e, dims, top))
+}
+
 fn write_hir_instruction(w: &mut Writer, ins: &HirInstruction) {
-    w.u64(ins.opcode as u32 as u64);
-    w.u64(ins.operand1.0 as u64);
-    w.u64(ins.operand2.0 as u64);
-    w.u64(ins.type_idx.0 as u64);
+    w.u64(u64::from(ins.opcode as u32));
+    w.u64(u64::from(ins.operand1.0));
+    w.u64(u64::from(ins.operand2.0));
+    w.u64(u64::from(ins.type_idx.0));
     w.u64(ins.imm);
 }
 
-fn read_hir_instruction(r: &mut Reader) -> Result<HirInstruction, String> {
+/// Reads what `write_hir_instruction` wrote.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or the opcode number is not a known opcode.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "write_hir_instruction stores a u32 in each slot, so nothing is cut off"
+)]
+fn read_hir_instruction(r: &mut Reader<'_>) -> Result<HirInstruction, String> {
     let opcode_raw = r.u64()?;
     let opcode = u32::try_from(opcode_raw)
         .ok()
@@ -708,8 +901,13 @@ fn read_hir_instruction(r: &mut Reader) -> Result<HirInstruction, String> {
 /// Encode a function body. Returns `Err` if the signature or any type-stream GID isn't portable
 /// (an unencodable return/param type, or a per-compilation deferred generic GID) -- the caller then
 /// skips it, so `body_of` declines rather than linking a body it can't resolve.
+///
+/// # Errors
+///
+/// Fails when the body holds a deferred GID, or a parameter or return type cannot be
+/// written. See [`write_type`].
 fn write_fn_body(w: &mut Writer, gid: &TypeId, body: &FnBody) -> Result<(), String> {
-    if body.types.iter().any(|t| t.is_local_deferred()) {
+    if body.types.iter().any(super::gid::TypeId::is_local_deferred) {
         return Err("vxlib: body carries a deferred (generic-instantiation) GID".into());
     }
     let mut sig = Writer::new();
@@ -735,21 +933,26 @@ fn write_fn_body(w: &mut Writer, gid: &TypeId, body: &FnBody) -> Result<(), Stri
     Ok(())
 }
 
-fn read_fn_body(r: &mut Reader) -> Result<(TypeId, FnBody), String> {
+/// Reads what `write_fn_body` wrote.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_fn_body(r: &mut Reader<'_>) -> Result<(TypeId, FnBody), String> {
     let gid = r.typeid()?;
     let name = r.sym()?;
-    let n_params = r.u64()? as usize;
+    let n_params = r.usize()?;
     let mut params = Vec::with_capacity(n_params);
     for _ in 0..n_params {
         params.push(read_type(r)?);
     }
     let ret_ty = read_type(r)?;
-    let n_hir = r.u64()? as usize;
+    let n_hir = r.usize()?;
     let mut hir = Vec::with_capacity(n_hir);
     for _ in 0..n_hir {
         hir.push(read_hir_instruction(r)?);
     }
-    let n_types = r.u64()? as usize;
+    let n_types = r.usize()?;
     let mut types = Vec::with_capacity(n_types);
     for _ in 0..n_types {
         types.push(r.typeid()?);
@@ -770,6 +973,10 @@ fn read_fn_body(r: &mut Reader) -> Result<(TypeId, FnBody), String> {
 /// type, the return type, then the 1-byte return-provenance code (#265 step 7). `Err` (with the codec's
 /// reason) if any param or the return type is not encodable yet, so the caller skips the whole
 /// signature — fail-closed, matching the body codec — and can report *why* it was dropped (#292).
+///
+/// # Errors
+///
+/// Fails when a parameter or the return type cannot be written. See [`write_type`].
 fn encode_sig_record(sig: &FnSig) -> Result<Vec<u8>, String> {
     let mut rec = Writer::new();
     rec.u64(sig.params.len() as u64);
@@ -782,12 +989,18 @@ fn encode_sig_record(sig: &FnSig) -> Result<Vec<u8>, String> {
     Ok(rec.buf)
 }
 
+/// What [`read_sig_record`] returns: the parameter types, the return type, the
+/// return-provenance code, and whether the function is `unsafe`.
+type SigRecord = (Vec<Type>, Type, u8, bool);
+
 /// Decode the payload written by [`encode_sig_record`] — params, return type, provenance code. The
 /// caller reads the name/gid/receiver that precede it.
-fn read_sig_record(
-    r: &mut Reader,
-) -> Result<(Vec<crate::syntax::Type>, crate::syntax::Type, u8, bool), String> {
-    let n_params = r.u64()? as usize;
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_sig_record(r: &mut Reader<'_>) -> Result<SigRecord, String> {
+    let n_params = r.usize()?;
     let mut params = Vec::new();
     for _ in 0..n_params {
         params.push(read_type(r)?);
@@ -801,7 +1014,9 @@ fn read_sig_record(
 /// One table's encode/skip accounting for a `serialize_registry_interface` run (#292).
 #[derive(Debug)]
 pub struct TableReport {
+    /// The name of the table, such as `fn_sigs`.
     pub table: &'static str,
+    /// How many entries were written.
     pub encoded: usize,
     /// Each fail-closed skip: the entry's display name and the codec error that excluded it.
     pub skipped: Vec<(String, String)>,
@@ -814,10 +1029,13 @@ pub struct TableReport {
 /// driver prints under the "Wrote module interface" line.
 #[derive(Debug)]
 pub struct InterfaceEmitReport {
+    /// One report for each table that can skip an entry.
     pub tables: Vec<TableReport>,
 }
 
 impl InterfaceEmitReport {
+    /// How many entries were skipped, over all tables.
+    #[must_use]
     pub fn total_skipped(&self) -> usize {
         self.tables.iter().map(|t| t.skipped.len()).sum()
     }
@@ -831,7 +1049,7 @@ impl std::fmt::Display for InterfaceEmitReport {
             .map(|t| format!("{} {}/{}", t.table, t.encoded, t.encoded + t.skipped.len()))
             .collect::<Vec<_>>()
             .join("  ");
-        write!(f, "  {}", counts)?;
+        write!(f, "  {counts}")?;
         match self.total_skipped() {
             0 => write!(f, "  (nothing skipped)")?,
             n => write!(
@@ -850,24 +1068,8 @@ impl std::fmt::Display for InterfaceEmitReport {
     }
 }
 
-/// Serialize the frozen registry's import-oracle interface to a versioned byte buffer. Covers the
-/// identity (`module_indices`), structural-layout (`layouts`), signature (`fn_sigs` / `methods`), and
-/// flat-HIR-body (`bodies`) tables. Keys are sorted so the output is byte-reproducible for the same
-/// registry.
-pub fn serialize_registry_interface(reg: &ImmutableGlobalRegistry) -> Vec<u8> {
-    serialize_registry_interface_reporting(reg).0
-}
-
-/// [`serialize_registry_interface`] plus the per-table encoded/skipped accounting, so the emit path
-/// can surface an incomplete artifact at produce time instead of letting it fail later, elsewhere,
-/// as a "not found" (#292).
-pub fn serialize_registry_interface_reporting(
-    reg: &ImmutableGlobalRegistry,
-) -> (Vec<u8>, InterfaceEmitReport) {
-    let mut w = Writer::new();
-    w.buf.extend_from_slice(VXLIB_MAGIC);
-    w.u64(crate::hash::compute_module_hash(VXLIB_FORMAT_TAG));
-
+/// Writes the table that maps each module's names to type ids.
+fn write_module_indices(w: &mut Writer, reg: &ImmutableGlobalRegistry) {
     // module_indices: sorted by module hash, then by symbol name, for a deterministic artifact.
     let mut modules: Vec<(&u64, &FxHashMap<crate::symbol::Symbol, TypeId>)> =
         reg.module_indices.iter().collect();
@@ -883,15 +1085,21 @@ pub fn serialize_registry_interface_reporting(
             w.typeid(gid);
         }
     }
+}
 
+/// Writes the layout of every type.
+fn write_layouts(w: &mut Writer, reg: &ImmutableGlobalRegistry) {
     // layouts: sorted by GID words.
     let mut defs: Vec<&TypeDefinition> = reg.layouts.values().collect();
     defs.sort_by_key(|d| d.id.words);
     w.u64(defs.len() as u64);
     for def in defs {
-        write_type_definition(&mut w, def);
+        write_type_definition(w, def);
     }
+}
 
+/// Writes the function signatures, and reports the ones it skipped.
+fn write_fn_sigs(w: &mut Writer, reg: &ImmutableGlobalRegistry) -> TableReport {
     // fn_sigs: sorted by name. A signature whose return type isn't encodable yet is skipped, so the
     // count is written after the entries are built (see the module header).
     let mut fns: Vec<(&Symbol, &FnSig)> = reg.fn_sigs.iter().collect();
@@ -919,7 +1127,11 @@ pub fn serialize_registry_interface_reporting(
     }
     w.u64(n);
     w.buf.extend_from_slice(&sub.buf);
+    fn_report
+}
 
+/// Writes the method signatures, and reports the ones it skipped.
+fn write_methods(w: &mut Writer, reg: &ImmutableGlobalRegistry) -> TableReport {
     // methods: sorted by (receiver GID, method name). Same skip-on-unencodable-return policy.
     let mut meths: Vec<(&(TypeId, Symbol), &FnSig)> = reg.methods.iter().collect();
     meths.sort_by(|a, b| a.0 .0.words.cmp(&b.0 .0.words).then(a.0 .1.cmp(&b.0 .1)));
@@ -947,7 +1159,11 @@ pub fn serialize_registry_interface_reporting(
     }
     w.u64(n);
     w.buf.extend_from_slice(&sub.buf);
+    meth_report
+}
 
+/// Writes the function bodies, and reports the ones it skipped.
+fn write_bodies(w: &mut Writer, reg: &ImmutableGlobalRegistry) -> TableReport {
     // bodies: sorted by GID words. A non-portable body (unencodable signature or a deferred generic
     // GID) is skipped, so the count is written after the encodable entries are built.
     let mut bodies: Vec<(&TypeId, &FnBody)> = reg.bodies.iter().collect();
@@ -972,7 +1188,11 @@ pub fn serialize_registry_interface_reporting(
     }
     w.u64(n);
     w.buf.extend_from_slice(&sub.buf);
+    body_report
+}
 
+/// Writes each struct's field types, and reports the structs it skipped.
+fn write_structs(w: &mut Writer, reg: &ImmutableGlobalRegistry) -> TableReport {
     // structs: each struct's declared (un-erased) field AST `Type`s + generic parameters (#219) — the
     // `StructFields` a downstream compile needs to type member access on an imported struct without
     // its AST. Keyed by the struct's GID (#291), sorted by GID words; a struct with an un-encodable
@@ -1016,7 +1236,11 @@ pub fn serialize_registry_interface_reporting(
     }
     w.u64(n);
     w.buf.extend_from_slice(&sub.buf);
+    struct_report
+}
 
+/// Writes the variants of each enum that has no data.
+fn write_enums(w: &mut Writer, reg: &ImmutableGlobalRegistry) -> TableReport {
     // enums: each data-free enum's variants, sorted by enum name. Every variant is written with
     // its number, so the numbers survive even if the list is ever reordered.
     let mut enums: Vec<_> = reg.enum_variants.iter().collect();
@@ -1030,11 +1254,40 @@ pub fn serialize_registry_interface_reporting(
             w.u64(i as u64);
         }
     }
-    let enum_report = TableReport {
+    TableReport {
         table: "enums",
         encoded: enums.len(),
         skipped: Vec::new(),
-    };
+    }
+}
+
+/// Serialize the frozen registry's import-oracle interface to a versioned byte buffer. Covers the
+/// identity (`module_indices`), structural-layout (`layouts`), signature (`fn_sigs` / `methods`), and
+/// flat-HIR-body (`bodies`) tables. Keys are sorted so the output is byte-reproducible for the same
+/// registry.
+#[must_use]
+pub fn serialize_registry_interface(reg: &ImmutableGlobalRegistry) -> Vec<u8> {
+    serialize_registry_interface_reporting(reg).0
+}
+
+/// [`serialize_registry_interface`] plus the per-table encoded/skipped accounting, so the emit path
+/// can surface an incomplete artifact at produce time instead of letting it fail later, elsewhere,
+/// as a "not found" (#292).
+#[must_use]
+pub fn serialize_registry_interface_reporting(
+    reg: &ImmutableGlobalRegistry,
+) -> (Vec<u8>, InterfaceEmitReport) {
+    let mut w = Writer::new();
+    w.buf.extend_from_slice(VXLIB_MAGIC);
+    w.u64(crate::hash::compute_module_hash(VXLIB_FORMAT_TAG));
+
+    write_module_indices(&mut w, reg);
+    write_layouts(&mut w, reg);
+    let fn_report = write_fn_sigs(&mut w, reg);
+    let meth_report = write_methods(&mut w, reg);
+    let body_report = write_bodies(&mut w, reg);
+    let struct_report = write_structs(&mut w, reg);
+    let enum_report = write_enums(&mut w, reg);
 
     let report = InterfaceEmitReport {
         tables: vec![
@@ -1053,24 +1306,17 @@ pub fn serialize_registry_interface_reporting(
 fn nominal_name(reg: &ImmutableGlobalRegistry, gid: &TypeId) -> String {
     reg.layouts
         .get(gid)
-        .map(|d| d.name.clone())
-        .unwrap_or_else(|| format!("{:?}", gid.words))
+        .map_or_else(|| format!("{:?}", gid.words), |d| d.name.clone())
 }
 
-/// Rebuild a queryable [`ImmutableGlobalRegistry`] from bytes produced by
-/// [`serialize_registry_interface`]. Each `fn_sigs` / `methods` entry carries its params, return type,
-/// and return-provenance code (#265 step 7). Returns `Err` on a bad magic, a format-version mismatch
-/// (stale artifact), or a truncated buffer -- never a silent misread.
-pub fn deserialize_registry_interface(bytes: &[u8]) -> Result<ImmutableGlobalRegistry, String> {
-    let mut r = Reader::new(bytes);
-    if r.take(4)? != VXLIB_MAGIC {
-        return Err("vxlib: bad magic (not a Vx module interface)".to_string());
-    }
-    let stamp = r.u64()?;
-    if stamp != crate::hash::compute_module_hash(VXLIB_FORMAT_TAG) {
-        return Err("vxlib: format version mismatch (stale or incompatible artifact)".to_string());
-    }
-
+/// Reads the table that maps each module's names to type ids.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_module_indices(
+    r: &mut Reader<'_>,
+) -> Result<FxHashMap<u64, FxHashMap<Symbol, TypeId>>, String> {
     let mut module_indices: FxHashMap<u64, FxHashMap<crate::symbol::Symbol, TypeId>> =
         FxHashMap::default();
     let n_modules = r.u64()?;
@@ -1085,20 +1331,36 @@ pub fn deserialize_registry_interface(bytes: &[u8]) -> Result<ImmutableGlobalReg
         }
         module_indices.insert(mod_hash, by_name);
     }
+    Ok(module_indices)
+}
 
+/// Reads the layout of every type.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_layouts(r: &mut Reader<'_>) -> Result<FxHashMap<TypeId, TypeDefinition>, String> {
     let mut layouts: FxHashMap<TypeId, TypeDefinition> = FxHashMap::default();
     let n_defs = r.u64()?;
     for _ in 0..n_defs {
-        let def = read_type_definition(&mut r)?;
+        let def = read_type_definition(r)?;
         layouts.insert(def.id, def);
     }
+    Ok(layouts)
+}
 
+/// Reads the function signatures.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_fn_sigs(r: &mut Reader<'_>) -> Result<FxHashMap<Symbol, FnSig>, String> {
     let mut fn_sigs: FxHashMap<Symbol, FnSig> = FxHashMap::default();
     let n_fns = r.u64()?;
     for _ in 0..n_fns {
         let name = r.sym()?;
         let gid = r.typeid()?;
-        let (params, ret_ty, ret_prov, is_unsafe) = read_sig_record(&mut r)?;
+        let (params, ret_ty, ret_prov, is_unsafe) = read_sig_record(r)?;
         fn_sigs.insert(
             name,
             FnSig {
@@ -1110,14 +1372,22 @@ pub fn deserialize_registry_interface(bytes: &[u8]) -> Result<ImmutableGlobalReg
             },
         );
     }
+    Ok(fn_sigs)
+}
 
+/// Reads the method signatures.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_methods(r: &mut Reader<'_>) -> Result<FxHashMap<(TypeId, Symbol), FnSig>, String> {
     let mut methods: FxHashMap<(TypeId, Symbol), FnSig> = FxHashMap::default();
     let n_meths = r.u64()?;
     for _ in 0..n_meths {
         let recv = r.typeid()?;
         let name = r.sym()?;
         let gid = r.typeid()?;
-        let (params, ret_ty, ret_prov, is_unsafe) = read_sig_record(&mut r)?;
+        let (params, ret_ty, ret_prov, is_unsafe) = read_sig_record(r)?;
         methods.insert(
             (recv, name),
             FnSig {
@@ -1129,44 +1399,73 @@ pub fn deserialize_registry_interface(bytes: &[u8]) -> Result<ImmutableGlobalReg
             },
         );
     }
+    Ok(methods)
+}
 
+/// Reads the function bodies.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_bodies(r: &mut Reader<'_>) -> Result<FxHashMap<TypeId, FnBody>, String> {
     let mut bodies: FxHashMap<TypeId, FnBody> = FxHashMap::default();
     let n_bodies = r.u64()?;
     for _ in 0..n_bodies {
-        let (gid, body) = read_fn_body(&mut r)?;
+        let (gid, body) = read_fn_body(r)?;
         bodies.insert(gid, body);
     }
+    Ok(bodies)
+}
 
+/// Reads each struct's field types.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early or holds a tag this reader does not know.
+fn read_structs(r: &mut Reader<'_>) -> Result<FxHashMap<TypeId, StructFields>, String> {
     // structs: declared field AST types + generics, GID-keyed (#291), so imported struct member
     // access types the same as a local struct (#219). Mirrors the serializer's per-struct record.
     let mut structs: FxHashMap<TypeId, StructFields> = FxHashMap::default();
     let n_structs = r.u64()?;
     for _ in 0..n_structs {
         let gid = r.typeid()?;
-        let n_generics = r.u64()? as usize;
+        let n_generics = r.usize()?;
         let mut generics = Vec::new();
         for _ in 0..n_generics {
             generics.push(r.sym()?);
         }
-        let n_fields = r.u64()? as usize;
+        let n_fields = r.usize()?;
         let mut fields = Vec::new();
         for _ in 0..n_fields {
             let fname = r.sym()?;
-            let fty = read_type(&mut r)?;
+            let fty = read_type(r)?;
             fields.push((fname, fty));
         }
         structs.insert(gid, StructFields { generics, fields });
     }
+    Ok(structs)
+}
 
+/// Reads the variants of each enum that has no data.
+///
+/// # Errors
+///
+/// Fails when the buffer ends early, or an enum's variants are not numbered 0, 1, 2 and so on with each number
+/// used once.
+///
+/// # Panics
+///
+/// Never in practice: the checks above leave every variant slot filled.
+fn read_enum_variants(r: &mut Reader<'_>) -> Result<FxHashMap<Symbol, Vec<Symbol>>, String> {
     let mut enum_variants = FxHashMap::default();
     let n_enums = r.u64()?;
     for _ in 0..n_enums {
         let name = r.sym()?;
-        let n_variants = r.u64()? as usize;
+        let n_variants = r.usize()?;
         let mut variants = vec![None; n_variants];
         for _ in 0..n_variants {
             let v = r.sym()?;
-            let i = r.u64()? as usize;
+            let i = r.usize()?;
             let slot = variants
                 .get_mut(i)
                 .ok_or_else(|| format!("vxlib: enum {name} has a variant numbered {i}"))?;
@@ -1178,6 +1477,35 @@ pub fn deserialize_registry_interface(bytes: &[u8]) -> Result<ImmutableGlobalReg
         let variants: Vec<_> = variants.into_iter().map(|v| v.expect("filled")).collect();
         enum_variants.insert(name, variants);
     }
+    Ok(enum_variants)
+}
+
+/// Rebuild a queryable [`ImmutableGlobalRegistry`] from bytes produced by
+/// [`serialize_registry_interface`]. Each `fn_sigs` / `methods` entry carries its params, return type,
+/// and return-provenance code (#265 step 7). Returns `Err` on a bad magic, a format-version mismatch
+/// (stale artifact), or a truncated buffer -- never a silent misread.
+///
+/// # Errors
+///
+/// Fails on a bad magic, a format-version mismatch, a buffer that ends early, or a tag or
+/// number the reader does not know.
+pub fn deserialize_registry_interface(bytes: &[u8]) -> Result<ImmutableGlobalRegistry, String> {
+    let mut r = Reader::new(bytes);
+    if r.take(4)? != VXLIB_MAGIC {
+        return Err("vxlib: bad magic (not a Vx module interface)".to_string());
+    }
+    let stamp = r.u64()?;
+    if stamp != crate::hash::compute_module_hash(VXLIB_FORMAT_TAG) {
+        return Err("vxlib: format version mismatch (stale or incompatible artifact)".to_string());
+    }
+
+    let module_indices = read_module_indices(&mut r)?;
+    let layouts = read_layouts(&mut r)?;
+    let fn_sigs = read_fn_sigs(&mut r)?;
+    let methods = read_methods(&mut r)?;
+    let bodies = read_bodies(&mut r)?;
+    let structs = read_structs(&mut r)?;
+    let enum_variants = read_enum_variants(&mut r)?;
 
     let layout_by_base_name = LayoutNameIndex::build(&layouts);
     Ok(ImmutableGlobalRegistry {
@@ -1191,14 +1519,19 @@ pub fn deserialize_registry_interface(bytes: &[u8]) -> Result<ImmutableGlobalReg
         // Data-carrying enum decls are not serialized into a `.vxlib` yet; constructing/matching a
         // monomorphized imported enum then falls back to the AST path (#242).
         enum_data: FxHashMap::default(),
-        merge_state: Default::default(),
+        merge_state: MergeState::default(),
         // `const` tables are not serialized into a `.vxlib` yet.
-        const_tables: Default::default(),
+        const_tables: Vec::new(),
         layout_by_base_name,
     })
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use crate::registry::ModuleInterface;
@@ -1282,28 +1615,8 @@ mod tests {
         assert_eq!(reg.layouts.len(), round.layouts.len());
     }
 
-    /// The signature tables round-trip too: `resolve_fn` / `resolve_method` return the same GID and
-    /// return type after a serialize -> deserialize cycle, across the return-type shapes the stdlib
-    /// actually uses -- scalar, nominal struct, and a (dimensionless) tensor (#220 stage 2).
-    #[test]
-    fn registry_interface_round_trips_functions_and_methods() {
-        let m = parse_and_resolve(
-            "crate::m",
-            "struct Point { x: i32, y: i32 }\n\
-             fn origin() -> Point { return Point { x: 0i32, y: 0i32 }; }\n\
-             fn scale() -> f32 { return 2.0f32; }\n\
-             fn zeros() -> Tensor<f32, [?, ?]> { return zeros(); }\n\
-             fn pick(a: &Point, b: &Point) -> &i32 { return &b.x; }\n\
-             unsafe fn peek(p: *mut i32) -> i32 { unsafe { return *p; } }\n\
-             impl Point { fn sum(self: Point) -> i32 { return self.x + self.y; } }\n\
-             trait Sq { fn sq(self: Self) -> f32; }\n\
-             impl Sq for f32 { fn sq(self: f32) -> f32 { return self * self; } }\n",
-        );
-        let reg =
-            crate::pipeline::build_frozen_registry(std::slice::from_ref(&m)).expect("acyclic");
-        let bytes = serialize_registry_interface(&reg);
-        let round = deserialize_registry_interface(&bytes).expect("deserialize");
-
+    /// Checks that every function signature in `reg` is the same in `round`.
+    fn assert_functions_round_trip(reg: &ImmutableGlobalRegistry, round: &ImmutableGlobalRegistry) {
         // Every fn_sig the original holds comes back with an identical GID + return type.
         assert!(!reg.fn_sigs.is_empty());
         assert_eq!(reg.fn_sigs.len(), round.fn_sigs.len());
@@ -1337,7 +1650,10 @@ mod tests {
             2,
             "pick's return derives from parameter slot 1"
         );
+    }
 
+    /// Checks that every method signature in `reg` is the same in `round`.
+    fn assert_methods_round_trip(reg: &ImmutableGlobalRegistry, round: &ImmutableGlobalRegistry) {
         // Same for methods, keyed by (receiver GID, method name).
         assert!(!reg.methods.is_empty());
         assert_eq!(reg.methods.len(), round.methods.len());
@@ -1359,7 +1675,10 @@ mod tests {
                 "method ret_prov parity for {name}"
             );
         }
+    }
 
+    /// Checks that every struct's field types in `reg` are the same in `round`.
+    fn assert_structs_round_trip(reg: &ImmutableGlobalRegistry, round: &ImmutableGlobalRegistry) {
         // structs round-trip: the declared field AST types come back, so a downstream compile can
         // type member access on an imported struct (#219).
         assert!(!reg.structs.is_empty());
@@ -1389,6 +1708,33 @@ mod tests {
         );
     }
 
+    /// The signature tables round-trip too: `resolve_fn` / `resolve_method` return the same GID and
+    /// return type after a serialize -> deserialize cycle, across the return-type shapes the stdlib
+    /// actually uses -- scalar, nominal struct, and a (dimensionless) tensor (#220 stage 2).
+    #[test]
+    fn registry_interface_round_trips_functions_and_methods() {
+        let m = parse_and_resolve(
+            "crate::m",
+            "struct Point { x: i32, y: i32 }\n\
+             fn origin() -> Point { return Point { x: 0i32, y: 0i32 }; }\n\
+             fn scale() -> f32 { return 2.0f32; }\n\
+             fn zeros() -> Tensor<f32, [?, ?]> { return zeros(); }\n\
+             fn pick(a: &Point, b: &Point) -> &i32 { return &b.x; }\n\
+             unsafe fn peek(p: *mut i32) -> i32 { unsafe { return *p; } }\n\
+             impl Point { fn sum(self: Point) -> i32 { return self.x + self.y; } }\n\
+             trait Sq { fn sq(self: Self) -> f32; }\n\
+             impl Sq for f32 { fn sq(self: f32) -> f32 { return self * self; } }\n",
+        );
+        let reg =
+            crate::pipeline::build_frozen_registry(std::slice::from_ref(&m)).expect("acyclic");
+        let bytes = serialize_registry_interface(&reg);
+        let round = deserialize_registry_interface(&bytes).expect("deserialize");
+
+        assert_functions_round_trip(&reg, &round);
+        assert_methods_round_trip(&reg, &round);
+        assert_structs_round_trip(&reg, &round);
+    }
+
     /// A data-free enum's variants come back in their order, so each keeps its number.
     #[test]
     fn registry_interface_round_trips_enum_variants() {
@@ -1405,7 +1751,7 @@ mod tests {
         assert_eq!(round.enum_variants, reg.enum_variants);
         let color: Vec<&str> = round.enum_variants[&Symbol::from("Color")]
             .iter()
-            .map(|v| v.as_ref())
+            .map(AsRef::as_ref)
             .collect();
         assert_eq!(color, ["Red", "Green", "Blue"]);
     }

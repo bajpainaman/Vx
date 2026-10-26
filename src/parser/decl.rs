@@ -10,9 +10,20 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::*;
+use super::{ParseResult, Parser};
+use crate::lexer::TokenType;
+use crate::syntax::{
+    EnumDecl, ExprStmtStmt, ExternDecl, Function, GenericParam, ImplBlock, ImportDecl,
+    MacroDefDecl, MacroRule, MemorySpace, MethodSignature, Program, ReturnStmt, Span, Statement,
+    StructDecl, Topology, TraitDecl, TransferImplDecl, Type,
+};
 
 impl<'a> Parser<'a> {
+    /// The next token as a name. The keyword `transfer` counts as a name here.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `msg` when the next token is not a name.
     pub(crate) fn expect_identifier(&mut self, msg: &str) -> ParseResult<'a, String> {
         match self.advance().kind {
             TokenType::Identifier(s) => Ok(s.to_string()),
@@ -21,6 +32,12 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse the `name: Type` parameters up to the closing `)`. A name written `mut` is also
+    /// added to `self.mut_params`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a parameter is not a name, `:` and a type.
     fn parse_comma_separated_params(
         &mut self,
     ) -> ParseResult<'a, Vec<(crate::symbol::Symbol, Type)>> {
@@ -44,6 +61,13 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
+    /// Parse the generic parameters in `<` and `>`, if any are written here, and put their
+    /// names in scope.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a parameter or one of its bounds does not parse, or when the closing `>` is
+    /// missing.
     pub(crate) fn parse_generic_params(&mut self) -> ParseResult<'a, Vec<GenericParam>> {
         let mut generics = Vec::new();
         if self.match_token(&TokenType::LeftAngle) {
@@ -90,6 +114,11 @@ impl<'a> Parser<'a> {
     /// One bound after a type parameter's `:`: a trait name, then optionally its type arguments
     /// and associated-type bindings in angle brackets, as in `Sum<i64>` or `Iterator<Item = T>`.
     /// A `Name =` inside the brackets starts a binding; anything else is a type argument.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the bound does not start with a trait name, when one of its arguments is not a
+    /// type, or when the closing `>` is missing.
     fn parse_trait_bound(&mut self) -> ParseResult<'a, crate::syntax::TraitBound> {
         let trait_name = match self.advance().kind.clone() {
             TokenType::Identifier(s) => s.to_string(),
@@ -134,6 +163,13 @@ impl<'a> Parser<'a> {
             || (self.check(&TokenType::Unsafe) && matches!(self.peek_n(1).kind, TokenType::Fn))
     }
 
+    /// Parse a function: `fn name<T>(params) on Topology -> Type`, then its `requires`,
+    /// `ensures` and `where` clauses, then its body. `unsafe` may come before `fn`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a part of the function does not parse, or when the `->` and the return type
+    /// are missing.
     pub fn parse_function(&mut self) -> ParseResult<'a, Function> {
         let is_unsafe = self.match_token(&TokenType::Unsafe);
         self.consume(&TokenType::Fn, "Expected 'fn'")?;
@@ -169,6 +205,39 @@ impl<'a> Parser<'a> {
             ensures.push(self.parse_expr()?);
         }
 
+        let where_transfers = self.parse_where_reachable()?;
+        let body = self.parse_function_body()?;
+
+        // Remove generic params from scope
+        for _ in 0..generics.len() {
+            self.generic_params.pop();
+        }
+
+        Ok(Function {
+            is_unsafe,
+            name: name.into(),
+            generics,
+            params,
+            mut_params,
+            topology,
+            return_type,
+            requires,
+            ensures,
+            where_transfers,
+            body,
+            doc_comment: None,
+        })
+    }
+
+    /// Parse the `where Reachable<A, B>, ...` clause of a function, if it has one. Returns each
+    /// pair of topology names.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a constraint is not `Reachable<A, B>`.
+    fn parse_where_reachable(
+        &mut self,
+    ) -> ParseResult<'a, Vec<(crate::symbol::Symbol, crate::symbol::Symbol)>> {
         // `where Reachable<A, B> [, Reachable<C, D>]*` -- topology transfer constraints.
         //
         // The name says what the constraint actually tests: a transfer PATH exists from A to
@@ -192,8 +261,7 @@ impl<'a> Parser<'a> {
                         ));
                     }
                     return Err(self.error(&format!(
-                        "Unsupported where-constraint '{}' (only `Reachable<A, B>` is supported)",
-                        cname
+                        "Unsupported where-constraint '{cname}' (only `Reachable<A, B>` is supported)"
                     )));
                 }
                 self.consume(&TokenType::LeftAngle, "Expected '<' after Reachable")?;
@@ -207,7 +275,16 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        Ok(where_transfers)
+    }
 
+    /// Parse a function body in `{` and `}`. A last expression with no `;` that has a value
+    /// becomes the function's `return`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a brace is missing or a statement in the body does not parse.
+    fn parse_function_body(&mut self) -> ParseResult<'a, Vec<Statement>> {
         self.consume(&TokenType::LeftBrace, "Expected '{'")?;
         let mut body = Vec::new();
         while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
@@ -237,26 +314,157 @@ impl<'a> Parser<'a> {
         }
 
         self.consume(&TokenType::RightBrace, "Expected '}'")?;
+        Ok(body)
+    }
 
-        // Remove generic params from scope
-        for _ in 0..generics.len() {
-            self.generic_params.pop();
+    /// The name after the keyword of a `Topology` or `Memory` declaration.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `msg` when the next token is not a name.
+    fn expect_decl_name(&mut self, msg: &str) -> ParseResult<'a, crate::symbol::Symbol> {
+        match &self.advance().kind {
+            TokenType::Identifier(s) => Ok(crate::symbol::Symbol::from(*s)),
+            _ => Err(self.error(msg)),
         }
+    }
 
-        Ok(Function {
-            is_unsafe,
-            name: name.into(),
-            generics,
-            params,
-            mut_params,
-            topology,
-            return_type,
-            requires,
-            ensures,
-            where_transfers,
-            body,
-            doc_comment: None,
+    /// The name of the next field in a `Topology` or `Memory` declaration. `owner` is the word
+    /// the error message uses for the declaration: `topology` or `memory`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next token is not a name.
+    fn expect_field_name(&mut self, owner: &str) -> ParseResult<'a, String> {
+        match &self.advance().kind {
+            TokenType::Identifier(s) => Ok(s.to_string()),
+            other => Err(self.error(&format!("Expected a {owner} field name, got {other:?}"))),
+        }
+    }
+
+    /// Parse a `transfer Memory::A -> Memory::B : cost` clause of a topology declaration,
+    /// with the markers that may follow it. The next token is the `transfer` keyword.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a memory space, the `->` or the cost does not parse.
+    fn parse_transfer_edge(&mut self) -> ParseResult<'a, crate::arch::TransferEdge> {
+        self.advance();
+        let from = self.parse_memory_space()?;
+        self.consume(&TokenType::Arrow, "Expected '->' in transfer clause")?;
+        let to = self.parse_memory_space()?;
+        // The cost is optional, and when present may be either a link bandwidth
+        // (`: 64 GB/s`) or a unitless relative cost (`: 300`). Omitting it declares
+        // reachability and leaves the cost to the endpoints' bandwidths -- which is the
+        // normal case for a hop between nested spaces, and the only way to avoid declaring
+        // a second cost for an edge that already has a derivable one (E6013).
+        let cost = if self.match_token(&TokenType::Colon) {
+            self.parse_edge_cost()?
+        } else {
+            crate::arch::EdgeCost::Derived
+        };
+        // Optional trailing markers, in any order: a `relaxed` / `sync` consistency
+        // grade (default synchronizing), and `copy_engine` -- the declaration that a
+        // hardware engine (a DMA, Ampere's cp.async) can drive this hop. `copy_engine`
+        // is what makes `raw::async_copy` legal in a lowering for this edge (Vx#353).
+        let mut sync = true;
+        let mut copy_engine = false;
+        while let TokenType::Identifier(s) = &self.peek().kind {
+            match *s {
+                "relaxed" => {
+                    self.advance();
+                    sync = false;
+                }
+                "sync" => {
+                    self.advance();
+                    sync = true;
+                }
+                "copy_engine" => {
+                    self.advance();
+                    copy_engine = true;
+                }
+                _ => break,
+            }
+        }
+        Ok(crate::arch::TransferEdge {
+            from,
+            to,
+            cost,
+            sync,
+            copy_engine,
         })
+    }
+
+    /// The value of an `arch:` field: the name of an instruction set.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next token is not a name.
+    fn parse_arch_name(&mut self) -> ParseResult<'a, crate::symbol::Symbol> {
+        match &self.advance().kind {
+            TokenType::Identifier(s) => Ok(crate::symbol::Symbol::from(&**s)),
+            other => Err(self.error(&format!(
+                "`arch:` expects an identifier (x86_64, aarch64, nvptx64, amdgcn), got {other:?}"
+            ))),
+        }
+    }
+
+    /// Parse the value of a `visible:` field, `[Memory::A, ...]`, and add each memory space
+    /// to `visibility`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a bracket is missing or an entry is not a memory space.
+    fn parse_visible_list(&mut self, visibility: &mut Vec<MemorySpace>) -> ParseResult<'a, ()> {
+        self.consume(&TokenType::LeftBracket, "Expected '[' after 'visible'")?;
+        while !self.check(&TokenType::RightBracket) && !self.check(&TokenType::Eof) {
+            visibility.push(self.parse_memory_space()?);
+            if !self.match_token(&TokenType::Comma) {
+                break;
+            }
+        }
+        self.consume(&TokenType::RightBracket, "Expected ']' after visible list")?;
+        Ok(())
+    }
+
+    /// Parse the value of a `dtypes:` field: a list of element type names in `[` and `]`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a bracket is missing, when an entry is not the name of an element type, or
+    /// when the list is empty.
+    fn parse_dtypes_list(&mut self) -> ParseResult<'a, Vec<crate::syntax::ElementType>> {
+        self.consume(&TokenType::LeftBracket, "Expected '[' after 'dtypes'")?;
+        let mut listed: Vec<crate::syntax::ElementType> = Vec::new();
+        while !self.check(&TokenType::RightBracket) && !self.check(&TokenType::Eof) {
+            let name = match &self.advance().kind {
+                TokenType::Identifier(s) => s.to_string(),
+                other => {
+                    return Err(self.error(&format!(
+                        "`dtypes:` expects element type names, got {other:?}"
+                    )))
+                }
+            };
+            match name.parse::<crate::syntax::ElementType>() {
+                Ok(e) => listed.push(e),
+                Err(_) => {
+                    return Err(self.error(&format!(
+                        "`dtypes:` does not know the element type '{name}'"
+                    )))
+                }
+            }
+            if !self.match_token(&TokenType::Comma) {
+                break;
+            }
+        }
+        self.consume(&TokenType::RightBracket, "Expected ']' after dtypes list")?;
+        if listed.is_empty() {
+            return Err(self.error(
+                "`dtypes:` is empty, which would say this machine can represent no \
+                 element type at all; omit the field to leave it unstated",
+            ));
+        }
+        Ok(listed)
     }
 
     /// Parse a user-defined topology declaration and register its descriptor:
@@ -271,12 +479,14 @@ impl<'a> Parser<'a> {
     /// The whole effect is registering the descriptor in the global topology registry
     /// (`crate::arch`), so nothing is stored in the AST. `Topology::<Name>` uses elsewhere
     /// then resolve to `Topology::Custom(<Name>)` and pick up this description.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the declaration has no name, has a field that is not known or does not parse,
+    /// or has no `memory:` field.
     pub(crate) fn parse_topology_decl(&mut self) -> ParseResult<'a, crate::arch::TopologyDecl> {
         self.consume(&TokenType::Topology, "Expected 'Topology'")?;
-        let name = match &self.advance().kind {
-            TokenType::Identifier(s) => crate::symbol::Symbol::from(*s),
-            _ => return Err(self.error("Expected a name after 'Topology'")),
-        };
+        let name = self.expect_decl_name("Expected a name after 'Topology'")?;
         self.consume(
             &TokenType::LeftBrace,
             "Expected '{' in topology declaration",
@@ -295,131 +505,30 @@ impl<'a> Parser<'a> {
             // morphism (an edge added to the cost graph), with an optional consistency grade
             // (default synchronizing). Uses the `transfer` keyword, so no colon.
             if self.check(&TokenType::Transfer) {
-                self.advance();
-                let from = self.parse_memory_space()?;
-                self.consume(&TokenType::Arrow, "Expected '->' in transfer clause")?;
-                let to = self.parse_memory_space()?;
-                // The cost is optional, and when present may be either a link bandwidth
-                // (`: 64 GB/s`) or a unitless relative cost (`: 300`). Omitting it declares
-                // reachability and leaves the cost to the endpoints' bandwidths -- which is the
-                // normal case for a hop between nested spaces, and the only way to avoid declaring
-                // a second cost for an edge that already has a derivable one (E6013).
-                let cost = if self.match_token(&TokenType::Colon) {
-                    self.parse_edge_cost()?
-                } else {
-                    crate::arch::EdgeCost::Derived
-                };
-                // Optional trailing markers, in any order: a `relaxed` / `sync` consistency
-                // grade (default synchronizing), and `copy_engine` -- the declaration that a
-                // hardware engine (a DMA, Ampere's cp.async) can drive this hop. `copy_engine`
-                // is what makes `raw::async_copy` legal in a lowering for this edge (Vx#353).
-                let mut sync = true;
-                let mut copy_engine = false;
-                while let TokenType::Identifier(s) = &self.peek().kind {
-                    match *s {
-                        "relaxed" => {
-                            self.advance();
-                            sync = false;
-                        }
-                        "sync" => {
-                            self.advance();
-                            sync = true;
-                        }
-                        "copy_engine" => {
-                            self.advance();
-                            copy_engine = true;
-                        }
-                        _ => break,
-                    }
-                }
-                transfers.push(crate::arch::TransferEdge {
-                    from,
-                    to,
-                    cost,
-                    sync,
-                    copy_engine,
-                });
+                transfers.push(self.parse_transfer_edge()?);
                 self.match_token(&TokenType::Comma);
                 continue;
             }
 
-            let field = match &self.advance().kind {
-                TokenType::Identifier(s) => s.to_string(),
-                other => {
-                    return Err(
-                        self.error(&format!("Expected a topology field name, got {:?}", other))
-                    )
-                }
-            };
+            let field = self.expect_field_name("topology")?;
             self.consume(&TokenType::Colon, "Expected ':' after topology field")?;
             match field.as_str() {
                 // The instruction set this topology executes. A machine description that
                 // does not say this cannot answer what code to emit for it, and nothing
                 // else in the file implies it -- a filename and a comment are not readable
                 // by the compiler.
-                "arch" => {
-                    arch = Some(match &self.advance().kind {
-                        TokenType::Identifier(s) => crate::symbol::Symbol::from(&**s),
-                        other => {
-                            return Err(self.error(&format!(
-                                "`arch:` expects an identifier (x86_64, aarch64, nvptx64, amdgcn), got {:?}",
-                                other
-                            )))
-                        }
-                    });
-                }
+                "arch" => arch = Some(self.parse_arch_name()?),
                 "memory" => default_space = Some(self.parse_memory_space()?),
                 "visible" => {
                     visible_given = true;
-                    self.consume(&TokenType::LeftBracket, "Expected '[' after 'visible'")?;
-                    while !self.check(&TokenType::RightBracket) && !self.check(&TokenType::Eof) {
-                        visibility.push(self.parse_memory_space()?);
-                        if !self.match_token(&TokenType::Comma) {
-                            break;
-                        }
-                    }
-                    self.consume(&TokenType::RightBracket, "Expected ']' after visible list")?;
+                    self.parse_visible_list(&mut visibility)?;
                 }
                 // Which element types this hardware can represent. Absent is undeclared and
                 // undeclared is permissive -- an empty list would say the machine can hold no
                 // data at all, which is never what a machine file means to say, so it is
                 // refused here rather than silently rejecting every program placed on it.
-                "dtypes" => {
-                    self.consume(&TokenType::LeftBracket, "Expected '[' after 'dtypes'")?;
-                    let mut listed: Vec<crate::syntax::ElementType> = Vec::new();
-                    while !self.check(&TokenType::RightBracket) && !self.check(&TokenType::Eof) {
-                        let name = match &self.advance().kind {
-                            TokenType::Identifier(s) => s.to_string(),
-                            other => {
-                                return Err(self.error(&format!(
-                                    "`dtypes:` expects element type names, got {:?}",
-                                    other
-                                )))
-                            }
-                        };
-                        match name.parse::<crate::syntax::ElementType>() {
-                            Ok(e) => listed.push(e),
-                            Err(_) => {
-                                return Err(self.error(&format!(
-                                    "`dtypes:` does not know the element type '{}'",
-                                    name
-                                )))
-                            }
-                        }
-                        if !self.match_token(&TokenType::Comma) {
-                            break;
-                        }
-                    }
-                    self.consume(&TokenType::RightBracket, "Expected ']' after dtypes list")?;
-                    if listed.is_empty() {
-                        return Err(self.error(
-                            "`dtypes:` is empty, which would say this machine can represent no \
-                             element type at all; omit the field to leave it unstated",
-                        ));
-                    }
-                    dtypes = Some(listed);
-                }
-                other => return Err(self.error(&format!("Unknown topology field '{}'", other))),
+                "dtypes" => dtypes = Some(self.parse_dtypes_list()?),
+                other => return Err(self.error(&format!("Unknown topology field '{other}'"))),
             }
             self.match_token(&TokenType::Comma);
         }
@@ -428,9 +537,8 @@ impl<'a> Parser<'a> {
             "Expected '}' to close topology declaration",
         )?;
 
-        let default_space = match default_space {
-            Some(s) => s,
-            None => return Err(self.error("topology declaration needs a `memory:` field")),
+        let Some(default_space) = default_space else {
+            return Err(self.error("topology declaration needs a `memory:` field"));
         };
         // With no explicit `visible`, a topology sees exactly its own default space. An
         // explicit `visible` list is respected verbatim, so an inconsistent one (default
@@ -444,24 +552,97 @@ impl<'a> Parser<'a> {
         Ok(crate::arch::TopologyDecl {
             name,
             descriptor: crate::arch::TopologyDescriptor {
-                arch,
                 default_space,
                 visibility,
+                arch,
                 transfers,
                 dtypes,
             },
         })
     }
 
+    /// The value of a `scope:` field: `device`, `sm`, `cta` or `thread`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next token is not one of those four words.
+    fn parse_scope(&mut self) -> ParseResult<'a, crate::syntax::Scope> {
+        let s = match &self.advance().kind {
+            TokenType::Identifier(s) => s.to_string(),
+            other => {
+                return Err(self.error(&format!(
+                    "`scope:` expects device/sm/cta/thread, got {other:?}"
+                )))
+            }
+        };
+        match s.as_str() {
+            "device" => Ok(crate::syntax::Scope::Device),
+            "sm" => Ok(crate::syntax::Scope::Sm),
+            "cta" => Ok(crate::syntax::Scope::Cta),
+            "thread" => Ok(crate::syntax::Scope::Thread),
+            other => Err(self.error(&format!(
+                "`scope:` expects device/sm/cta/thread, got '{other}'"
+            ))),
+        }
+    }
+
+    /// The value of a `crossing:` field: `streamed` or `sequenced`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next token is not one of those two words.
+    fn parse_crossing(&mut self) -> ParseResult<'a, crate::syntax::Crossing> {
+        let kind = match &self.advance().kind {
+            TokenType::Identifier(s) => s.to_string(),
+            other => {
+                return Err(self.error(&format!(
+                    "Expected 'streamed' or 'sequenced' for `crossing:`, got {other:?}"
+                )))
+            }
+        };
+        match kind.as_str() {
+            "streamed" => Ok(crate::syntax::Crossing::Streamed),
+            "sequenced" => Ok(crate::syntax::Crossing::Sequenced),
+            other => Err(self.error(&format!(
+                "`crossing:` expects 'streamed' or 'sequenced', got '{other}'"
+            ))),
+        }
+    }
+
+    /// The value of a `managed:` field: `explicit` or `cached`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next token is not one of those two words.
+    fn parse_management(&mut self) -> ParseResult<'a, crate::syntax::Management> {
+        let kind = match &self.advance().kind {
+            TokenType::Identifier(s) => s.to_string(),
+            other => {
+                return Err(self.error(&format!(
+                    "Expected 'explicit' or 'cached' for `managed:`, got {other:?}"
+                )))
+            }
+        };
+        match kind.as_str() {
+            "explicit" => Ok(crate::syntax::Management::Explicit),
+            "cached" => Ok(crate::syntax::Management::Cached),
+            other => Err(self.error(&format!(
+                "`managed:` expects 'explicit' or 'cached', got '{other}'"
+            ))),
+        }
+    }
+
     /// `Memory <Name> { within:, capacity:, bandwidth:, managed:, granule: }` -- a first-class
     /// memory-space declaration. Every field is optional except the name. Returned as a
     /// `MemoryDecl` on the AST (no global registration, unlike `parse_topology_decl`).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the declaration has no name, or has a field that is not known or does not
+    /// parse.
     pub(crate) fn parse_memory_decl(&mut self) -> ParseResult<'a, crate::syntax::MemoryDecl> {
         self.consume(&TokenType::Memory, "Expected 'Memory'")?;
-        let name = match &self.advance().kind {
-            TokenType::Identifier(s) => crate::symbol::Symbol::from(*s),
-            _ => return Err(self.error("Expected a name after 'Memory'")),
-        };
+        let name = self.expect_decl_name("Expected a name after 'Memory'")?;
         self.consume(&TokenType::LeftBrace, "Expected '{' in memory declaration")?;
 
         let mut parent: Option<MemorySpace> = None;
@@ -477,14 +658,7 @@ impl<'a> Parser<'a> {
         let mut crossing = crate::syntax::Crossing::default();
 
         while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
-            let field = match &self.advance().kind {
-                TokenType::Identifier(s) => s.to_string(),
-                other => {
-                    return Err(
-                        self.error(&format!("Expected a memory field name, got {:?}", other))
-                    )
-                }
-            };
+            let field = self.expect_field_name("memory")?;
             // `overcommit` is a bare flag (no `: value`).
             if field == "overcommit" {
                 overcommit = true;
@@ -494,78 +668,16 @@ impl<'a> Parser<'a> {
             self.consume(&TokenType::Colon, "Expected ':' after memory field")?;
             match field.as_str() {
                 "within" => parent = Some(self.parse_memory_space()?),
-                "scope" => {
-                    let s = match &self.advance().kind {
-                        TokenType::Identifier(s) => s.to_string(),
-                        other => {
-                            return Err(self.error(&format!(
-                                "`scope:` expects device/sm/cta/thread, got {:?}",
-                                other
-                            )))
-                        }
-                    };
-                    scope = Some(match s.as_str() {
-                        "device" => crate::syntax::Scope::Device,
-                        "sm" => crate::syntax::Scope::Sm,
-                        "cta" => crate::syntax::Scope::Cta,
-                        "thread" => crate::syntax::Scope::Thread,
-                        other => {
-                            return Err(self.error(&format!(
-                                "`scope:` expects device/sm/cta/thread, got '{}'",
-                                other
-                            )))
-                        }
-                    });
-                }
+                "scope" => scope = Some(self.parse_scope()?),
                 "capacity" => capacity = Some(self.parse_byte_size()?),
                 "granule" => granule = Some(self.parse_byte_size()?),
                 "bandwidth" => bandwidth = Some(self.parse_bandwidth()?),
                 "clock" => clock_hz = Some(self.parse_clock()?),
                 "replicas" => replicas = Some(self.parse_count()?),
                 "node" => numa_node = Some(self.parse_numa_node()?),
-                "crossing" => {
-                    let kind = match &self.advance().kind {
-                        TokenType::Identifier(s) => s.to_string(),
-                        other => {
-                            return Err(self.error(&format!(
-                                "Expected 'streamed' or 'sequenced' for `crossing:`, got {:?}",
-                                other
-                            )))
-                        }
-                    };
-                    crossing = match kind.as_str() {
-                        "streamed" => crate::syntax::Crossing::Streamed,
-                        "sequenced" => crate::syntax::Crossing::Sequenced,
-                        other => {
-                            return Err(self.error(&format!(
-                                "`crossing:` expects 'streamed' or 'sequenced', got '{}'",
-                                other
-                            )))
-                        }
-                    };
-                }
-                "managed" => {
-                    let kind = match &self.advance().kind {
-                        TokenType::Identifier(s) => s.to_string(),
-                        other => {
-                            return Err(self.error(&format!(
-                                "Expected 'explicit' or 'cached' for `managed:`, got {:?}",
-                                other
-                            )))
-                        }
-                    };
-                    managed = match kind.as_str() {
-                        "explicit" => crate::syntax::Management::Explicit,
-                        "cached" => crate::syntax::Management::Cached,
-                        other => {
-                            return Err(self.error(&format!(
-                                "`managed:` expects 'explicit' or 'cached', got '{}'",
-                                other
-                            )))
-                        }
-                    };
-                }
-                other => return Err(self.error(&format!("Unknown memory field '{}'", other))),
+                "crossing" => crossing = self.parse_crossing()?,
+                "managed" => managed = self.parse_management()?,
+                other => return Err(self.error(&format!("Unknown memory field '{other}'"))),
             }
             self.match_token(&TokenType::Comma);
         }
@@ -596,6 +708,11 @@ impl<'a> Parser<'a> {
     /// SI spellings are decimal, IEC binary. Capacities are usually the IEC case -- a "228 KB"
     /// shared-memory figure is 228 KiB in fact -- so a file should say `KiB` and mean it rather
     /// than rely on the reader knowing which convention the parser picked.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next tokens are not a number and a size unit, or when the size is not a
+    /// whole number of bytes that fits in 64 bits.
     fn parse_byte_size(&mut self) -> ParseResult<'a, crate::syntax::ByteSize> {
         let mantissa = self.parse_number_text("a byte size")?;
         let unit = self.parse_byte_unit()?;
@@ -608,6 +725,11 @@ impl<'a> Parser<'a> {
     /// spec sheet means what the sheet meant. Bandwidth is the case that motivated the rule:
     /// NVIDIA's "3.35 TB/s" is 3.35e12 B/s, and reading `TB` as 2^40 understated every predicted
     /// transfer time by 9%.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next tokens are not a number, a size unit, `/` and then `s` or `cyc`, or
+    /// when the size is not a whole number of bytes that fits in 64 bits.
     fn parse_bandwidth(&mut self) -> ParseResult<'a, crate::syntax::Bandwidth> {
         let mantissa = self.parse_number_text("a bandwidth")?;
         let unit = self.parse_byte_unit()?;
@@ -623,6 +745,11 @@ impl<'a> Parser<'a> {
     /// Exists so a `B/cyc` bandwidth can be converted against a `B/s` one exactly. Every fleet
     /// machine mixes the two -- L2 quoted in TB/s, SMEM in B/cyc -- and before this the mixed path
     /// was simply not derivable, which is how the `L2->SMEM` seam went unpriced.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next tokens are not a number and a frequency unit, or when the frequency
+    /// cannot be stored as a whole number of hertz.
     fn parse_clock(&mut self) -> ParseResult<'a, u64> {
         let mantissa = self.parse_number_text("a clock frequency")?;
         let unit_str = match &self.advance().kind {
@@ -644,20 +771,20 @@ impl<'a> Parser<'a> {
         })?;
         crate::units::to_hertz(&mantissa, unit).map_err(|e| {
             self.error(&format!(
-                "`clock: {} {}` is not a whole number of hertz ({:?})",
-                mantissa, unit_str, e
+                "`clock: {mantissa} {unit_str}` is not a whole number of hertz ({e:?})"
             ))
         })
     }
 
     /// A plain positive integer count, for `replicas:`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next token is not a whole number, or when the number is zero.
     fn parse_count(&mut self) -> ParseResult<'a, u64> {
         let text = self.parse_number_text("a count")?;
-        let n: u64 = text.parse().map_err(|_| {
-            self.error(&format!(
-                "`replicas:` expects a whole number, got '{}'",
-                text
-            ))
+        let n: u64 = text.parse().map_err(|_not_a_number| {
+            self.error(&format!("`replicas:` expects a whole number, got '{text}'"))
         })?;
         if n == 0 {
             return Err(self.error("`replicas:` must be positive"));
@@ -669,11 +796,16 @@ impl<'a> Parser<'a> {
     /// first node on every machine -- so this cannot borrow `parse_count`, whose whole job is
     /// to reject it. The bound is the dispatch band's, not the hardware's: an id outside it
     /// would alias onto a slice's.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next token is not a whole number, or when the number is larger than
+    /// `NUMA_DISPATCH_MAX_NODE`.
     fn parse_numa_node(&mut self) -> ParseResult<'a, u64> {
         let text = self.parse_number_text("a NUMA node number")?;
-        let n: u64 = text
-            .parse()
-            .map_err(|_| self.error(&format!("`node:` expects a whole number, got '{}'", text)))?;
+        let n: u64 = text.parse().map_err(|_not_a_number| {
+            self.error(&format!("`node:` expects a whole number, got '{text}'"))
+        })?;
         if n > crate::arch::NUMA_DISPATCH_MAX_NODE {
             return Err(self.error(&format!(
                 "`node: {}` is out of range; the largest node a dispatch id can carry is {}",
@@ -685,6 +817,10 @@ impl<'a> Parser<'a> {
     }
 
     /// The `/s` or `/cyc` of a rate.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next tokens are not `/` and then `s` or `cyc`.
     fn parse_rate_denominator(&mut self) -> ParseResult<'a, crate::syntax::RatePer> {
         self.consume(
             &TokenType::Slash,
@@ -694,8 +830,7 @@ impl<'a> Parser<'a> {
             TokenType::Identifier(s) => s.to_string(),
             other => {
                 return Err(self.error(&format!(
-                    "Expected 's' or 'cyc' after '/' in bandwidth, got {:?}",
-                    other
+                    "Expected 's' or 'cyc' after '/' in bandwidth, got {other:?}"
                 )))
             }
         };
@@ -703,8 +838,7 @@ impl<'a> Parser<'a> {
             "s" => Ok(crate::syntax::RatePer::Second),
             "cyc" => Ok(crate::syntax::RatePer::Cycle),
             other => Err(self.error(&format!(
-                "bandwidth denominator must be 's' or 'cyc', got '{}'",
-                other
+                "bandwidth denominator must be 's' or 'cyc', got '{other}'"
             ))),
         }
     }
@@ -714,6 +848,10 @@ impl<'a> Parser<'a> {
     ///
     /// Disambiguated by whether a byte unit follows the number. The only other things that may
     /// follow are the `relaxed`/`sync` markers and a `,`, and no unit spelling collides with those.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the cost is neither a link bandwidth nor a whole number that fits in 32 bits.
     fn parse_edge_cost(&mut self) -> ParseResult<'a, crate::arch::EdgeCost> {
         let mantissa = self.parse_number_text("a transfer cost or link bandwidth")?;
         let is_rate = matches!(
@@ -729,7 +867,7 @@ impl<'a> Parser<'a> {
                 per,
             }))
         } else {
-            let cost = mantissa.parse::<u32>().map_err(|_| {
+            let cost = mantissa.parse::<u32>().map_err(|_not_a_number| {
                 self.error(&format!(
                     "transfer cost must be a non-negative integer or a link bandwidth \
                      (e.g. `64 GB/s`), got '{mantissa}'"
@@ -744,14 +882,23 @@ impl<'a> Parser<'a> {
     /// Text rather than `f64` so [`crate::units::to_bytes`] can do exact integer arithmetic: `3.35`
     /// is not representable in binary floating point, and a parse-multiply-round pipeline is
     /// correct only for the particular values it happens to be given.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next token is not a number. `what` names the number in the message.
     fn parse_number_text(&mut self, what: &str) -> ParseResult<'a, String> {
         match &self.advance().kind {
             TokenType::Number(s) => Ok(s.to_string()),
-            other => Err(self.error(&format!("Expected {}, got {:?}", what, other))),
+            other => Err(self.error(&format!("Expected {what}, got {other:?}"))),
         }
     }
 
     /// Exact mantissa-times-unit, with the failure reported where the reader can see the figure.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `mantissa` is not a decimal number, or when the product is not a whole number
+    /// of bytes that fits in 64 bits.
     fn scaled_bytes(
         &mut self,
         mantissa: &str,
@@ -775,6 +922,10 @@ impl<'a> Parser<'a> {
 
     /// A byte-unit suffix. SI spellings (`GB`) are decimal, IEC (`GiB`) binary -- see
     /// [`crate::units`] for why both exist and why the distinction is enforced.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next token is not a size unit the compiler knows.
     fn parse_byte_unit(&mut self) -> ParseResult<'a, crate::units::ByteUnit> {
         let unit = match &self.advance().kind {
             TokenType::Identifier(s) => s.to_string(),
@@ -797,6 +948,10 @@ impl<'a> Parser<'a> {
 
     /// The name of a declared struct, enum or trait. `void` is the built-in type with one
     /// value, and the compiler recognizes it by name, so a program cannot declare its own.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `msg` when the next token is not a name, and when the name is `void`.
     fn expect_type_name(&mut self, msg: &str) -> ParseResult<'a, String> {
         let token = self.peek().clone();
         let name = self.expect_identifier(msg)?;
@@ -809,6 +964,11 @@ impl<'a> Parser<'a> {
         Ok(name)
     }
 
+    /// Parse a struct declaration: `struct Name<T> { field: Type, ... }`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the name, the generic parameters, a field or a brace does not parse.
     pub(crate) fn parse_struct_decl(&mut self) -> ParseResult<'a, StructDecl> {
         self.consume(&TokenType::Struct, "Expected 'struct'")?;
 
@@ -843,6 +1003,11 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse an enum declaration: `enum Name<T> { A, B(Type, ...) }`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the name, the generic parameters, a variant or a brace does not parse.
     pub(crate) fn parse_enum_decl(&mut self) -> ParseResult<'a, EnumDecl> {
         self.consume(&TokenType::Enum, "Expected 'enum'")?;
 
@@ -894,6 +1059,12 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse an `extern { ... }` block: a list of function declarations with no bodies.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a brace is missing, or when a declaration in the block is not
+    /// `fn name(params) -> Type;`.
     pub(crate) fn parse_extern_block(&mut self) -> ParseResult<'a, Vec<ExternDecl>> {
         self.consume(&TokenType::Extern, "Expected 'extern'")?;
 
@@ -911,17 +1082,7 @@ impl<'a> Parser<'a> {
             // As the trait and impl loops do. `std::libc`, `std::alloc`, `std::mmap`,
             // `std::hash_map` and `std::hash_set` contain nothing but declarations, so a
             // doc comment being a parse error here left those modules undocumentable.
-            let mut doc_comment: Option<String> = None;
-            while let TokenType::DocComment(c) = &self.peek().kind {
-                let text = c.to_string();
-                if let Some(existing) = &mut doc_comment {
-                    existing.push('\n');
-                    existing.push_str(&text);
-                } else {
-                    doc_comment = Some(text);
-                }
-                self.advance();
-            }
+            let doc_comment = self.collect_doc_comments();
             if self.check(&TokenType::RightBrace) || self.check(&TokenType::Eof) {
                 break;
             }
@@ -957,6 +1118,88 @@ impl<'a> Parser<'a> {
         Ok(externs)
     }
 
+    /// The `///` comments written here, joined with new lines. `None` when there are none.
+    fn collect_doc_comments(&mut self) -> Option<String> {
+        let mut doc_comment: Option<String> = None;
+        while let TokenType::DocComment(c) = &self.peek().kind {
+            let text = c.to_string();
+            if let Some(existing) = &mut doc_comment {
+                existing.push('\n');
+                existing.push_str(&text);
+            } else {
+                doc_comment = Some(text);
+            }
+            self.advance();
+        }
+        doc_comment
+    }
+
+    /// Parse one method of a trait, from its `fn` to its `;` or the end of its default body.
+    /// `doc_comment` is the `///` text written above it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the method is written `unsafe fn`, or when its signature or its default body
+    /// does not parse.
+    fn parse_trait_method(
+        &mut self,
+        doc_comment: Option<String>,
+    ) -> ParseResult<'a, MethodSignature> {
+        if self.check(&TokenType::Unsafe) {
+            return Err(self.error("`unsafe fn` on a trait method is not supported yet"));
+        }
+        self.consume(&TokenType::Fn, "Expected 'fn' in trait")?;
+        let method_name = self.expect_identifier("Expected method name")?;
+        // The method's own parameters, on top of the trait's. They stay in scope for
+        // this signature only, so they are popped once its body or `;` is read.
+        let method_generics = self.parse_generic_params()?;
+        self.consume(&TokenType::LeftParen, "Expected '('")?;
+        self.mut_params.clear();
+        let params = self.parse_comma_separated_params()?;
+        let mut_params = std::mem::take(&mut self.mut_params);
+        self.consume(&TokenType::RightParen, "Expected ')'")?;
+        self.consume(&TokenType::Arrow, "Expected '->'")?;
+        let return_type = self.parse_return_type()?;
+        // A trait method is either a requirement, ending in `;`, or a default, whose body
+        // an impl inherits unless it writes its own.
+        let default_body = if self.match_token(&TokenType::LeftBrace) {
+            let mut body = Vec::new();
+            while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
+                self.parse_statement_into(&mut body)?;
+            }
+            self.consume(
+                &TokenType::RightBrace,
+                "Expected '}' after trait method body",
+            )?;
+            Some(body)
+        } else {
+            self.consume(
+                &TokenType::Semicolon,
+                "Expected ';' or a default body after a trait method signature",
+            )?;
+            None
+        };
+        for _ in 0..method_generics.len() {
+            self.generic_params.pop();
+        }
+        Ok(MethodSignature {
+            name: method_name.into(),
+            generics: method_generics,
+            params,
+            mut_params,
+            return_type,
+            default_body,
+            doc_comment,
+        })
+    }
+
+    /// Parse a trait declaration: its associated types and its method signatures, each with an
+    /// optional default body.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the name, the generic parameters, an associated type or a method does not
+    /// parse.
     pub(crate) fn parse_trait_decl(&mut self) -> ParseResult<'a, TraitDecl> {
         self.consume(&TokenType::Trait, "Expected 'trait'")?;
         let name = self.expect_type_name("Expected trait name")?;
@@ -970,17 +1213,7 @@ impl<'a> Parser<'a> {
             // one at all before: the loop went straight to `fn` and a `///` was a parse error,
             // which left the traits -- the public surface of every type implementing them --
             // as the one part of the library that could not be documented where it is declared.
-            let mut doc_comment: Option<String> = None;
-            while let TokenType::DocComment(c) = &self.peek().kind {
-                let text = c.to_string();
-                if let Some(existing) = &mut doc_comment {
-                    existing.push('\n');
-                    existing.push_str(&text);
-                } else {
-                    doc_comment = Some(text);
-                }
-                self.advance();
-            }
+            let doc_comment = self.collect_doc_comments();
             if self.check(&TokenType::RightBrace) || self.check(&TokenType::Eof) {
                 break;
             }
@@ -996,52 +1229,7 @@ impl<'a> Parser<'a> {
                 assoc_types.push(assoc.into());
                 continue;
             }
-            if self.check(&TokenType::Unsafe) {
-                return Err(self.error("`unsafe fn` on a trait method is not supported yet"));
-            }
-            self.consume(&TokenType::Fn, "Expected 'fn' in trait")?;
-            let method_name = self.expect_identifier("Expected method name")?;
-            // The method's own parameters, on top of the trait's. They stay in scope for
-            // this signature only, so they are popped once its body or `;` is read.
-            let method_generics = self.parse_generic_params()?;
-            self.consume(&TokenType::LeftParen, "Expected '('")?;
-            self.mut_params.clear();
-            let params = self.parse_comma_separated_params()?;
-            let mut_params = std::mem::take(&mut self.mut_params);
-            self.consume(&TokenType::RightParen, "Expected ')'")?;
-            self.consume(&TokenType::Arrow, "Expected '->'")?;
-            let return_type = self.parse_return_type()?;
-            // A trait method is either a requirement, ending in `;`, or a default, whose body
-            // an impl inherits unless it writes its own.
-            let default_body = if self.match_token(&TokenType::LeftBrace) {
-                let mut body = Vec::new();
-                while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
-                    self.parse_statement_into(&mut body)?;
-                }
-                self.consume(
-                    &TokenType::RightBrace,
-                    "Expected '}' after trait method body",
-                )?;
-                Some(body)
-            } else {
-                self.consume(
-                    &TokenType::Semicolon,
-                    "Expected ';' or a default body after a trait method signature",
-                )?;
-                None
-            };
-            for _ in 0..method_generics.len() {
-                self.generic_params.pop();
-            }
-            methods.push(MethodSignature {
-                name: method_name.into(),
-                generics: method_generics,
-                params,
-                mut_params,
-                return_type,
-                default_body,
-                doc_comment,
-            });
+            methods.push(self.parse_trait_method(doc_comment)?);
         }
         self.consume(&TokenType::RightBrace, "Expected '}'")?;
 
@@ -1057,28 +1245,15 @@ impl<'a> Parser<'a> {
         })
     }
 
-    pub(crate) fn parse_impl_block(&mut self) -> ParseResult<'a, ImplBlock> {
-        self.consume(&TokenType::Impl, "Expected 'impl'")?;
-
-        let generics = self.parse_generic_params()?;
-
-        // `impl<T> Transfer ...` reaches here (the dispatch only looks one token past `impl`, so
-        // a generic list hides the trait name). Without this check, `parse_type` consumes
-        // `Transfer` as an ordinary trait name and the error lands somewhere in the header,
-        // while the actual offender is never named.
-        //
-        // A lowering is instantiated per EDGE, not per type, so a type parameter has nothing to
-        // bind to -- the same reason a generic `fn` inside a lowering body is refused (E6015).
-        let generic_transfer = self.check(&TokenType::Transfer)
-            || matches!(&self.peek().kind, TokenType::Identifier(s) if &**s == "Transfer");
-        if !generics.is_empty() && generic_transfer {
-            return Err(self.error(
-                "'impl Transfer' does not take generic parameters; a transfer lowering is \
-                 declared per edge, for one machine \
-                 (`impl Transfer<Memory::A, Memory::B> for Topology::X { ... }`)",
-            ));
-        }
-
+    /// Parse what an impl block is for, after `impl` and its generic parameters: `Type`, or
+    /// `Trait for Type`. Returns the trait's name, the trait's type arguments and the type.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a type does not parse, or when what comes before `for` is not a trait name.
+    fn parse_impl_target(
+        &mut self,
+    ) -> ParseResult<'a, (Option<crate::symbol::Symbol>, Vec<Type>, Type)> {
         // Either `impl Trait for Type` or `impl Type`
         let mut trait_name = None;
         let mut trait_args: Vec<Type> = Vec::new();
@@ -1106,22 +1281,79 @@ impl<'a> Parser<'a> {
         } else {
             parsed_type
         };
+        Ok((trait_name, trait_args, target_type))
+    }
+
+    /// Parse one method of an impl block. `generics` are the block's own generic parameters,
+    /// and `doc_comment` is the `///` text written above the method.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the method does not parse.
+    fn parse_impl_method(
+        &mut self,
+        generics: &[GenericParam],
+        doc_comment: Option<String>,
+    ) -> ParseResult<'a, Function> {
+        let mut method = self.parse_function()?;
+        method.doc_comment = doc_comment;
+        // A method of a generic impl block has the block's parameters in scope, so the
+        // method is generic too even when it declares none of its own. Saying so here is
+        // what makes the declaration-time body check skip it, exactly as it already skips
+        // a generic free function: `T` has no methods until the impl is instantiated, and
+        // the instantiated copy is what gets checked. A parameter the method declares
+        // itself shadows the block's.
+        let own: Vec<String> = method
+            .generics
+            .iter()
+            .map(|g| g.name().to_string())
+            .collect();
+        let mut in_scope: Vec<GenericParam> = generics
+            .iter()
+            .filter(|g| !own.iter().any(|n| n == g.name()))
+            .cloned()
+            .collect();
+        in_scope.append(&mut method.generics);
+        method.generics = in_scope;
+        Ok(method)
+    }
+
+    /// Parse `impl Type { ... }` or `impl Trait for Type { ... }`: its methods and the
+    /// associated types it binds.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the header, an associated type binding or a method does not parse, and when
+    /// `impl Transfer` is given generic parameters.
+    pub(crate) fn parse_impl_block(&mut self) -> ParseResult<'a, ImplBlock> {
+        self.consume(&TokenType::Impl, "Expected 'impl'")?;
+
+        let generics = self.parse_generic_params()?;
+
+        // `impl<T> Transfer ...` reaches here (the dispatch only looks one token past `impl`, so
+        // a generic list hides the trait name). Without this check, `parse_type` consumes
+        // `Transfer` as an ordinary trait name and the error lands somewhere in the header,
+        // while the actual offender is never named.
+        //
+        // A lowering is instantiated per EDGE, not per type, so a type parameter has nothing to
+        // bind to -- the same reason a generic `fn` inside a lowering body is refused (E6015).
+        let generic_transfer = self.check(&TokenType::Transfer)
+            || matches!(&self.peek().kind, TokenType::Identifier(s) if &**s == "Transfer");
+        if !generics.is_empty() && generic_transfer {
+            return Err(self.error(
+                "'impl Transfer' does not take generic parameters; a transfer lowering is \
+                 declared per edge, for one machine \
+                 (`impl Transfer<Memory::A, Memory::B> for Topology::X { ... }`)",
+            ));
+        }
+
+        let (trait_name, trait_args, target_type) = self.parse_impl_target()?;
 
         self.consume(&TokenType::LeftBrace, "Expected '{' after impl target")?;
         let mut methods = Vec::new();
         let mut assoc_bindings: Vec<(crate::symbol::Symbol, Type)> = Vec::new();
         while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
-            let mut doc_comment: Option<String> = None;
-            while let TokenType::DocComment(c) = &self.peek().kind {
-                let text = c.to_string();
-                if let Some(existing) = &mut doc_comment {
-                    existing.push('\n');
-                    existing.push_str(&text);
-                } else {
-                    doc_comment = Some(text);
-                }
-                self.advance();
-            }
+            let doc_comment = self.collect_doc_comments();
 
             // `type Item = i64;` binds one of the trait's associated types.
             if self.match_token(&TokenType::TypeKw) {
@@ -1139,27 +1371,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            let mut method = self.parse_function()?;
-            method.doc_comment = doc_comment;
-            // A method of a generic impl block has the block's parameters in scope, so the
-            // method is generic too even when it declares none of its own. Saying so here is
-            // what makes the declaration-time body check skip it, exactly as it already skips
-            // a generic free function: `T` has no methods until the impl is instantiated, and
-            // the instantiated copy is what gets checked. A parameter the method declares
-            // itself shadows the block's.
-            let own: Vec<String> = method
-                .generics
-                .iter()
-                .map(|g| g.name().to_string())
-                .collect();
-            let mut in_scope: Vec<GenericParam> = generics
-                .iter()
-                .filter(|g| !own.iter().any(|n| n == g.name()))
-                .cloned()
-                .collect();
-            in_scope.append(&mut method.generics);
-            method.generics = in_scope;
-            methods.push(method);
+            methods.push(self.parse_impl_method(&generics, doc_comment)?);
         }
         self.consume(&TokenType::RightBrace, "Expected '}'")?;
 
@@ -1178,6 +1390,11 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse `import a::b::c;`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the path is not names with `::` between them, or when the `;` is missing.
     pub(crate) fn parse_import_decl(&mut self) -> ParseResult<'a, ImportDecl> {
         self.consume(&TokenType::Import, "Expected 'import'")?;
         let mut path = Vec::new();
@@ -1186,14 +1403,19 @@ impl<'a> Parser<'a> {
             path.push(ident.into());
             if self.match_token(&TokenType::DoubleColon) {
                 continue;
-            } else {
-                break;
             }
+            break;
         }
         self.consume(&TokenType::Semicolon, "Expected ';' after import path")?;
         Ok(ImportDecl { path })
     }
 
+    /// Parse a `macro_rules! name { (matcher) => { transcriber } ... }` definition. The matcher
+    /// and the transcriber of each rule are kept as token trees.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the name is missing, or when a rule is not `( ... ) => { ... }`.
     pub(crate) fn parse_macro_def(&mut self) -> ParseResult<'a, MacroDefDecl> {
         let span_start_line = self.peek().line;
         let span_start_column = self.peek().column;
@@ -1263,11 +1485,16 @@ impl<'a> Parser<'a> {
     /// `stamp_impl!(i32);` in item position. The call is recorded whole -- the arguments stay
     /// an unparsed token tree -- because what it expands to is decided by the macro's rules,
     /// not by this parser.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the next token is not a macro name, or when the arguments do not parse as a
+    /// token tree.
     fn parse_item_macro_call(&mut self) -> ParseResult<'a, crate::syntax::stmt::MacroCallStmt> {
         let name = match &self.advance().kind {
             TokenType::Identifier(s) => s.to_string(),
             other => {
-                return Err(self.error(&format!("Expected a macro name, found {:?}", other)));
+                return Err(self.error(&format!("Expected a macro name, found {other:?}")));
             }
         };
         self.advance(); // the `!`
@@ -1295,6 +1522,10 @@ impl<'a> Parser<'a> {
     }
 
     /// `const NAME : T = value;`
+    ///
+    /// # Errors
+    ///
+    /// Fails when the name, the `:` and type, the `=` and value, or the `;` is missing.
     fn parse_const_item(&mut self) -> ParseResult<'a, crate::syntax::ConstDecl> {
         let keyword = self.advance().clone();
         let name = match &self.advance().kind {
@@ -1322,142 +1553,173 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse a whole source file: every declaration at the top level.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a declaration does not parse, when a token cannot start a declaration, or
+    /// when two functions have the same name.
     pub fn parse(&mut self) -> ParseResult<'a, Program> {
-        let mut imports = Vec::new();
-        let mut externs = Vec::new();
-        let mut topologies = Vec::new();
-        let mut memories = Vec::new();
-        let mut structs = Vec::new();
-        let mut enums = Vec::new();
-        let mut traits = Vec::new();
-        let mut impls = Vec::new();
-        let mut functions = Vec::new();
+        let mut program = Program {
+            module_path: self.source.to_string().into(), // Default fallback, should be overridden by pipeline
+            item_macros: Vec::new(),
+            imports: Vec::new(),
+            macros: Vec::new(),
+            externs: Vec::new(),
+            structs: Vec::new(),
+            enums: Vec::new(),
+            traits: Vec::new(),
+            impls: Vec::new(),
+            functions: Vec::new(),
+            consts: Vec::new(),
+            topologies: Vec::new(),
+            memories: Vec::new(),
+            transfer_impls: Vec::new(),
+        };
         // Where each function was written, to report a second one with the same name.
         let mut defined_at: std::collections::HashMap<crate::symbol::Symbol, (usize, usize)> =
             std::collections::HashMap::new();
-        let mut consts = Vec::new();
-        let mut macros = Vec::new();
-        let mut transfer_impls = Vec::new();
-        let mut item_macros = Vec::new();
         while !self.check(&TokenType::Eof) {
-            let mut doc_comment: Option<String> = None;
-            while let TokenType::DocComment(c) = &self.peek().kind {
-                let text = c.to_string();
-                if let Some(existing) = &mut doc_comment {
-                    existing.push('\n');
-                    existing.push_str(&text);
-                } else {
-                    doc_comment = Some(text);
-                }
-                self.advance();
-            }
-
-            if self.check(&TokenType::Import) {
-                imports.push(self.parse_import_decl()?);
-            } else if self.check(&TokenType::MacroRules) {
-                macros.push(self.parse_macro_def()?);
-            } else if self.check(&TokenType::Extern) {
-                externs.extend(self.parse_extern_block()?);
-            } else if self.check(&TokenType::Trait) {
-                traits.push(self.parse_trait_decl()?);
-            } else if self.check(&TokenType::Impl) {
-                // `impl Transfer<Memory::A, Memory::B> for Topology::X { ... }` is a transfer
-                // lowering, not an ordinary trait impl. The trait name `Transfer` is reserved for
-                // it, so one token of lookahead separates the two: any `impl Transfer...` is a
-                // lowering, and `parse_transfer_impl` reports what is wrong with the rest of the
-                // header. Reserving the name is what makes this a one-token decision -- before
-                // Vx#353 the deciding difference between a lowering and a trait impl was the
-                // capital letter in `Transfer` versus the `transfer` keyword.
-                let is_transfer_impl = matches!(
-                    &self.peek_n(1).kind,
-                    TokenType::Identifier(s) if &**s == "Transfer"
-                ) || matches!(self.peek_n(1).kind, TokenType::Transfer);
-                if is_transfer_impl {
-                    let mut t = self.parse_transfer_impl()?;
-                    t.doc_comment = doc_comment;
-                    transfer_impls.push(t);
-                } else {
-                    impls.push(self.parse_impl_block()?);
-                }
-            } else if self.check(&TokenType::Struct) {
-                let mut s = self.parse_struct_decl()?;
-                s.doc_comment = doc_comment;
-                structs.push(s);
-            } else if self.check(&TokenType::Enum) {
-                let mut e = self.parse_enum_decl()?;
-                e.doc_comment = doc_comment;
-                enums.push(e);
-            } else if self.at_const_item() {
-                let mut c = self.parse_const_item()?;
-                c.doc_comment = doc_comment;
-                consts.push(c);
-            } else if self.at_fn_start() {
-                let start = self.peek().clone();
-                let mut f = self.parse_function()?;
-                f.doc_comment = doc_comment;
-                // Vx has no overloading: a second `fn foo` replaced the first without a word.
-                if let Some((line, column)) = defined_at.get(&f.name) {
-                    return Err(self.error_at(
-                        &start,
-                        &format!("`{}` is already defined at {line}:{column}", f.name),
-                    ));
-                }
-                defined_at.insert(f.name.clone(), (start.line, start.column));
-                functions.push(f);
-            } else if self.check(&TokenType::Topology) {
-                // `Topology <Name> { memory: Memory::X, visible: [Memory::Y, ...] }` declares a
-                // user-defined topology. Its descriptor is carried on the AST (`Program.topologies`),
-                // like a memory space -- no global registry -- and seeded into the per-compilation
-                // cost graph by sema.
-                topologies.push(self.parse_topology_decl()?);
-            } else if self.check(&TokenType::Memory) {
-                // `Memory <Name> { within:, capacity:, bandwidth:, managed:, granule: }` declares
-                // a first-class memory space. The full descriptor is stored on the AST (not a
-                // global registry); sema indexes it via `GlobalAstEnv`.
-                let mut m = self.parse_memory_decl()?;
-                m.doc_comment = doc_comment;
-                memories.push(m);
-            } else if self.at_item_macro_call() {
-                // `stamp_impl!(i32);` where an item goes. What it expands to is not known until
-                // macro expansion runs, so it is recorded and replaced there.
-                item_macros.push(self.parse_item_macro_call()?);
-            } else {
-                return Err(self.error(&format!(
-                    "Unexpected token at top level: {:?}",
-                    self.peek().kind
-                )));
-            }
+            let doc_comment = self.collect_doc_comments();
+            self.parse_item(&mut program, &mut defined_at, doc_comment)?;
         }
         // Tuple syntax stands for `core::tuple`'s structs, so it brings that module with it.
         if self.uses_tuples
-            && !imports.iter().any(|i: &ImportDecl| {
+            && !program.imports.iter().any(|i: &ImportDecl| {
                 i.path.len() == 2 && &*i.path[0] == "core" && &*i.path[1] == "tuple"
             })
         {
-            imports.push(ImportDecl {
+            program.imports.push(ImportDecl {
                 path: vec!["core".into(), "tuple".into()],
             });
         }
-        Ok(Program {
-            module_path: self.source.to_string().into(), // Default fallback, should be overridden by pipeline
-            item_macros,
-            imports,
-            macros,
-            externs,
-            structs,
-            enums,
-            traits,
-            impls,
-            functions,
-            consts,
-            topologies,
-            memories,
-            transfer_impls,
-        })
+        Ok(program)
+    }
+
+    /// Parse one declaration at the top level and add it to `program`. `doc_comment` is the
+    /// `///` text written above it, and `defined_at` holds where each function so far was
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the declaration does not parse, when the next token cannot start a
+    /// declaration, or when a function with the same name is already defined.
+    fn parse_item(
+        &mut self,
+        program: &mut Program,
+        defined_at: &mut std::collections::HashMap<crate::symbol::Symbol, (usize, usize)>,
+        doc_comment: Option<String>,
+    ) -> ParseResult<'a, ()> {
+        if self.check(&TokenType::Import) {
+            program.imports.push(self.parse_import_decl()?);
+        } else if self.check(&TokenType::MacroRules) {
+            program.macros.push(self.parse_macro_def()?);
+        } else if self.check(&TokenType::Extern) {
+            program.externs.extend(self.parse_extern_block()?);
+        } else if self.check(&TokenType::Trait) {
+            program.traits.push(self.parse_trait_decl()?);
+        } else if self.check(&TokenType::Impl) {
+            self.parse_impl_item(program, doc_comment)?;
+        } else if self.check(&TokenType::Struct) {
+            let mut s = self.parse_struct_decl()?;
+            s.doc_comment = doc_comment;
+            program.structs.push(s);
+        } else if self.check(&TokenType::Enum) {
+            let mut e = self.parse_enum_decl()?;
+            e.doc_comment = doc_comment;
+            program.enums.push(e);
+        } else if self.at_const_item() {
+            let mut c = self.parse_const_item()?;
+            c.doc_comment = doc_comment;
+            program.consts.push(c);
+        } else if self.at_fn_start() {
+            let f = self.parse_function_item(defined_at, doc_comment)?;
+            program.functions.push(f);
+        } else if self.check(&TokenType::Topology) {
+            // `Topology <Name> { memory: Memory::X, visible: [Memory::Y, ...] }` declares a
+            // user-defined topology. Its descriptor is carried on the AST (`Program.topologies`),
+            // like a memory space -- no global registry -- and seeded into the per-compilation
+            // cost graph by sema.
+            program.topologies.push(self.parse_topology_decl()?);
+        } else if self.check(&TokenType::Memory) {
+            // `Memory <Name> { within:, capacity:, bandwidth:, managed:, granule: }` declares
+            // a first-class memory space. The full descriptor is stored on the AST (not a
+            // global registry); sema indexes it via `GlobalAstEnv`.
+            let mut m = self.parse_memory_decl()?;
+            m.doc_comment = doc_comment;
+            program.memories.push(m);
+        } else if self.at_item_macro_call() {
+            // `stamp_impl!(i32);` where an item goes. What it expands to is not known until
+            // macro expansion runs, so it is recorded and replaced there.
+            program.item_macros.push(self.parse_item_macro_call()?);
+        } else {
+            return Err(self.error(&format!(
+                "Unexpected token at top level: {:?}",
+                self.peek().kind
+            )));
+        }
+        Ok(())
+    }
+
+    /// Parse a top-level `impl` and add it to `program`: a transfer lowering when the trait is
+    /// `Transfer`, an ordinary impl block otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the impl does not parse.
+    fn parse_impl_item(
+        &mut self,
+        program: &mut Program,
+        doc_comment: Option<String>,
+    ) -> ParseResult<'a, ()> {
+        // `impl Transfer<Memory::A, Memory::B> for Topology::X { ... }` is a transfer
+        // lowering, not an ordinary trait impl. The trait name `Transfer` is reserved for
+        // it, so one token of lookahead separates the two: any `impl Transfer...` is a
+        // lowering, and `parse_transfer_impl` reports what is wrong with the rest of the
+        // header. Reserving the name is what makes this a one-token decision -- before
+        // Vx#353 the deciding difference between a lowering and a trait impl was the
+        // capital letter in `Transfer` versus the `transfer` keyword.
+        let is_transfer_impl = matches!(
+            &self.peek_n(1).kind,
+            TokenType::Identifier(s) if &**s == "Transfer"
+        ) || matches!(self.peek_n(1).kind, TokenType::Transfer);
+        if is_transfer_impl {
+            let mut t = self.parse_transfer_impl()?;
+            t.doc_comment = doc_comment;
+            program.transfer_impls.push(t);
+        } else {
+            program.impls.push(self.parse_impl_block()?);
+        }
+        Ok(())
+    }
+
+    /// Parse a top-level function and record where it was written in `defined_at`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the function does not parse, or when a function with the same name is
+    /// already defined.
+    fn parse_function_item(
+        &mut self,
+        defined_at: &mut std::collections::HashMap<crate::symbol::Symbol, (usize, usize)>,
+        doc_comment: Option<String>,
+    ) -> ParseResult<'a, Function> {
+        let start = self.peek().clone();
+        let mut f = self.parse_function()?;
+        f.doc_comment = doc_comment;
+        // Vx has no overloading: a second `fn foo` replaced the first without a word.
+        if let Some((line, column)) = defined_at.get(&f.name) {
+            return Err(self.error_at(
+                &start,
+                &format!("`{}` is already defined at {line}:{column}", f.name),
+            ));
+        }
+        defined_at.insert(f.name.clone(), (start.line, start.column));
+        Ok(f)
     }
 
     /// `impl Transfer<Memory::A, Memory::B> for Topology::X { fn ... }` — a transfer lowering
-    /// (docs/custom_transfer_contract.md). The body is ordinary `fn` items, parsed by
+    /// (`docs/custom_transfer_contract.md`). The body is ordinary `fn` items, parsed by
     /// `parse_function` like an impl block's methods.
     ///
     /// The bodies are macro-expanded, structurally checked (E6015), and type-checked like impl
@@ -1467,6 +1729,11 @@ impl<'a> Parser<'a> {
     /// The `for Topology::X` clause is required, because a lowering is code for one machine's
     /// edge. Two parts can declare the same edge and move it with different instructions
     /// (`cp.async` on Ampere, TMA on Hopper), and before Vx#353 only one of them could say so.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the header is not `impl Transfer<Memory::A, Memory::B> for Topology::X`, or
+    /// when the block holds anything that is not a function that parses.
     pub(crate) fn parse_transfer_impl(&mut self) -> ParseResult<'a, TransferImplDecl> {
         self.consume(&TokenType::Impl, "Expected 'impl'")?;
         // The old spelling, `impl transfer Memory::A -> Memory::B`, used the lowercase keyword.
@@ -1482,8 +1749,7 @@ impl<'a> Parser<'a> {
         let trait_name = self.expect_identifier("Expected 'Transfer' after 'impl'")?;
         if trait_name != "Transfer" {
             return Err(self.error(&format!(
-                "Expected 'Transfer' after 'impl', got '{}'",
-                trait_name
+                "Expected 'Transfer' after 'impl', got '{trait_name}'"
             )));
         }
         // `impl Transfer for SomeType` was the implicit-movement opt-in until Vx#353. It is
@@ -1514,23 +1780,30 @@ impl<'a> Parser<'a> {
              machine's edge, so it has to name the machine",
         )?;
         let topology = self.parse_topology()?;
+        let methods = self.parse_transfer_impl_methods()?;
+        Ok(TransferImplDecl {
+            from,
+            to,
+            topology,
+            methods,
+            doc_comment: None,
+        })
+    }
+
+    /// Parse the block of a transfer lowering, from `{` to `}`: functions only.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a brace is missing, or when the block holds anything that is not a function
+    /// that parses.
+    fn parse_transfer_impl_methods(&mut self) -> ParseResult<'a, Vec<Function>> {
         self.consume(
             &TokenType::LeftBrace,
             "Expected '{' after 'impl Transfer' header",
         )?;
         let mut methods = Vec::new();
         while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
-            let mut doc_comment: Option<String> = None;
-            while let TokenType::DocComment(c) = &self.peek().kind {
-                let text = c.to_string();
-                if let Some(existing) = &mut doc_comment {
-                    existing.push('\n');
-                    existing.push_str(&text);
-                } else {
-                    doc_comment = Some(text);
-                }
-                self.advance();
-            }
+            let doc_comment = self.collect_doc_comments();
             if !self.at_fn_start() {
                 return Err(self.error(&format!(
                     "Expected 'fn' inside 'impl Transfer' (a lowering is functions only), got {:?}",
@@ -1545,19 +1818,23 @@ impl<'a> Parser<'a> {
             &TokenType::RightBrace,
             "Expected '}' to close 'impl Transfer'",
         )?;
-        Ok(TransferImplDecl {
-            from,
-            to,
-            topology,
-            methods,
-            doc_comment: None,
-        })
+        Ok(methods)
     }
 }
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
+    use crate::syntax::{
+        ArrayExpr, AssignStmt, BinaryOp, BinaryOpExpr, CompoundAssignStmt, Dim, ElementType, Expr,
+        ForLoopStmt, FunctionCallExpr, IndexAccessExpr, LetDeclStmt, MemberAccessExpr,
+        MethodCallExpr, NumberExpr, RangeExpr, SpawnOnExpr, UnsafeBlockExpr,
+    };
     use rstest::rstest;
 
     #[rstest]
@@ -1577,7 +1854,7 @@ mod tests {
         // `impl Transfer<Memory::A, Memory::B> for Topology::X { fn ... }`. The body is ordinary
         // Vx -- that is the design's whole point -- so an ordinary function must parse inside it
         // unchanged.
-        let input = r#"
+        let input = r"
 /// Fills a distinct destination, so this is the copy shape.
 impl Transfer<Memory::L2, Memory::SMEM> for Topology::Dev {
     /// One cooperative copy loop.
@@ -1590,7 +1867,7 @@ impl Transfer<Memory::L2, Memory::SMEM> for Topology::Dev {
         return i;
     }
 }
-"#;
+";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -1620,7 +1897,7 @@ impl Transfer<Memory::L2, Memory::SMEM> for Topology::Dev {
         // The dispatch is one token of lookahead on a keyword; a plain impl block right next to a
         // transfer impl must still land in `impls`. This is the regression the lookahead could
         // cause and must not.
-        let input = r#"
+        let input = r"
 struct Pair { a: i32 }
 impl Pair {
     fn get(x: i32) -> i32 { return x; }
@@ -1628,7 +1905,7 @@ impl Pair {
 impl Transfer<Memory::GPU_HBM, Memory::L2> for Topology::Dev {
     fn stage() -> i32 { return 0; }
 }
-"#;
+";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -1665,12 +1942,12 @@ impl Transfer<Memory::GPU_HBM, Memory::L2> for Topology::Dev {
     fn transfer_impl_bodies_are_macro_expanded() {
         // Macro expansion walks functions and impl methods; a lowering body must expand too, or
         // a MacroCall node survives for every downstream pass to trip on (Vx#352 review finding).
-        let input = r#"
+        let input = r"
 macro_rules! one { () => { 1 } }
 impl Transfer<Memory::L2, Memory::SMEM> for Topology::Dev {
     fn move_tile() -> i32 { return one!(); }
 }
-"#;
+";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -1702,12 +1979,12 @@ impl Transfer<Memory::L2, Memory::SMEM> for Topology::Dev {
         // body had gone missing. A derived figure that silently reports nothing when its
         // input vanished is worse than no figure, so the weight argument loses: these are
         // copy loops, a few statements each.
-        let input = r#"
+        let input = r"
 impl Transfer<Memory::L2, Memory::SMEM> for Topology::Dev {
     fn move_tile(n: i32) -> i32 { return n; }
 }
 fn ordinary(n: i32) -> i32 { return n; }
-"#;
+";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -1733,7 +2010,7 @@ fn ordinary(n: i32) -> i32 { return n; }
 
     #[test]
     fn test_parse_distributed_matmul() {
-        let input = r#"
+        let input = r"
 fn distributed_matmul(a: Ref<Tensor<f32, [?, ?]>, Memory::CPU_DRAM>, b: Ref<Tensor<f32, [?, ?]>, Memory::CPU_DRAM>) -> Verified<Tensor<f32, [?, ?]>> {
     spawn on(Topology::NPU[0]) {
         let local_a = transfer(a, Memory::NPU_HBM);
@@ -1742,7 +2019,7 @@ fn distributed_matmul(a: Ref<Tensor<f32, [?, ?]>, Memory::CPU_DRAM>, b: Ref<Tens
         return transfer(result, Memory::CPU_DRAM);
     }
 }
-        "#;
+        ";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -2009,7 +2286,7 @@ fn distributed_matmul(a: Ref<Tensor<f32, [?, ?]>, Memory::CPU_DRAM>, b: Ref<Tens
 
     #[test]
     fn test_parse_full_custom_matmul() {
-        let input = r#"
+        let input = r"
         fn custom_matmul(a: Ref<Tensor<f32, [?, ?]>, Memory::NPU_HBM>, b: Ref<Tensor<f32, [?, ?]>, Memory::NPU_HBM>) -> Verified<Tensor<f32, [?, ?]>> {
             spawn on(Topology::NPU[0]) {
                 let mut result: Tensor<f32, [?, ?]> = Tensor<f32, [?, ?], Memory::NPU_HBM>::uninit([a.shape[0], b.shape[1]]);
@@ -2024,7 +2301,7 @@ fn distributed_matmul(a: Ref<Tensor<f32, [?, ?]>, Memory::CPU_DRAM>, b: Ref<Tens
                 return Verified(result);
             }
         }
-        "#;
+        ";
         let tokens = Lexer::new(input).tokenize();
         let mut parser = Parser::new(&tokens, input);
         let program = parser.parse().unwrap();
@@ -2050,7 +2327,7 @@ fn distributed_matmul(a: Ref<Tensor<f32, [?, ?]>, Memory::CPU_DRAM>, b: Ref<Tens
 
     #[test]
     fn test_parse_struct_and_pointers() {
-        let input = r#"
+        let input = r"
         struct Config {
             value: Tensor<i32, [?, ?]>,
             threshold: Tensor<f32, [?, ?]>
@@ -2063,7 +2340,7 @@ fn distributed_matmul(a: Ref<Tensor<f32, [?, ?]>, Memory::CPU_DRAM>, b: Ref<Tens
             }
             return c.value < 20;
         }
-        "#;
+        ";
         let tokens = Lexer::new(input).tokenize();
         let mut parser = Parser::new(&tokens, input);
         let program = parser.parse().unwrap();
@@ -2139,7 +2416,7 @@ fn distributed_matmul(a: Ref<Tensor<f32, [?, ?]>, Memory::CPU_DRAM>, b: Ref<Tens
 
     #[test]
     fn test_parse_implicit_return() {
-        let input = r#"
+        let input = r"
 fn stdout_write(buffer: *const u8, len: i64) -> i64 {
     vx_stdout_write(buffer, len)
 }
@@ -2147,7 +2424,7 @@ fn stdout_write(buffer: *const u8, len: i64) -> i64 {
 fn stderr_write(buffer: *const u8, len: i64) -> i64 {
     vx_stderr_write(buffer, len);
 }
-        "#;
+        ";
         let tokens = Lexer::new(input).tokenize();
         let mut parser = Parser::new(&tokens, input);
         let program = parser.parse().unwrap();

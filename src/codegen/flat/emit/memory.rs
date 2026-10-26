@@ -3,20 +3,31 @@
 //! One `impl` block on the per-function emitter; the dispatch that reaches these
 //! lives in `step`, next to the struct.
 
-use super::super::*;
+use std::fmt::Write as _;
+
+use super::super::{
+    elem_of_gid, mlir_scalar, mlir_vector, peel_wrappers, pointee_agg_gid, ptr_gid,
+    tensor_memref_ty, Decline, FnEmit, HirInstruction, Lowered, Type,
+};
 
 impl FnEmit<'_> {
-    // Parameter materialization: the register *is* the block argument, no op emitted. A
-    // scalar param records its element type; a tensor param records its memref type (from the
-    // side table) so later index/store ops address it.
+    /// Parameter materialization: the register *is* the block argument, no op emitted. A
+    /// scalar param records its element type; a tensor param records its memref type (from the
+    /// side table) so later index/store ops address it.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the type of the parameter is not tracked.
     pub(crate) fn op_load(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         // `arg_offset` is 1 when a return slot took `%arg0`, so declared parameter `i` is
         // `%arg{i + 1}` in the signature this body was emitted against.
-        self.names[idx] = format!("%arg{}", ins.imm as u32 + self.arg_offset);
+        self.names[idx] = format!("%arg{}", ins.imm + u64::from(self.arg_offset));
         let gid = *self
             .types
             .get(ins.type_idx.0 as usize)
             .ok_or(crate::emitter_gap!())?;
+        // An index too large for this machine names no parameter.
+        let param_idx = usize::try_from(ins.imm).unwrap_or(usize::MAX);
         if let Some(e) = elem_of_gid(gid) {
             self.etypes[idx] = Some(e);
         } else if gid == ptr_gid() {
@@ -27,7 +38,7 @@ impl FnEmit<'_> {
             if let Some(agg_gid) = self
                 .func
                 .params
-                .get(ins.imm as usize)
+                .get(param_idx)
                 .and_then(|(_, ty)| pointee_agg_gid(ty, self.ctx))
             {
                 self.agg_of[idx] = Some(agg_gid);
@@ -42,7 +53,7 @@ impl FnEmit<'_> {
         } else if let Some(Type::Simd(e, lanes)) = self
             .func
             .params
-            .get(ins.imm as usize)
+            .get(param_idx)
             .map(|(_, ty)| peel_wrappers(ty))
         {
             // A `<N x T>` parameter: a `vector<NxT>` block argument. The spelling comes off the
@@ -53,9 +64,14 @@ impl FnEmit<'_> {
         Ok(())
     }
 
-    // A named local's stack slot. A scalar slot is a rank-0 memref (matching the AST codegen's
-    // scalar locals); an aggregate (struct) slot is an `llvm.alloca` of the `!llvm.struct`
-    // type, its pointer tracked in `agg_of` so field ops can address it.
+    /// A named local's stack slot. A scalar slot is a rank-0 memref (matching the AST codegen's
+    /// scalar locals); an aggregate (struct) slot is an `llvm.alloca` of the `!llvm.struct`
+    /// type, its pointer tracked in `agg_of` so field ops can address it.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the type of the slot is not tracked, or is neither a modelled scalar, a
+    /// pointer nor a struct with a layout.
     pub(crate) fn op_alloca(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let gid = *self
             .types
@@ -111,8 +127,13 @@ impl FnEmit<'_> {
         Ok(())
     }
 
-    // Store a value into a slot (no result). A scalar slot is a rank-0 `memref`; an aggregate
-    // slot (a struct value spilled from a struct-returning call) is an `llvm.store` (#215).
+    /// Store a value into a slot (no result). A scalar slot is a rank-0 `memref`; an aggregate
+    /// slot (a struct value spilled from a struct-returning call) is an `llvm.store` (#215).
+    ///
+    /// # Errors
+    ///
+    /// Declines when the slot or the value is not tracked, or the element type of the slot is
+    /// not known.
     pub(crate) fn op_store(&mut self, _idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let slot = self
             .names
@@ -138,8 +159,9 @@ impl FnEmit<'_> {
         };
         if let Some(&Some(agg_gid)) = self.agg_of.get(ins.operand1.0 as usize) {
             let agg = self.ctx.aggs.get(&agg_gid).ok_or(crate::emitter_gap!())?;
-            self.body += &format!(
-                "  llvm.store {val}, {slot} : {}, !llvm.ptr\n",
+            let _ = writeln!(
+                self.body,
+                "  llvm.store {val}, {slot} : {}, !llvm.ptr",
                 agg.struct_ty
             );
         } else if *self
@@ -148,7 +170,10 @@ impl FnEmit<'_> {
             .ok_or(crate::emitter_gap!())?
         {
             // A pointer local: store the `!llvm.ptr` value into its `llvm.alloca` cell. (#235)
-            self.body += &format!("  llvm.store {val}, {slot} : !llvm.ptr, !llvm.ptr\n");
+            let _ = writeln!(
+                self.body,
+                "  llvm.store {val}, {slot} : !llvm.ptr, !llvm.ptr"
+            );
         } else if let Some(e) = self
             .sslot_of
             .get(ins.operand1.0 as usize)
@@ -157,17 +182,27 @@ impl FnEmit<'_> {
         {
             // An address-taken scalar slot (an `llvm.alloca` of the element): `llvm.store`. (#230)
             let mt = mlir_scalar(&e).ok_or(crate::emitter_gap!())?;
-            self.body += &format!("  llvm.store {val}, {slot}{attr} : {mt}, !llvm.ptr\n");
+            let _ = writeln!(
+                self.body,
+                "  llvm.store {val}, {slot}{attr} : {mt}, !llvm.ptr"
+            );
         } else {
             let e = self.elem_at(ins.operand1.0).ok_or(crate::emitter_gap!())?;
             let mt = mlir_scalar(&e).ok_or(crate::emitter_gap!())?;
-            self.body += &format!("  memref.store {val}, {slot}[]{attr} : memref<{mt}>\n");
+            let _ = writeln!(
+                self.body,
+                "  memref.store {val}, {slot}[]{attr} : memref<{mt}>"
+            );
         }
         Ok(())
     }
 
-    // Load a value back from a slot; the result type is the slot's element (this
-    // instruction's own `type_idx`).
+    /// Load a value back from a slot; the result type is the slot's element (this
+    /// instruction's own `type_idx`).
+    ///
+    /// # Errors
+    ///
+    /// Declines when the slot is not tracked, or its element type is not a modelled scalar.
     pub(crate) fn op_slot_load(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         // A pointer slot loads back an `!llvm.ptr` value (`llvm.load`); an aggregate slot loads
         // the whole `!llvm.struct` value (`llvm.load`, #242 Vec<Vec<T>>); a scalar slot loads
@@ -179,8 +214,9 @@ impl FnEmit<'_> {
                 .get(ins.operand1.0 as usize)
                 .ok_or(crate::emitter_gap!())?;
             let n = format!("%v{idx}");
-            self.body += &format!(
-                "  {n} = llvm.load {slot} : !llvm.ptr -> {}\n",
+            let _ = writeln!(
+                self.body,
+                "  {n} = llvm.load {slot} : !llvm.ptr -> {}",
                 agg.struct_ty
             );
             self.names[idx] = n;
@@ -195,7 +231,10 @@ impl FnEmit<'_> {
                 .get(ins.operand1.0 as usize)
                 .ok_or(crate::emitter_gap!())?;
             let n = format!("%v{idx}");
-            self.body += &format!("  {n} = llvm.load {slot} : !llvm.ptr -> !llvm.ptr\n");
+            let _ = writeln!(
+                self.body,
+                "  {n} = llvm.load {slot} : !llvm.ptr -> !llvm.ptr"
+            );
             self.names[idx] = n;
             self.ptr_of[idx] = true;
         } else if let Some(e) = self
@@ -211,7 +250,7 @@ impl FnEmit<'_> {
                 .get(ins.operand1.0 as usize)
                 .ok_or(crate::emitter_gap!())?;
             let n = format!("%v{idx}");
-            self.body += &format!("  {n} = llvm.load {slot} : !llvm.ptr -> {mt}\n");
+            let _ = writeln!(self.body, "  {n} = llvm.load {slot} : !llvm.ptr -> {mt}");
             self.names[idx] = n;
             self.etypes[idx] = Some(e);
         } else {
@@ -222,7 +261,7 @@ impl FnEmit<'_> {
                 .get(ins.operand1.0 as usize)
                 .ok_or(crate::emitter_gap!())?;
             let n = format!("%v{idx}");
-            self.body += &format!("  {n} = memref.load {slot}[] : memref<{mt}>\n");
+            let _ = writeln!(self.body, "  {n} = memref.load {slot}[] : memref<{mt}>");
             self.names[idx] = n;
             self.etypes[idx] = Some(e);
         }

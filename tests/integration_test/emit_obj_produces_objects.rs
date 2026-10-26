@@ -43,7 +43,7 @@ fn the_backend_corpus_emits_object_files() {
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("tests/backend/pass is missing")
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "vx"))
         .collect();
@@ -68,9 +68,7 @@ fn the_backend_corpus_emits_object_files() {
             .output()
             .expect("failed to run vxc");
         // An object that exists and is non-empty is the only evidence that counts.
-        let produced = std::fs::metadata(&obj)
-            .map(|m| m.len() > 0)
-            .unwrap_or(false);
+        let produced = std::fs::metadata(&obj).is_ok_and(|m| m.len() > 0);
         let known = KNOWN_BROKEN.iter().find(|(p, _)| *p == name);
 
         match (produced, known) {
@@ -86,7 +84,7 @@ fn the_backend_corpus_emits_object_files() {
                 }
             )),
             (true, Some((_, why))) => {
-                unexpectedly_fine.push(format!("  {name}: was listed as broken: {why}"))
+                unexpectedly_fine.push(format!("  {name}: was listed as broken: {why}"));
             }
             _ => {}
         }

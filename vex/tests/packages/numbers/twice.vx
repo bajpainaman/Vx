@@ -1,0 +1,12 @@
+//===- twice.vx - Vx Package Tool -------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A library package with no dependencies.
+
+fn twice(n : i64) -> i64 {
+  return n * 2;
+}

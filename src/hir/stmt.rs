@@ -12,7 +12,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::*;
+use super::{
+    ArrayExpr, AssertStmt, AssignStmt, BinaryOp, BinaryOpExpr, BorrowExpr, CompoundAssignStmt,
+    ComptimeBlockExpr, ElementType, EnumDecl, Expr, ExprStmtStmt, ForLoopStmt, Function,
+    FunctionCallExpr, IdentifierExpr, IfExpr, IndexAccessExpr, IndirectCallExpr, LetDeclStmt,
+    LogicalOp, LogicalOpExpr, LoopStmt, NumberExpr, RelationalOp, RelationalOpExpr, ReturnStmt,
+    Span, Statement, StructDecl, Topology, TopologyExpr, Type, TypeChecker, UnaryOp, UnaryOpExpr,
+    Value,
+};
 
 use crate::hir;
 use crate::hir::borrow_cx::BlockUses;
@@ -23,11 +30,23 @@ use crate::hir::comptime_interpreter::{
 use crate::syntax;
 
 /// What a loop's header names for its body. The header runs before every pass.
+#[derive(Clone, Copy)]
 pub(crate) struct LoopHeader<'e> {
     /// The variable a `for` loop declares.
     pub(crate) binds: Option<&'e str>,
     /// The iterator a `for` loop takes each value from.
     pub(crate) evaluates: Option<&'e Expr>,
+}
+
+/// Borrows that are set aside for a while, each with the variable it borrows from.
+type ReservedBorrows = Vec<(crate::symbol::Symbol, crate::hir::env::BorrowRecord)>;
+
+/// The operator of a compound assignment such as `a += b`.
+struct CompoundOp<'a> {
+    /// The operator that sits between the two sides: `+` in `a += b`.
+    op: &'a BinaryOp,
+    /// Where the checker records the type of the two sides, for code generation.
+    operand_ty: &'a mut Option<crate::syntax::ElementType>,
 }
 
 /// What running a statement did to the block it sits in.
@@ -47,7 +66,7 @@ pub(crate) enum EvalFlow {
     Continue,
 }
 
-impl<'a> TypeChecker<'a> {
+impl TypeChecker<'_> {
     /// Run the comptime interpreter and return the observation that decides folding.
     ///
     /// The control checker uses its concrete result when it is supported and has no escaping
@@ -151,16 +170,17 @@ impl<'a> TypeChecker<'a> {
         &mut self,
         body: &mut Vec<Statement>,
         return_type: &Type,
-        header: LoopHeader,
+        header: LoopHeader<'_>,
     ) {
         self.check_block_as(body, return_type, Some(header));
     }
 
+    /// Checks a block. `header` is `Some` for a loop body and `None` for a function body.
     fn check_block_as(
         &mut self,
         body: &mut Vec<Statement>,
         return_type: &Type,
-        header: Option<LoopHeader>,
+        header: Option<LoopHeader<'_>>,
     ) {
         Self::name_loop_literals(body);
         let mut terminated = false;
@@ -199,7 +219,10 @@ impl<'a> TypeChecker<'a> {
                 declared.insert(name.clone(), true);
             }
         }
-        #[allow(clippy::needless_range_loop)]
+        #[allow(
+            clippy::needless_range_loop,
+            reason = "the loop reads `body[i]` and also passes it on as a mutable reference"
+        )]
         for i in 0..body.len() {
             self.borrow.set_stmt(i);
             self.drops_set_stmt(i);
@@ -313,6 +336,11 @@ impl<'a> TypeChecker<'a> {
         last_use
     }
 
+    /// Type check one statement.
+    ///
+    /// # Panics
+    ///
+    /// If a `return` that was just checked with a value no longer has that value.
     pub(crate) fn check_statement(
         &mut self,
         stmt: &mut Statement,
@@ -326,7 +354,7 @@ impl<'a> TypeChecker<'a> {
             Statement::Break(b) => self.drops_exit("break", b.span.line, true),
             Statement::Continue(c) => self.drops_exit("continue", c.span.line, true),
             Statement::Assign(AssignStmt { lhs, rhs, span: _ }) => {
-                self.check_assign_stmt(lhs, None, rhs, consume, None)
+                self.check_assign_stmt(lhs, rhs, None, consume);
             }
             Statement::CompoundAssign(CompoundAssignStmt {
                 lhs,
@@ -336,7 +364,11 @@ impl<'a> TypeChecker<'a> {
                 operand_ty,
             }) => {
                 let op = op.clone();
-                self.check_assign_stmt(lhs, Some(&op), rhs, consume, Some(operand_ty))
+                let compound = CompoundOp {
+                    op: &op,
+                    operand_ty,
+                };
+                self.check_assign_stmt(lhs, rhs, Some(compound), consume);
             }
             Statement::Return(ret) => {
                 if self.check_return_stmt(ret, consume, return_type) {
@@ -381,14 +413,14 @@ impl<'a> TypeChecker<'a> {
     fn check_let_decl_stmt(&mut self, decl: &mut LetDeclStmt, consume: bool) {
         let LetDeclStmt {
             name,
-            is_mut: _is_mut,
+            is_mut,
             ty_ann,
             expr,
             span,
         } = decl;
         // Track declared variables for W1001 (unused variable) and W1004 (`mut` never needed)
         self.declared_vars.push((name.clone(), *span));
-        if *_is_mut {
+        if *is_mut {
             self.declared_mut_vars.push((name.clone(), *span));
         }
 
@@ -401,52 +433,16 @@ impl<'a> TypeChecker<'a> {
         self.expected_type = prev_expected;
         self.current_assignment_target = None;
 
-        let mut tmp_env = HashMap::new();
-        for env in &self.consteval.env {
-            for (k, v) in env {
-                tmp_env.insert(k.clone(), v.clone());
-            }
-        }
-        if let Some(val) = self.eval_expr(expr, &tmp_env) {
-            self.consteval
-                .env
-                .last_mut()
-                .unwrap()
-                .insert(name.to_string().into(), val);
-        }
+        self.record_let_comptime_value(name, expr);
 
         // A `transfer(..)` validates its destination and records the tile it lands, at its own
         // site. The binding adds nothing: checking its type as well reported the same overflow
         // twice, counted one tile as two, and re-litigated a destination the transfer had
         // already accepted.
         let initializer_places_its_own = matches!(expr, Expr::Transfer(_));
-        let context = format!("variable '{}'", name);
+        let context = format!("variable '{name}'");
         let binding_ty = if let Some(ann) = ty_ann {
-            // `Unknown` is the poison type of an already-reported failure (an unresolved call, a
-            // type parameter nothing binds); a mismatch against it would report that twice.
-            if ty != Type::Unknown && !self.is_assignable(ann, &ty) {
-                let splat = matches!(
-                    (&*ann, &ty),
-                    (Type::Tensor(el, dims, _), Type::Scalar(s)) if !dims.is_empty() && el == s
-                );
-                if splat {
-                    self.errors.error_with_code(
-                        crate::diagnostic::DiagnosticCode::E3023,
-                        format!(
-                            "'{}' is a shaped tensor initialized from a scalar; write \
-                             `Tensor<..>::fill(v)` to fill every element with it",
-                            name
-                        ),
-                        Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
-                    );
-                } else {
-                    self.errors.error_with_code(
-                        crate::diagnostic::DiagnosticCode::E3001,
-                        format!("'{name}' is declared {ann} but its initializer is {ty}"),
-                        Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
-                    );
-                }
-            }
+            self.report_let_type_mismatch(name, ann, &ty, span);
             // Capacity: a placed tensor annotation must fit its memory space.
             if !initializer_places_its_own {
                 self.check_type_placement(ann, &context, span);
@@ -465,7 +461,7 @@ impl<'a> TypeChecker<'a> {
             ty
         };
 
-        self.bind_view(name.as_ref(), *_is_mut, expr, &binding_ty, span);
+        self.bind_view(name.as_ref(), *is_mut, expr, &binding_ty, span);
         if !self.speculating && !Self::views_foreign_memory(expr) {
             self.drops_note_owner(name.as_ref(), &binding_ty);
         }
@@ -476,11 +472,51 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
-        // Record where a binding points, so a later `return` of it can be checked for
-        // escape (#243): a reference, or any value that can hold one -- a `View { r : &x }`
-        // or a closure that uses a local. A binding whose provenance we can't determine is
-        // left unrecorded rather than assumed safe-or-unsafe.
-        if self.type_can_hold_reference(&binding_ty) {
+        self.record_let_provenance(name, expr, &binding_ty, span);
+
+        // Shadowing: this binding hides any earlier one with the same name, so earlier
+        // facts about the name are now about a dead binding and must not participate in
+        // proofs (a stale `i == 1` beside a new `i == 9` proves anything). Neutralized
+        // for mutable bindings too -- they record no new fact, but they still shadow.
+        self.set_mutable(name.as_ref(), *is_mut);
+        self.neutralize_facts_mentioning(name.as_ref());
+        if !*is_mut {
+            self.record_let_equality(name, expr);
+        }
+    }
+
+    /// Record the fact `name == expr` for the prover, for an immutable `let`.
+    fn record_let_equality(&mut self, name: &crate::symbol::Symbol, expr: &Expr) {
+        let id_expr = Expr::Identifier(IdentifierExpr {
+            name: name.clone(),
+            span: Span::default(),
+        });
+        // `raw::extent(t)` folds to its literal element count first: the prover cannot
+        // lower a function call, so `let n = raw::extent(src)` would otherwise record
+        // an unlowerable fact and every bound written against `n` would be unprovable
+        // (Vx#353).
+        let eq_expr = Expr::RelationalOp(RelationalOpExpr {
+            lhs: Box::new(id_expr),
+            op: RelationalOp::Eq,
+            rhs: Box::new(self.fold_raw_extent(expr)),
+            span: Span::default(),
+            operand_ty: None,
+        });
+        self.consteval.constraints.push(eq_expr);
+    }
+
+    /// Record where a new binding points, so a later `return` of it can be checked for
+    /// escape (#243): a reference, or any value that can hold one -- a `View { r : &x }`
+    /// or a closure that uses a local. A binding whose provenance we can't determine is
+    /// left unrecorded rather than assumed safe-or-unsafe.
+    fn record_let_provenance(
+        &mut self,
+        name: &crate::symbol::Symbol,
+        expr: &Expr,
+        binding_ty: &Type,
+        span: &Span,
+    ) {
+        if self.type_can_hold_reference(binding_ty) {
             if let Some(prov) = self.ref_provenance_of(expr) {
                 // `let r = if c { let t = 1; &t } else { .. }`: `t`'s block has ended.
                 if let crate::hir::env::RefProvenance::Local(depth) = prov {
@@ -494,35 +530,64 @@ impl<'a> TypeChecker<'a> {
                 self.borrow.ref_provenance.remove(name.as_ref());
             }
         }
+    }
 
-        // Shadowing: this binding hides any earlier one with the same name, so earlier
-        // facts about the name are now about a dead binding and must not participate in
-        // proofs (a stale `i == 1` beside a new `i == 9` proves anything). Neutralized
-        // for mutable bindings too -- they record no new fact, but they still shadow.
-        self.set_mutable(name.as_ref(), *_is_mut);
-        self.neutralize_facts_mentioning(name.as_ref());
-        if !*_is_mut {
-            let id_expr = Expr::Identifier(IdentifierExpr {
-                name: name.clone(),
-                span: Span::default(),
-            });
-            // `raw::extent(t)` folds to its literal element count first: the prover cannot
-            // lower a function call, so `let n = raw::extent(src)` would otherwise record
-            // an unlowerable fact and every bound written against `n` would be unprovable
-            // (Vx#353).
-            let eq_expr = Expr::RelationalOp(RelationalOpExpr {
-                lhs: Box::new(id_expr),
-                op: RelationalOp::Eq,
-                rhs: Box::new(self.fold_raw_extent(expr)),
-                span: Span::default(),
-                operand_ty: None,
-            });
-            self.consteval.constraints.push(eq_expr);
+    /// Report a `let` whose initializer, of type `ty`, cannot be assigned to its annotation.
+    fn report_let_type_mismatch(
+        &mut self,
+        name: &crate::symbol::Symbol,
+        ann: &Type,
+        ty: &Type,
+        span: &Span,
+    ) {
+        // `Unknown` is the poison type of an already-reported failure (an unresolved call, a
+        // type parameter nothing binds); a mismatch against it would report that twice.
+        if *ty != Type::Unknown && !self.is_assignable(ann, ty) {
+            let splat = matches!(
+                (ann, ty),
+                (Type::Tensor(el, dims, _), Type::Scalar(s)) if !dims.is_empty() && el == s
+            );
+            if splat {
+                self.errors.error_with_code(
+                    crate::diagnostic::DiagnosticCode::E3023,
+                    format!(
+                        "'{name}' is a shaped tensor initialized from a scalar; write \
+                         `Tensor<..>::fill(v)` to fill every element with it"
+                    ),
+                    Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+                );
+            } else {
+                self.errors.error_with_code(
+                    crate::diagnostic::DiagnosticCode::E3001,
+                    format!("'{name}' is declared {ann} but its initializer is {ty}"),
+                    Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+                );
+            }
         }
     }
 
-    /// Check a `for` loop: type the iterable, bind the induction variable's element type, prove
-    /// loop invariants on entry, and check the body.
+    /// Remember the value of a `let` initializer that can be worked out while compiling.
+    ///
+    /// # Panics
+    ///
+    /// If the checker has no scope of compile-time values open, which it always has.
+    fn record_let_comptime_value(&mut self, name: &crate::symbol::Symbol, expr: &Expr) {
+        let mut tmp_env = HashMap::new();
+        for env in &self.consteval.env {
+            for (k, v) in env {
+                tmp_env.insert(k.clone(), v.clone());
+            }
+        }
+        if let Some(val) = self.eval_expr(expr, &tmp_env) {
+            self.consteval
+                .env
+                .last_mut()
+                .unwrap()
+                .insert(name.to_string().into(), val);
+        }
+    }
+
+    /// The name of the method a `for` loop over `&c` or `&mut c` calls on the collection.
     fn iter_method_name(is_mut: bool) -> &'static str {
         if is_mut {
             "iter_mut"
@@ -579,14 +644,15 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn check_for_loop_stmt(&mut self, floop: &mut ForLoopStmt, consume: bool, return_type: &Type) {
+    /// `for x in t` over a tensor reads it by index: the loop is rewritten to
+    /// `for $i in 0..t.len() { let x = t[$i]; .. }`. A loop over anything else is left as it is.
+    fn index_tensor_for_loop(&mut self, floop: &mut ForLoopStmt) {
         let ForLoopStmt {
             iter,
             iterable,
-            invariants,
             body,
             span: loop_span,
-            next_fn,
+            ..
         } = floop;
         let loop_span = *loop_span;
         // `for x in t` over a tensor reads it by index: `for $i in 0..t.len() { let x = t[$i]; .. }`.
@@ -629,42 +695,57 @@ impl<'a> TypeChecker<'a> {
                 ));
                 *iter = index;
             } else if !self.speculating {
-                let message = if matches!(&**iterable, Expr::Array(_)) {
-                    "a `for` loop cannot go over a nested array literal; make it with \
-                     `Tensor<T>([[..], [..]])` and bind it with `let` first"
-                } else {
-                    "a `for` loop over a tensor reads it by index, so the tensor needs a name: \
-                     bind it with `let` first"
-                };
-                self.errors.error_with_code(
-                    crate::diagnostic::DiagnosticCode::E3046,
-                    message.to_string(),
-                    // An array literal has no position of its own; the loop has.
-                    Some(crate::diagnostic::SourceSpan::from_ast_span(
-                        &match &**iterable {
-                            Expr::Array(_) => loop_span,
-                            other => other.span(),
-                        },
-                    )),
-                );
+                self.report_unnamed_tensor_loop(iterable, loop_span);
             }
         }
-        // `for x in it` consumes `it`, as Rust's does: the loop drives a copy of the
-        // iterator to exhaustion, so letting the name live on would hand back a value
-        // that had not moved.
-        //
-        // The consumption is deferred past the synthesized `next` below, though. Marking
-        // the move here left that call looking the method up on a consumed variable, of
-        // type `?`. Whether this is an iterator is read off the binding rather than by
-        // type-checking the expression twice, which would report each of its errors twice.
-        let defers_consume = consume
-            && match &**iterable {
+    }
+
+    /// Report a `for` loop over a tensor that has no name, which the loop cannot read by index.
+    fn report_unnamed_tensor_loop(&mut self, iterable: &Expr, loop_span: Span) {
+        let message = if matches!(iterable, Expr::Array(_)) {
+            "a `for` loop cannot go over a nested array literal; make it with \
+             `Tensor<T>([[..], [..]])` and bind it with `let` first"
+        } else {
+            "a `for` loop over a tensor reads it by index, so the tensor needs a name: \
+             bind it with `let` first"
+        };
+        self.errors.error_with_code(
+            crate::diagnostic::DiagnosticCode::E3046,
+            message.to_string(),
+            // An array literal has no position of its own; the loop has.
+            Some(crate::diagnostic::SourceSpan::from_ast_span(
+                &match iterable {
+                    Expr::Array(_) => loop_span,
+                    other => other.span(),
+                },
+            )),
+        );
+    }
+
+    /// Whether `for x in it` moves `it` only after the loop's call to `next` is checked.
+    ///
+    /// `for x in it` consumes `it`, as Rust's does: the loop drives a copy of the
+    /// iterator to exhaustion, so letting the name live on would hand back a value
+    /// that had not moved.
+    ///
+    /// The consumption is deferred past the synthesized `next`, though. Marking
+    /// the move first left that call looking the method up on a consumed variable, of
+    /// type `?`. Whether this is an iterator is read off the binding rather than by
+    /// type-checking the expression twice, which would report each of its errors twice.
+    fn for_loop_defers_consume(&self, iterable: &Expr, consume: bool) -> bool {
+        consume
+            && match iterable {
                 Expr::Identifier(id) => matches!(
                     self.lookup(id.name.as_ref()).map(|(t, _)| t),
-                    Some(Type::GenericInstance(..)) | Some(Type::Struct(..))
+                    Some(Type::GenericInstance(..) | Type::Struct(..))
                 ),
                 _ => false,
-            };
+            }
+    }
+
+    /// Rewrite the `&c` or `&mut c` a `for` loop goes over into a call of the collection's
+    /// `iter()` or `iter_mut()` method, when it has one.
+    fn iterate_borrowed_collection(&mut self, iterable: &mut Box<Expr>) {
         // `for x in &c` reads the items through `c.iter()`, and `for x in &mut c` changes them
         // through `c.iter_mut()`, as Rust's collections do. Rewritten before `&c` is checked,
         // so the only borrow of `c` is the method call's, as when `c.iter()` is written.
@@ -676,10 +757,12 @@ impl<'a> TypeChecker<'a> {
                 **iterable = Self::method_call_on((*b.expr).clone(), method, span);
             }
         }
-        // `for x in v.iter()` borrows `v` for the whole loop and no longer: the iterator has no
-        // name, so its borrow has no last use to end at.
-        let borrows_before_iterable = self.borrow.snapshot();
-        let mut iterable_ty = self.check_expr_type_flag(iterable, consume && !defers_consume);
+    }
+
+    /// Type check what a `for` loop goes over, after turning a collection, or a reference to
+    /// one, into a call of the method that makes its iterator. Returns the type of the result.
+    fn check_for_iterable(&mut self, iterable: &mut Box<Expr>, consume: bool) -> Type {
+        let mut iterable_ty = self.check_expr_type_flag(iterable, consume);
 
         // A value that is not an iterator but can be turned into one, as a `Vec` can: the
         // loop drives `iterable.into_iter()`, as Rust's does.
@@ -696,7 +779,7 @@ impl<'a> TypeChecker<'a> {
                 args: vec![],
                 span,
             });
-            iterable_ty = self.check_expr_type_flag(iterable, consume && !defers_consume);
+            iterable_ty = self.check_expr_type_flag(iterable, consume);
         }
         // The same for a variable that holds a reference to a collection.
         if let Type::Borrow { inner, is_mut, .. } = iterable_ty.clone() {
@@ -723,103 +806,93 @@ impl<'a> TypeChecker<'a> {
                 }
             }
         }
-        let iterable_borrows = self.borrow.added_since(&borrows_before_iterable);
-        let outer_depth = self.scopes.len();
-        self.push_releasing_scope();
+        iterable_ty
+    }
 
-        // If it's Range, it's I64. If it's Iterator, we extract from Option<T>
-        // If it's Tensor, we extract the ElementType
+    /// The type of the loop variable of a `for` loop over an iterator: what the iterator's
+    /// `next` method returns inside its `Option`. Also records in `next_fn` the function that
+    /// `next` resolves to.
+    fn iterator_item_type(
+        &mut self,
+        iterable: &mut Box<Expr>,
+        next_fn: &mut Option<crate::symbol::Symbol>,
+        consume: bool,
+    ) -> Type {
+        use syntax::expr::{Expr, MethodCallExpr};
+        use syntax::Span;
         let mut iter_ty = Type::Scalar(ElementType::I64); // fallback
-
-        // Check if it's a generic iterator by synthesizing a `.next()` call
-        if matches!(iterable_ty, Type::GenericInstance(..))
-            || matches!(iterable_ty, Type::Struct(..))
-        {
-            use syntax::expr::{Expr, MethodCallExpr};
-            use syntax::Span;
-            let mut next_call = Expr::MethodCall(MethodCallExpr {
-                base: (*iterable).clone(),
-                method_name: "next".to_string().into(),
-                type_args: None,
-                args: vec![],
-                span: Span::default(),
-            });
-            // This will resolve and monomorphize `next`! Its result is `Option<Element>`, so
-            // the loop variable takes the payload type. The `Option` base may be spelled
-            // `Enum` *or* `Struct` after resolution — accept both, else the element type is
-            // lost and the loop variable wrongly falls back to `i64` (E3004 against an i32
-            // body, the for-over-iterator typing bug, #242).
-            //
-            // Its receiver is the iterable, already checked above, so it is only probed here:
-            // checking it again would report each of the iterable's errors a second time. Only
-            // a `next` that could not be found is checked for real, to report that.
-            let saved_speculating = self.speculating;
-            self.speculating = true;
-            let mut opt_ty = self.check_expr_type_flag(&mut next_call, consume);
-            self.speculating = saved_speculating;
-            if matches!(next_call, Expr::MethodCall(_)) {
-                opt_ty = self.check_expr_type_flag(&mut next_call, consume);
-            }
-            if let Expr::FunctionCall(call) = &next_call {
-                *next_fn = Some(call.name.clone());
-            }
-            if let Type::GenericInstance(base, args) = opt_ty {
-                if let Type::Enum(name, _) | Type::Struct(name, _) = &*base {
-                    if name.as_ref() == "Option" && args.len() == 1 {
-                        iter_ty = args[0].clone();
-                    }
+        let mut next_call = Expr::MethodCall(MethodCallExpr {
+            base: (*iterable).clone(),
+            method_name: "next".to_string().into(),
+            type_args: None,
+            args: vec![],
+            span: Span::default(),
+        });
+        // This will resolve and monomorphize `next`! Its result is `Option<Element>`, so
+        // the loop variable takes the payload type. The `Option` base may be spelled
+        // `Enum` *or* `Struct` after resolution — accept both, else the element type is
+        // lost and the loop variable wrongly falls back to `i64` (E3004 against an i32
+        // body, the for-over-iterator typing bug, #242).
+        //
+        // Its receiver is the iterable, already checked above, so it is only probed here:
+        // checking it again would report each of the iterable's errors a second time. Only
+        // a `next` that could not be found is checked for real, to report that.
+        let saved_speculating = self.speculating;
+        self.speculating = true;
+        let mut opt_ty = self.check_expr_type_flag(&mut next_call, consume);
+        self.speculating = saved_speculating;
+        if matches!(next_call, Expr::MethodCall(_)) {
+            opt_ty = self.check_expr_type_flag(&mut next_call, consume);
+        }
+        if let Expr::FunctionCall(call) = &next_call {
+            *next_fn = Some(call.name.clone());
+        }
+        if let Type::GenericInstance(base, args) = opt_ty {
+            if let Type::Enum(name, _) | Type::Struct(name, _) = &*base {
+                if name.as_ref() == "Option" && args.len() == 1 {
+                    iter_ty = args[0].clone();
                 }
             }
-            if defers_consume {
-                self.check_expr_type_flag(iterable, true);
-            }
-        } else {
-            iter_ty = match iterable_ty {
-                Type::GenericInstance(base, args) => {
-                    if let Type::Enum(name, _) | Type::Struct(name, _) = &*base {
-                        if name.as_ref() == "Option" && args.len() == 1 {
-                            args[0].clone()
-                        } else {
-                            Type::Scalar(ElementType::I64)
-                        }
+        }
+        iter_ty
+    }
+
+    /// The type of the loop variable of a `for` loop over something that is not an iterator:
+    /// a range or a tensor.
+    fn plain_item_type(iterable_ty: Type) -> Type {
+        match iterable_ty {
+            Type::GenericInstance(base, args) => {
+                if let Type::Enum(name, _) | Type::Struct(name, _) = &*base {
+                    if name.as_ref() == "Option" && args.len() == 1 {
+                        args[0].clone()
                     } else {
                         Type::Scalar(ElementType::I64)
                     }
+                } else {
+                    Type::Scalar(ElementType::I64)
                 }
-                Type::Tensor(el_ty, _, _) => Type::Scalar(el_ty),
-                // A scalar iterable is an integer range (`a..b`); the induction variable takes
-                // the range's element type, so `for i in 0..10` binds `i: i32` and code like
-                // `sum + i` / `return i` type-checks without a coercion (#240). The flat
-                // lowerer already types the loop var from the same range bound.
-                Type::Scalar(e) => Type::Scalar(e),
-                _ => Type::Scalar(ElementType::I64),
-            };
+            }
+            Type::Tensor(el_ty, _, _) => Type::Scalar(el_ty),
+            // A scalar iterable is an integer range (`a..b`); the induction variable takes
+            // the range's element type, so `for i in 0..10` binds `i: i32` and code like
+            // `sum + i` / `return i` type-checks without a coercion (#240). The flat
+            // lowerer already types the loop var from the same range bound.
+            Type::Scalar(e) => Type::Scalar(e),
+            _ => Type::Scalar(ElementType::I64),
         }
+    }
 
-        if next_fn.is_some() {
-            self.drops_bind_loop_item(iter, body, &iter_ty);
-        }
-        self.insert(iter.clone(), iter_ty); // Still assuming i64 for most things, but it works for our current test cases.
-
-        // Prove invariants hold on entry, then assume them inside the loop
-        let prev_constraints_len = self.consteval.constraints.len();
-
-        // A range loop constrains its induction variable: `for i in a..b` gives
-        // `a <= i && i < b` for the body. Recorded as prover facts so bounds obligations
-        // over `i` (the `raw::` primitives, Vx#353) and `Verified<T>` assertions can
-        // close without a hand-written invariant. Skipped when the body reassigns the
-        // variable: the checker does not version mutated symbols, so a stale fact would
-        // prove false things. The facts sit above `prev_constraints_len`, so the
-        // truncation below drops them at loop exit with the invariants.
-        // The induction variable shadows any outer binding of the same name; earlier
-        // facts about that name are about the dead binding now (see
-        // neutralize_facts_mentioning -- a stale outer `i < 2` under an inner
-        // `for i in 0..8` forged an out-of-bounds proof in review).
-        self.neutralize_facts_mentioning(iter);
-        if let Expr::Range(r) = &**iterable {
+    /// A range loop constrains its induction variable: `for i in a..b` gives
+    /// `a <= i && i < b` for the body. Recorded as prover facts so bounds obligations
+    /// over `i` (the `raw::` primitives, Vx#353) and `Verified<T>` assertions can
+    /// close without a hand-written invariant. Skipped when the body reassigns the
+    /// variable: the checker does not version mutated symbols, so a stale fact would
+    /// prove false things.
+    fn record_range_facts(&mut self, iter: &str, iterable: &Expr, body: &[Statement]) {
+        if let Expr::Range(r) = iterable {
             if !crate::hir::check::raw::body_reassigns(body, iter) {
                 let iter_expr = Expr::Identifier(syntax::expr::IdentifierExpr {
-                    name: iter.clone().into(),
+                    name: iter.into(),
                     span: Span::default(),
                 });
                 let lo = self.fold_raw_extent(&r.start);
@@ -850,13 +923,85 @@ impl<'a> TypeChecker<'a> {
                 }
             }
         }
-        for inv in invariants.iter() {
+    }
+
+    /// Prove each loop invariant on entry to the loop, then assume it for the loop body.
+    fn assume_loop_invariants(&mut self, invariants: &[Expr]) {
+        for inv in invariants {
             if !self.prove_expr(inv) {
                 self.errors
                     .push("Loop invariant cannot be proven on entry".to_string());
             }
             self.consteval.constraints.push(inv.clone());
         }
+    }
+
+    /// Check that each loop invariant still holds at the end of the loop body.
+    fn check_loop_invariants_hold(&mut self, invariants: &[Expr]) {
+        // Check invariants hold after the loop iteration (we don't strictly prove induction here, just checking at end of block)
+        for inv in invariants {
+            if !self.prove_expr(inv) {
+                self.errors
+                    .push("Loop invariant cannot be proven to hold across iterations".to_string());
+            }
+        }
+    }
+
+    /// Check a `for` loop: type the iterable, bind the induction variable's element type, prove
+    /// loop invariants on entry, and check the body.
+    fn check_for_loop_stmt(&mut self, floop: &mut ForLoopStmt, consume: bool, return_type: &Type) {
+        self.index_tensor_for_loop(floop);
+        let ForLoopStmt {
+            iter,
+            iterable,
+            invariants,
+            body,
+            span: loop_span,
+            next_fn,
+        } = floop;
+        let loop_span = *loop_span;
+        let defers_consume = self.for_loop_defers_consume(iterable, consume);
+        self.iterate_borrowed_collection(iterable);
+        // `for x in v.iter()` borrows `v` for the whole loop and no longer: the iterator has no
+        // name, so its borrow has no last use to end at.
+        let borrows_before_iterable = self.borrow.snapshot();
+        let iterable_ty = self.check_for_iterable(iterable, consume && !defers_consume);
+        let iterable_borrows = self.borrow.added_since(&borrows_before_iterable);
+        let outer_depth = self.scopes.len();
+        self.push_releasing_scope();
+
+        // If it's Range, it's I64. If it's Iterator, we extract from Option<T>
+        // If it's Tensor, we extract the ElementType
+        // Check if it's a generic iterator by synthesizing a `.next()` call
+        let iter_ty = if matches!(iterable_ty, Type::GenericInstance(..))
+            || matches!(iterable_ty, Type::Struct(..))
+        {
+            let item_ty = self.iterator_item_type(iterable, next_fn, consume);
+            if defers_consume {
+                self.check_expr_type_flag(iterable, true);
+            }
+            item_ty
+        } else {
+            Self::plain_item_type(iterable_ty)
+        };
+
+        if next_fn.is_some() {
+            self.drops_bind_loop_item(iter, body, &iter_ty);
+        }
+        self.insert(iter.clone(), iter_ty); // Still assuming i64 for most things, but it works for our current test cases.
+
+        // Prove invariants hold on entry, then assume them inside the loop
+        let prev_constraints_len = self.consteval.constraints.len();
+
+        // The range facts sit above `prev_constraints_len`, so the
+        // truncation below drops them at loop exit with the invariants.
+        // The induction variable shadows any outer binding of the same name; earlier
+        // facts about that name are about the dead binding now (see
+        // neutralize_facts_mentioning -- a stale outer `i < 2` under an inner
+        // `for i in 0..8` forged an out-of-bounds proof in review).
+        self.neutralize_facts_mentioning(iter);
+        self.record_range_facts(iter, iterable, body);
+        self.assume_loop_invariants(invariants);
 
         // What is known before the body is walked, and where each name lives. Both are
         // needed after: the walk folds one iteration's worth of assignments into the
@@ -865,7 +1010,9 @@ impl<'a> TypeChecker<'a> {
         let scopes = self.consteval_scopes();
 
         let marks_before = self.moved_snapshot();
-        self.borrow.loop_exits.push(Default::default());
+        self.borrow
+            .loop_exits
+            .push(crate::hir::borrow_cx::LoopExits::default());
         self.drops_enter_loop();
         let header = LoopHeader {
             binds: Some(iter.as_str()),
@@ -875,13 +1022,7 @@ impl<'a> TypeChecker<'a> {
         self.drops_exit_loop();
         self.settle_loop_moves(marks_before, outer_depth, body, &loop_span);
 
-        // Check invariants hold after the loop iteration (we don't strictly prove induction here, just checking at end of block)
-        for inv in invariants.iter() {
-            if !self.prove_expr(inv) {
-                self.errors
-                    .push("Loop invariant cannot be proven to hold across iterations".to_string());
-            }
-        }
+        self.check_loop_invariants_hold(invariants);
 
         let mut after = before.clone();
         let ran = self.run_loop_for_consteval(&mut after, |checker, env| {
@@ -895,11 +1036,14 @@ impl<'a> TypeChecker<'a> {
         self.borrow.forget(&iterable_borrows);
     }
 
-    /// Check an infinite `loop`: prove invariants on entry, check the body, then re-prove them
-    /// across iterations.
     /// After a loop body: a variable from outside the loop that the body moves, on a path that
     /// goes round again, is used after the move on the next pass (E4001). After the loop, a
     /// variable is moved if any path out of it moved it.
+    ///
+    /// # Panics
+    ///
+    /// If the loop did not push its entry on the stack of loop exits before its body was
+    /// checked.
     fn settle_loop_moves(
         &mut self,
         marks_before: Vec<std::collections::HashSet<String>>,
@@ -942,6 +1086,8 @@ impl<'a> TypeChecker<'a> {
         self.restore_moved(after);
     }
 
+    /// Check an infinite `loop`: prove invariants on entry, check the body, then re-prove them
+    /// across iterations.
     fn check_loop_stmt(&mut self, lp: &mut LoopStmt, return_type: &Type) {
         let LoopStmt {
             body,
@@ -968,7 +1114,9 @@ impl<'a> TypeChecker<'a> {
         let scopes = self.consteval_scopes();
 
         let marks_before = self.moved_snapshot();
-        self.borrow.loop_exits.push(Default::default());
+        self.borrow
+            .loop_exits
+            .push(crate::hir::borrow_cx::LoopExits::default());
         self.drops_enter_loop();
         let header = LoopHeader {
             binds: None,
@@ -995,11 +1143,6 @@ impl<'a> TypeChecker<'a> {
         self.pop_scope();
     }
 
-    /// Check an assignment / compound assignment: type the LHS, then the RHS expecting the LHS
-    /// type (#240), verify assignability, and fold a const RHS into the eval environment.
-    /// `op` is `Some` for a compound assignment, and carries the operator that sits between
-    /// the two sides. It has to be checked here as well as in `check_binaryop_expr`: `a %= b`
-    /// never builds a `BinaryOp` expression for that rule to see.
     /// The expression a written place is reached through when that is a shared `&`
     /// reference: `r` in `*r = v`, `r.f = v` or `r[i] = v` with `r : &T`. `None` when every
     /// step is a variable, a field, an index, a `&mut` or a raw pointer.
@@ -1056,28 +1199,9 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn check_assign_stmt(
-        &mut self,
-        lhs: &mut Expr,
-        op: Option<&BinaryOp>,
-        rhs: &mut Expr,
-        consume: bool,
-        operand_ty: Option<&mut Option<crate::syntax::ElementType>>,
-    ) {
-        // Assigning to a moved variable gives it a value again. A write does not read what
-        // was there, so the move stops being in the way -- and the mark has to go before the
-        // left-hand side is checked, which is what would otherwise report it as a use.
-        //
-        // Only a plain `x = v`. `x op= v` reads `x` first, and `a[i] = v` writes *through* a
-        // value the name no longer owns; both stay refused.
-        let mut owner_before = None;
-        if op.is_none() {
-            if let Expr::Identifier(id) = lhs {
-                owner_before = self.drops_owner_state(id.name.as_ref());
-                self.unconsume(id.name.as_ref());
-            }
-        }
-
+    /// Check the place an assignment writes to: that it may be written, and its type. Returns
+    /// the type, and the borrows the place holds only until the right-hand side is checked.
+    fn check_assign_place(&mut self, lhs: &mut Expr) -> (Type, Option<ReservedBorrows>) {
         self.check_assign_while_borrowed(lhs);
         self.record_change(lhs);
         if let Some(root) = self.read_only_root(lhs) {
@@ -1110,13 +1234,11 @@ impl<'a> TypeChecker<'a> {
                 );
             }
         }
+        (lhs_ty, lhs_borrows)
+    }
 
-        // Recorded for code generation, as for a plain binary operator: `/=`, `%=` and
-        // `>>=` need the sign that an MLIR integer does not carry.
-        if let (Some(slot), Type::Scalar(e)) = (operand_ty, &lhs_ty) {
-            *slot = Some(e.clone());
-        }
-
+    /// Remember the variable an assignment writes to while its right-hand side is checked.
+    fn note_assignment_target(&mut self, lhs: &Expr) {
         // Determine target name for NLL
         if let Expr::Identifier(id) = lhs {
             self.current_assignment_target = Some(id.name.to_string());
@@ -1125,64 +1247,35 @@ impl<'a> TypeChecker<'a> {
                 self.current_assignment_target = Some(id.name.to_string());
             }
         }
+    }
 
-        // Check the RHS expecting the target's type, so an untyped literal is born at that
-        // type (`a[i] = 1.0` into a bf16 tensor, `r = 5` into an i64 slot) rather than
-        // defaulting and mismatching (#240).
-        let mut rhs_ty = self.check_expr_expecting(rhs, Some(lhs_ty.clone()), consume);
-        self.current_assignment_target = None;
-        if let Some(borrows) = lhs_borrows {
-            self.borrow.forget(&borrows);
-        }
-        // `s += r` with `r : &i64` adds the number `r` points at, as `s + r` does.
-        if op.is_some() && matches!(lhs_ty, Type::Scalar(_)) {
-            if let Some(t) = Self::deref_number_operand(rhs, &rhs_ty) {
-                rhs_ty = t;
-            }
-        }
-
-        // Again, because the right-hand side may have moved the very variable being
-        // assigned: in `w = transform(w)` the call consumes `w` and the result is then put
-        // back under the same name, which leaves it perfectly usable.
-        if op.is_none() {
-            self.check_view_assign(lhs, rhs, &rhs_ty);
-            if let Expr::Identifier(id) = lhs {
-                self.drops_note_assign(id.name.as_ref(), owner_before, rhs, id.span.line);
-                self.unconsume(id.name.as_ref());
-                self.borrow.views.remove(id.name.as_ref());
-                if let Expr::Identifier(from) = &*rhs {
-                    if !self.speculating {
-                        let depth = self.scope_depth_of(&id.name);
-                        self.borrow
-                            .copy_borrows(from.name.as_ref(), id.name.as_ref(), depth);
-                    }
+    /// After `x = v` is checked: `x` has a value again, and owns or borrows what `v` did.
+    fn settle_plain_assign(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+        rhs_ty: &Type,
+        owner_before: Option<crate::hir::check::drops::Moved>,
+    ) {
+        self.check_view_assign(lhs, rhs, rhs_ty);
+        if let Expr::Identifier(id) = lhs {
+            self.drops_note_assign(id.name.as_ref(), owner_before, rhs, id.span.line);
+            self.unconsume(id.name.as_ref());
+            self.borrow.views.remove(id.name.as_ref());
+            if let Expr::Identifier(from) = rhs {
+                if !self.speculating {
+                    let depth = self.scope_depth_of(&id.name);
+                    self.borrow
+                        .copy_borrows(from.name.as_ref(), id.name.as_ref(), depth);
                 }
             }
         }
-        if let Some(op) = op {
-            let span = lhs.span();
-            if !self.check_restricted_operands(op, &lhs_ty, &rhs_ty, &span) {
-                return;
-            }
-        }
-        if !self.is_assignable(&lhs_ty, &rhs_ty) {
-            // Named types and a location, like every other type error: this fires on a
-            // narrowing store into half storage, where the fix is to write the `as` the
-            // language requires rather than to guess what was meant.
-            self.errors.error_with_code(
-                crate::diagnostic::DiagnosticCode::E3004,
-                format!(
-                    "Type mismatch in assignment: cannot assign {} to {}; write an explicit \
-                     `as` cast if the conversion is intended",
-                    rhs_ty, lhs_ty
-                ),
-                Some(crate::diagnostic::SourceSpan::from_ast_span(&lhs.span())),
-            );
-        }
+    }
 
-        // Keep the compile-time value of the assigned variable in step with the assignment.
-        // An assignment the evaluator cannot compute makes the variable unknown rather than
-        // leaving the previous value behind, which later reads would report as a certainty.
+    /// Keep the compile-time value of the assigned variable in step with the assignment.
+    /// An assignment the evaluator cannot compute makes the variable unknown rather than
+    /// leaving the previous value behind, which later reads would report as a certainty.
+    fn update_comptime_value_after_assign(&mut self, lhs: &Expr, rhs: &Expr) {
         match lhs {
             Expr::Identifier(IdentifierExpr { name, span: _ }) => {
                 let tmp_env = self.consteval_snapshot();
@@ -1245,6 +1338,90 @@ impl<'a> TypeChecker<'a> {
             }
             _ => {}
         }
+    }
+
+    /// Check an assignment / compound assignment: type the LHS, then the RHS expecting the LHS
+    /// type (#240), verify assignability, and fold a const RHS into the eval environment.
+    /// `compound` is `Some` for a compound assignment, and carries the operator that sits between
+    /// the two sides. It has to be checked here as well as in `check_binaryop_expr`: `a %= b`
+    /// never builds a `BinaryOp` expression for that rule to see.
+    fn check_assign_stmt(
+        &mut self,
+        lhs: &mut Expr,
+        rhs: &mut Expr,
+        compound: Option<CompoundOp<'_>>,
+        consume: bool,
+    ) {
+        let (op, operand_ty) = match compound {
+            Some(c) => (Some(c.op), Some(c.operand_ty)),
+            None => (None, None),
+        };
+        // Assigning to a moved variable gives it a value again. A write does not read what
+        // was there, so the move stops being in the way -- and the mark has to go before the
+        // left-hand side is checked, which is what would otherwise report it as a use.
+        //
+        // Only a plain `x = v`. `x op= v` reads `x` first, and `a[i] = v` writes *through* a
+        // value the name no longer owns; both stay refused.
+        let mut owner_before = None;
+        if op.is_none() {
+            if let Expr::Identifier(id) = lhs {
+                owner_before = self.drops_owner_state(id.name.as_ref());
+                self.unconsume(id.name.as_ref());
+            }
+        }
+
+        let (lhs_ty, lhs_borrows) = self.check_assign_place(lhs);
+
+        // Recorded for code generation, as for a plain binary operator: `/=`, `%=` and
+        // `>>=` need the sign that an MLIR integer does not carry.
+        if let (Some(slot), Type::Scalar(e)) = (operand_ty, &lhs_ty) {
+            *slot = Some(e.clone());
+        }
+
+        self.note_assignment_target(lhs);
+
+        // Check the RHS expecting the target's type, so an untyped literal is born at that
+        // type (`a[i] = 1.0` into a bf16 tensor, `r = 5` into an i64 slot) rather than
+        // defaulting and mismatching (#240).
+        let mut rhs_ty = self.check_expr_expecting(rhs, Some(lhs_ty.clone()), consume);
+        self.current_assignment_target = None;
+        if let Some(borrows) = lhs_borrows {
+            self.borrow.forget(&borrows);
+        }
+        // `s += r` with `r : &i64` adds the number `r` points at, as `s + r` does.
+        if op.is_some() && matches!(lhs_ty, Type::Scalar(_)) {
+            if let Some(t) = Self::deref_number_operand(rhs, &rhs_ty) {
+                rhs_ty = t;
+            }
+        }
+
+        // Again, because the right-hand side may have moved the very variable being
+        // assigned: in `w = transform(w)` the call consumes `w` and the result is then put
+        // back under the same name, which leaves it perfectly usable.
+        if op.is_none() {
+            self.settle_plain_assign(lhs, rhs, &rhs_ty, owner_before);
+        }
+        if let Some(op) = op {
+            let span = lhs.span();
+            if !self.check_restricted_operands(op, &lhs_ty, &rhs_ty, &span) {
+                return;
+            }
+        }
+        if !self.is_assignable(&lhs_ty, &rhs_ty) {
+            // Named types and a location, like every other type error: this fires on a
+            // narrowing store into half storage, where the fix is to write the `as` the
+            // language requires rather than to guess what was meant.
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E3004,
+                format!(
+                    "Type mismatch in assignment: cannot assign {rhs_ty} to {lhs_ty}; write an explicit \
+                     `as` cast if the conversion is intended"
+                ),
+                Some(crate::diagnostic::SourceSpan::from_ast_span(&lhs.span())),
+            );
+        }
+
+        self.update_comptime_value_after_assign(lhs, rhs);
     }
 
     /// Which constant scope each known name currently lives in, innermost winning.
@@ -1460,10 +1637,7 @@ impl<'a> TypeChecker<'a> {
         if ty != Type::Unknown && !self.is_assignable(&expected_ty, &ty) {
             self.errors.error_with_code(
                 crate::diagnostic::DiagnosticCode::E3002,
-                format!(
-                    "Type mismatch on return. Expected {}, got {}",
-                    expected_ty, ty
-                ),
+                format!("Type mismatch on return. Expected {expected_ty}, got {ty}"),
                 Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
             );
         }
@@ -1489,8 +1663,13 @@ impl<'a> TypeChecker<'a> {
             );
         }
 
-        // Each `ensures` must hold here, from what is known on this path, with `return` standing
-        // for this value.
+        self.check_ensures_at_return(expr, span);
+        crate::syntax::is_never_ty(&ty)
+    }
+
+    /// Each `ensures` must hold at a `return`, from what is known on this path, with `return`
+    /// standing for the returned value `expr`.
+    fn check_ensures_at_return(&mut self, expr: &Expr, span: &Span) {
         let return_ident = Expr::Identifier(IdentifierExpr {
             name: "return".to_string().into(),
             span: *span,
@@ -1519,11 +1698,10 @@ impl<'a> TypeChecker<'a> {
             }
             self.consteval.constraints.pop();
         }
-        crate::syntax::is_never_ty(&ty)
     }
 
     /// Check an `assert`: require a boolean condition, evaluate it at comptime when possible, and
-    /// either flag a failure or fold it into the SMT constraints (Verified<T> discharge).
+    /// either flag a failure or fold it into the SMT constraints (`Verified<T>` discharge).
     fn check_assert_stmt(&mut self, assert: &mut AssertStmt, consume: bool, return_type: &Type) {
         let AssertStmt { expr, msg, span } = assert;
         let ty = self.check_expr_type_flag(expr, consume);
@@ -1550,11 +1728,11 @@ impl<'a> TypeChecker<'a> {
                     .unwrap_or_else(|| "Comptime assertion failed".to_string());
                 if is_verified {
                     self.errors
-                        .push(format!("Contract violated for Verified return type: {}", m));
+                        .push(format!("Contract violated for Verified return type: {m}"));
                 } else {
                     self.errors.error_with_code(
                         crate::diagnostic::DiagnosticCode::E8002,
-                        format!("Comptime assert failed: {}", m),
+                        format!("Comptime assert failed: {m}"),
                         Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
                     );
                 }
@@ -1661,62 +1839,354 @@ impl<'a> TypeChecker<'a> {
         match prover.prove() {
             Ok(is_sat) => !is_sat, // If unsat, then the expression is proven (valid)
             Err(e) => {
-                self.errors.push_warning(format!("SMT solver error: {}", e));
+                self.errors.push_warning(format!("SMT solver error: {e}"));
                 false
             }
         }
     }
 
+    /// The value of a number literal.
+    fn eval_number(number: &NumberExpr) -> Option<Value> {
+        let NumberExpr {
+            value: n_str,
+            ty,
+            span: _,
+        } = number;
+        // An integer literal stays an integer. The suffix decides when there is one;
+        // without a suffix the spelling does, since a whole number written without a
+        // point is an integer everywhere else in the language.
+        let is_float = match ty {
+            Some(t) => t.is_float(),
+            None => n_str.contains('.') || n_str.contains('e') || n_str.contains('E'),
+        };
+        // An integer too big for an i64 has no value. Read as a float it would lose its
+        // low digits: `u64::MAX` was worked out as 18446744073709551616.
+        if !is_float {
+            return n_str.parse::<i64>().ok().map(Value::Int);
+        }
+        n_str.parse::<f64>().ok().map(Value::Number)
+    }
+
+    /// `Reachable<A, B>`: true iff a transfer path exists in the cost graph. Topology
+    /// variables have already been substituted during monomorphization.
+    fn eval_transfer_predicate(&self, e: &syntax::expr::TransferPredicateExpr) -> Value {
+        // `Current` is concrete at this checking site. Passing the surface spelling on
+        // to the graph is a compiler bug: the graph deliberately requires a real
+        // device topology because a default memory for an unresolved `Current` would
+        // be meaningless.
+        let from = if matches!(e.from, Topology::Current) {
+            &self.active_topology
+        } else {
+            &e.from
+        };
+        let to = if matches!(e.to, Topology::Current) {
+            &self.active_topology
+        } else {
+            &e.to
+        };
+        let mfrom = self.transfer_cost_graph.default_memory_for(from);
+        let mto = self.transfer_cost_graph.default_memory_for(to);
+        Value::Bool(
+            self.transfer_cost_graph
+                .transfer_path(&mfrom, &mto)
+                .is_some(),
+        )
+    }
+
+    /// The value of `a op b` for an arithmetic operator, when both sides are known.
+    fn eval_binary_op(
+        &self,
+        binary: &BinaryOpExpr,
+        env: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> Option<Value> {
+        let BinaryOpExpr { lhs, op, rhs, .. } = binary;
+        let l = self.eval_expr(lhs, env)?;
+        let r = self.eval_expr(rhs, env)?;
+        // Two integers stay integers, so `/` truncates the way the emitted code does
+        // and a large value keeps every bit. A result that overflows has no value
+        // rather than a wrapped one, which would be baked into the program unnoticed.
+        if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
+            let (a, b) = (*a, *b);
+            return match op {
+                BinaryOp::Add => a.checked_add(b).map(Value::Int),
+                BinaryOp::Sub => a.checked_sub(b).map(Value::Int),
+                BinaryOp::Mul => a.checked_mul(b).map(Value::Int),
+                // The checked forms answer None for a zero divisor, and for the one
+                // signed division that overflows.
+                BinaryOp::Div => a.checked_div(b).map(Value::Int),
+                BinaryOp::Rem => a.checked_rem(b).map(Value::Int),
+                // The bit pattern is exact now, but `>>` reads it one way for a
+                // signed type and another for an unsigned one, and this value does
+                // not record which it came from. Left unfolded until it does.
+                BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::MatMul => None,
+            };
+        }
+        // Anything else numeric is float arithmetic, an integer mixed with a float
+        // included.
+        let (a, b) = (l.as_f64()?, r.as_f64()?);
+        match op {
+            BinaryOp::Add => Some(Value::Number(a + b)),
+            BinaryOp::Sub => Some(Value::Number(a - b)),
+            BinaryOp::Mul => Some(Value::Number(a * b)),
+            BinaryOp::Div => Some(Value::Number(a / b)),
+            BinaryOp::Rem => (b != 0.0).then(|| Value::Number(a % b)),
+            // A bit pattern read out of an `f64` would not be the bit pattern the
+            // program is talking about. Left unfolded rather than folded wrongly.
+            // MatMul not supported for pure numbers at compile time
+            BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::MatMul => None,
+        }
+    }
+
+    /// The value of a comparison such as `a < b`, when both sides are known.
+    #[allow(
+        clippy::float_cmp,
+        reason = "this works out the program's own `==` and `!=` on two floats, which compare them exactly"
+    )]
+    fn eval_relational_op(
+        &self,
+        relational: &RelationalOpExpr,
+        env: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> Option<Value> {
+        let RelationalOpExpr { lhs, op, rhs, .. } = relational;
+        let l = self.eval_expr(lhs, env)?;
+        let r = self.eval_expr(rhs, env)?;
+        // Two integers compare as integers. Comparing them as floats makes every
+        // pair past 2^53 look equal.
+        if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
+            let (a, b) = (*a, *b);
+            return Some(Value::Bool(match op {
+                RelationalOp::Eq => a == b,
+                RelationalOp::NotEq => a != b,
+                RelationalOp::Lt => a < b,
+                RelationalOp::Gt => a > b,
+                RelationalOp::Le => a <= b,
+                RelationalOp::Ge => a >= b,
+            }));
+        }
+        if let (Some(a), Some(b)) = (l.as_f64(), r.as_f64()) {
+            return Some(Value::Bool(match op {
+                RelationalOp::Eq => a == b,
+                RelationalOp::NotEq => a != b,
+                RelationalOp::Lt => a < b,
+                RelationalOp::Gt => a > b,
+                RelationalOp::Le => a <= b,
+                RelationalOp::Ge => a >= b,
+            }));
+        }
+        match (l, r, op) {
+            (Value::Bool(a), Value::Bool(b), RelationalOp::Eq) => Some(Value::Bool(a == b)),
+            (Value::Bool(a), Value::Bool(b), RelationalOp::NotEq) => Some(Value::Bool(a != b)),
+            (Value::Topology(a), Value::Topology(b), RelationalOp::Eq) => {
+                Some(Value::Bool(self.topologies_equal(&a, &b)))
+            }
+            (Value::Topology(a), Value::Topology(b), RelationalOp::NotEq) => {
+                Some(Value::Bool(!self.topologies_equal(&a, &b)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The value of `a && b` or `a || b`, when both sides are known.
+    fn eval_logical_op(
+        &self,
+        logical: &LogicalOpExpr,
+        env: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> Option<Value> {
+        let LogicalOpExpr {
+            lhs,
+            op,
+            rhs,
+            span: _,
+        } = logical;
+        let l = self.eval_expr(lhs, env)?;
+        let r = self.eval_expr(rhs, env)?;
+        match (l, r, op) {
+            (Value::Bool(a), Value::Bool(b), LogicalOp::And) => Some(Value::Bool(a && b)),
+            (Value::Bool(a), Value::Bool(b), LogicalOp::Or) => Some(Value::Bool(a || b)),
+            _ => None,
+        }
+    }
+
+    /// The value of `!a` or `-a`, when `a` is known.
+    fn eval_unary_op(
+        &self,
+        e: &UnaryOpExpr,
+        env: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> Option<Value> {
+        let UnaryOpExpr {
+            op,
+            expr: inner,
+            span: _,
+        } = e;
+        match op {
+            UnaryOp::Not => {
+                if let Value::Bool(b) = self.eval_expr(inner, env)? {
+                    Some(Value::Bool(!b))
+                } else {
+                    None
+                }
+            }
+            // No value for the one negation that overflows, as for the other operators.
+            UnaryOp::Neg => match self.eval_expr(inner, env)? {
+                Value::Int(i) => i.checked_neg().map(Value::Int),
+                Value::Number(n) => Some(Value::Number(-n)),
+                _ => None,
+            },
+        }
+    }
+
+    /// `a[i]`, where both the array and the index are known at compile time. An index
+    /// past the end gives no value here; `check_indexaccess_expr` reports it.
+    fn eval_index_access(
+        &self,
+        e: &IndexAccessExpr,
+        env: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> Option<Value> {
+        let IndexAccessExpr {
+            base,
+            index,
+            span: _,
+        } = e;
+        let Value::Array(items) = self.eval_expr(base, env)? else {
+            return None;
+        };
+        let index_val = self.eval_expr(index, env)?;
+        let i = Self::array_index(&index_val, items.len())?;
+        Some(items[i].clone())
+    }
+
+    /// The value a call returns, worked out by running the body of the function it calls.
+    fn eval_function_call(
+        &self,
+        e: &FunctionCallExpr,
+        env: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> Option<Value> {
+        let FunctionCallExpr {
+            name,
+            type_args,
+            args,
+            span: _,
+        } = e;
+        // Ignored on purpose: the checker has already instantiated the call and
+        // substituted the arguments into the body, so `sort<4>` arrives with its
+        // `N` gone. Matching on `None` here was what skipped such a call.
+        let _ = type_args;
+        let func = match self.callee_body(name.as_ref()) {
+            Some(func) => func,
+            // A closure held in a variable: `add(41)` names the variable, and the
+            // body lives in the `Closure_N_call` the literal generated.
+            None => self.closure_call_body(name.as_ref())?,
+        };
+        // A generated closure body takes its captured environment as a first
+        // parameter, and the call passes a struct for it. The environment is not a
+        // value the evaluator can build, so both are skipped: a body that only uses
+        // its own parameters folds, and one that reads a capture finds the name
+        // unbound and answers nothing, which is the right answer either way.
+        let skip = usize::from(Self::is_closure_body(name.as_ref()));
+        let mut local_env = HashMap::new();
+        for (i, arg_expr) in args.iter().skip(skip).enumerate() {
+            let arg_val = self.eval_expr(arg_expr, env)?;
+            local_env.insert(func.params.get(i + skip)?.0.clone(), arg_val);
+        }
+        self.enter_call()?;
+        let outer_unsupported = self.consteval.unsupported_stmt.replace(false);
+        let mut result = None;
+        if let EvalFlow::Return(ret_val) = self.eval_block(&func.body, &mut local_env) {
+            result = ret_val;
+        }
+        // A body holding a statement the evaluator cannot run has not been run.
+        // Answering with what the statements it could run left behind would be a
+        // guess, and a guess here is reported as a certainty.
+        if self.consteval.unsupported_stmt.get() {
+            result = None;
+        }
+        self.consteval.unsupported_stmt.set(outer_unsupported);
+        self.leave_call();
+        result
+    }
+
+    /// The body of a comptime lambda is a `comptime` block, so evaluating a call to
+    /// one means evaluating the block: run its statements, then its trailing value.
+    fn eval_comptime_block(
+        &self,
+        e: &ComptimeBlockExpr,
+        env: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> Option<Value> {
+        let ComptimeBlockExpr {
+            stmts,
+            ret,
+            span: _,
+        } = e;
+        let mut local_env = env.clone();
+        if let EvalFlow::Return(value) = self.eval_block(stmts, &mut local_env) {
+            return value;
+        }
+        if self.consteval.unsupported_stmt.get() {
+            return None;
+        }
+        self.eval_expr(ret.as_deref()?, &local_env)
+    }
+
+    /// The value of an `if` whose condition is known: the value of the branch it selects.
+    fn eval_if(&self, e: &IfExpr, env: &HashMap<crate::symbol::Symbol, Value>) -> Option<Value> {
+        let IfExpr {
+            cond,
+            then_block,
+            else_block,
+            span: _,
+            is_comptime: _,
+        } = e;
+        if let Some(Value::Bool(cond_val)) = self.eval_expr(cond, env) {
+            let block = if cond_val {
+                then_block
+            } else if let Some(e) = else_block {
+                e
+            } else {
+                return None;
+            };
+            let mut ret = None;
+            let mut local_env = env.clone();
+            for stmt in block {
+                if let Statement::ExprStmt(ExprStmtStmt {
+                    expr: e,
+                    has_semi,
+                    span: _,
+                }) = stmt
+                {
+                    let val = self.eval_expr(e, &local_env);
+                    if !*has_semi {
+                        ret = val;
+                    }
+                } else if let EvalFlow::Return(val) = self.eval_statement(stmt, &mut local_env) {
+                    ret = val;
+                }
+            }
+            ret
+        } else {
+            None
+        }
+    }
+
+    /// Work out the value of `expr` while compiling, from the values in `env`. `None` when the
+    /// value cannot be known before the program runs.
     pub(crate) fn eval_expr(
         &self,
         expr: &Expr,
         env: &HashMap<crate::symbol::Symbol, Value>,
     ) -> Option<Value> {
         match expr {
-            Expr::Number(NumberExpr {
-                value: n_str,
-                ty,
-                span: _,
-            }) => {
-                // An integer literal stays an integer. The suffix decides when there is one;
-                // without a suffix the spelling does, since a whole number written without a
-                // point is an integer everywhere else in the language.
-                let is_float = match ty {
-                    Some(t) => t.is_float(),
-                    None => n_str.contains('.') || n_str.contains('e') || n_str.contains('E'),
-                };
-                // An integer too big for an i64 has no value. Read as a float it would lose its
-                // low digits: `u64::MAX` was worked out as 18446744073709551616.
-                if !is_float {
-                    return n_str.parse::<i64>().ok().map(Value::Int);
-                }
-                n_str.parse::<f64>().ok().map(Value::Number)
-            }
-            // `Reachable<A, B>`: true iff a transfer path exists in the cost graph. Topology
-            // variables have already been substituted during monomorphization.
-            Expr::TransferPredicate(e) => {
-                // `Current` is concrete at this checking site. Passing the surface spelling on
-                // to the graph is a compiler bug: the graph deliberately requires a real
-                // device topology because a default memory for an unresolved `Current` would
-                // be meaningless.
-                let from = if matches!(e.from, Topology::Current) {
-                    &self.active_topology
-                } else {
-                    &e.from
-                };
-                let to = if matches!(e.to, Topology::Current) {
-                    &self.active_topology
-                } else {
-                    &e.to
-                };
-                let mfrom = self.transfer_cost_graph.default_memory_for(from);
-                let mto = self.transfer_cost_graph.default_memory_for(to);
-                Some(Value::Bool(
-                    self.transfer_cost_graph
-                        .transfer_path(&mfrom, &mto)
-                        .is_some(),
-                ))
-            }
+            Expr::Number(number) => Self::eval_number(number),
+            Expr::TransferPredicate(e) => Some(self.eval_transfer_predicate(e)),
             Expr::Identifier(IdentifierExpr { name: n, span: _ }) if n.as_ref() == "true" => {
                 Some(Value::Bool(true))
             }
@@ -1725,128 +2195,10 @@ impl<'a> TypeChecker<'a> {
             }
 
             Expr::Identifier(IdentifierExpr { name: n, span: _ }) => env.get(n.as_ref()).cloned(),
-            Expr::BinaryOp(BinaryOpExpr { lhs, op, rhs, .. }) => {
-                let l = self.eval_expr(lhs, env)?;
-                let r = self.eval_expr(rhs, env)?;
-                // Two integers stay integers, so `/` truncates the way the emitted code does
-                // and a large value keeps every bit. A result that overflows has no value
-                // rather than a wrapped one, which would be baked into the program unnoticed.
-                if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
-                    let (a, b) = (*a, *b);
-                    return match op {
-                        BinaryOp::Add => a.checked_add(b).map(Value::Int),
-                        BinaryOp::Sub => a.checked_sub(b).map(Value::Int),
-                        BinaryOp::Mul => a.checked_mul(b).map(Value::Int),
-                        // The checked forms answer None for a zero divisor, and for the one
-                        // signed division that overflows.
-                        BinaryOp::Div => a.checked_div(b).map(Value::Int),
-                        BinaryOp::Rem => a.checked_rem(b).map(Value::Int),
-                        // The bit pattern is exact now, but `>>` reads it one way for a
-                        // signed type and another for an unsigned one, and this value does
-                        // not record which it came from. Left unfolded until it does.
-                        BinaryOp::BitAnd
-                        | BinaryOp::BitOr
-                        | BinaryOp::BitXor
-                        | BinaryOp::Shl
-                        | BinaryOp::Shr => None,
-                        BinaryOp::MatMul => None,
-                    };
-                }
-                // Anything else numeric is float arithmetic, an integer mixed with a float
-                // included.
-                let (a, b) = (l.as_f64()?, r.as_f64()?);
-                match op {
-                    BinaryOp::Add => Some(Value::Number(a + b)),
-                    BinaryOp::Sub => Some(Value::Number(a - b)),
-                    BinaryOp::Mul => Some(Value::Number(a * b)),
-                    BinaryOp::Div => Some(Value::Number(a / b)),
-                    BinaryOp::Rem => (b != 0.0).then(|| Value::Number(a % b)),
-                    // A bit pattern read out of an `f64` would not be the bit pattern the
-                    // program is talking about. Left unfolded rather than folded wrongly.
-                    BinaryOp::BitAnd
-                    | BinaryOp::BitOr
-                    | BinaryOp::BitXor
-                    | BinaryOp::Shl
-                    | BinaryOp::Shr => None,
-                    // MatMul not supported for pure numbers at compile time
-                    BinaryOp::MatMul => None,
-                }
-            }
-            Expr::RelationalOp(RelationalOpExpr { lhs, op, rhs, .. }) => {
-                let l = self.eval_expr(lhs, env)?;
-                let r = self.eval_expr(rhs, env)?;
-                // Two integers compare as integers. Comparing them as floats makes every
-                // pair past 2^53 look equal.
-                if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
-                    let (a, b) = (*a, *b);
-                    return Some(Value::Bool(match op {
-                        RelationalOp::Eq => a == b,
-                        RelationalOp::NotEq => a != b,
-                        RelationalOp::Lt => a < b,
-                        RelationalOp::Gt => a > b,
-                        RelationalOp::Le => a <= b,
-                        RelationalOp::Ge => a >= b,
-                    }));
-                }
-                if let (Some(a), Some(b)) = (l.as_f64(), r.as_f64()) {
-                    return Some(Value::Bool(match op {
-                        RelationalOp::Eq => a == b,
-                        RelationalOp::NotEq => a != b,
-                        RelationalOp::Lt => a < b,
-                        RelationalOp::Gt => a > b,
-                        RelationalOp::Le => a <= b,
-                        RelationalOp::Ge => a >= b,
-                    }));
-                }
-                match (l, r, op) {
-                    (Value::Bool(a), Value::Bool(b), RelationalOp::Eq) => Some(Value::Bool(a == b)),
-                    (Value::Bool(a), Value::Bool(b), RelationalOp::NotEq) => {
-                        Some(Value::Bool(a != b))
-                    }
-                    (Value::Topology(a), Value::Topology(b), RelationalOp::Eq) => {
-                        Some(Value::Bool(self.topologies_equal(&a, &b)))
-                    }
-                    (Value::Topology(a), Value::Topology(b), RelationalOp::NotEq) => {
-                        Some(Value::Bool(!self.topologies_equal(&a, &b)))
-                    }
-                    _ => None,
-                }
-            }
-            Expr::LogicalOp(LogicalOpExpr {
-                lhs,
-                op,
-                rhs,
-                span: _,
-            }) => {
-                let l = self.eval_expr(lhs, env)?;
-                let r = self.eval_expr(rhs, env)?;
-                match (l, r, op) {
-                    (Value::Bool(a), Value::Bool(b), LogicalOp::And) => Some(Value::Bool(a && b)),
-                    (Value::Bool(a), Value::Bool(b), LogicalOp::Or) => Some(Value::Bool(a || b)),
-                    _ => None,
-                }
-            }
-            Expr::UnaryOp(UnaryOpExpr {
-                op: UnaryOp::Not,
-                expr: inner,
-                span: _,
-            }) => {
-                if let Value::Bool(b) = self.eval_expr(inner, env)? {
-                    Some(Value::Bool(!b))
-                } else {
-                    None
-                }
-            }
-            // No value for the one negation that overflows, as for the other operators.
-            Expr::UnaryOp(UnaryOpExpr {
-                op: UnaryOp::Neg,
-                expr: inner,
-                span: _,
-            }) => match self.eval_expr(inner, env)? {
-                Value::Int(i) => i.checked_neg().map(Value::Int),
-                Value::Number(n) => Some(Value::Number(-n)),
-                _ => None,
-            },
+            Expr::BinaryOp(e) => self.eval_binary_op(e, env),
+            Expr::RelationalOp(e) => self.eval_relational_op(e, env),
+            Expr::LogicalOp(e) => self.eval_logical_op(e, env),
+            Expr::UnaryOp(e) => self.eval_unary_op(e, env),
             // `[ a, b, c ]`. Every element has to be known, or the whole array is unknown:
             // a half-built array would let a later index read a value that was never there.
             Expr::Array(ArrayExpr { elements, span: _ }) => {
@@ -1856,79 +2208,9 @@ impl<'a> TypeChecker<'a> {
                 }
                 Some(Value::Array(items))
             }
-            // `a[i]`, where both the array and the index are known at compile time. An index
-            // past the end gives no value here; `check_indexaccess_expr` reports it.
-            Expr::IndexAccess(IndexAccessExpr {
-                base,
-                index,
-                span: _,
-            }) => {
-                let Value::Array(items) = self.eval_expr(base, env)? else {
-                    return None;
-                };
-                let index_val = self.eval_expr(index, env)?;
-                let i = Self::array_index(&index_val, items.len())?;
-                Some(items[i].clone())
-            }
-            Expr::FunctionCall(FunctionCallExpr {
-                name,
-                type_args,
-                args,
-                span: _,
-            }) => {
-                // Ignored on purpose: the checker has already instantiated the call and
-                // substituted the arguments into the body, so `sort<4>` arrives with its
-                // `N` gone. Matching on `None` here was what skipped such a call.
-                let _ = type_args;
-                let func = match self.callee_body(name.as_ref()) {
-                    Some(func) => func,
-                    // A closure held in a variable: `add(41)` names the variable, and the
-                    // body lives in the `Closure_N_call` the literal generated.
-                    None => self.closure_call_body(name.as_ref())?,
-                };
-                // A generated closure body takes its captured environment as a first
-                // parameter, and the call passes a struct for it. The environment is not a
-                // value the evaluator can build, so both are skipped: a body that only uses
-                // its own parameters folds, and one that reads a capture finds the name
-                // unbound and answers nothing, which is the right answer either way.
-                let skip = usize::from(Self::is_closure_body(name.as_ref()));
-                let mut local_env = HashMap::new();
-                for (i, arg_expr) in args.iter().skip(skip).enumerate() {
-                    let arg_val = self.eval_expr(arg_expr, env)?;
-                    local_env.insert(func.params.get(i + skip)?.0.clone(), arg_val);
-                }
-                self.enter_call()?;
-                let outer_unsupported = self.consteval.unsupported_stmt.replace(false);
-                let mut result = None;
-                if let EvalFlow::Return(ret_val) = self.eval_block(&func.body, &mut local_env) {
-                    result = ret_val;
-                }
-                // A body holding a statement the evaluator cannot run has not been run.
-                // Answering with what the statements it could run left behind would be a
-                // guess, and a guess here is reported as a certainty.
-                if self.consteval.unsupported_stmt.get() {
-                    result = None;
-                }
-                self.consteval.unsupported_stmt.set(outer_unsupported);
-                self.leave_call();
-                result
-            }
-            // The body of a comptime lambda is a `comptime` block, so evaluating a call to
-            // one means evaluating the block: run its statements, then its trailing value.
-            Expr::ComptimeBlock(ComptimeBlockExpr {
-                stmts,
-                ret,
-                span: _,
-            }) => {
-                let mut local_env = env.clone();
-                if let EvalFlow::Return(value) = self.eval_block(stmts, &mut local_env) {
-                    return value;
-                }
-                if self.consteval.unsupported_stmt.get() {
-                    return None;
-                }
-                self.eval_expr(ret.as_deref()?, &local_env)
-            }
+            Expr::IndexAccess(e) => self.eval_index_access(e, env),
+            Expr::FunctionCall(e) => self.eval_function_call(e, env),
+            Expr::ComptimeBlock(e) => self.eval_comptime_block(e, env),
             Expr::IndirectCall(IndirectCallExpr {
                 callee,
                 args,
@@ -1942,45 +2224,7 @@ impl<'a> TypeChecker<'a> {
                     Some(Value::Topology(top.clone()))
                 }
             }
-            Expr::If(IfExpr {
-                cond,
-                then_block,
-                else_block,
-                span: _,
-                is_comptime: _,
-            }) => {
-                if let Some(Value::Bool(cond_val)) = self.eval_expr(cond, env) {
-                    let block = if cond_val {
-                        then_block
-                    } else if let Some(e) = else_block {
-                        e
-                    } else {
-                        return None;
-                    };
-                    let mut ret = None;
-                    let mut local_env = env.clone();
-                    for stmt in block {
-                        if let Statement::ExprStmt(ExprStmtStmt {
-                            expr: e,
-                            has_semi,
-                            span: _,
-                        }) = stmt
-                        {
-                            let val = self.eval_expr(e, &local_env);
-                            if !*has_semi {
-                                ret = val;
-                            }
-                        } else if let EvalFlow::Return(val) =
-                            self.eval_statement(stmt, &mut local_env)
-                        {
-                            ret = val;
-                        }
-                    }
-                    ret
-                } else {
-                    None
-                }
-            }
+            Expr::If(e) => self.eval_if(e, env),
             _ => None,
         }
     }
@@ -2121,7 +2365,7 @@ impl<'a> TypeChecker<'a> {
         if !struct_name.starts_with("Closure_") {
             return None;
         }
-        let call_name = format!("{}_call", struct_name);
+        let call_name = format!("{struct_name}_call");
         self.mono
             .functions
             .iter()
@@ -2138,7 +2382,7 @@ impl<'a> TypeChecker<'a> {
         args: &[Expr],
         env: &HashMap<crate::symbol::Symbol, Value>,
     ) -> Option<Value> {
-        eprintln!("[ic] indirect call, callee = {:?}", callee);
+        eprintln!("[ic] indirect call, callee = {callee:?}");
         let Expr::Identifier(IdentifierExpr { name, span: _ }) = callee else {
             return None;
         };
@@ -2212,14 +2456,15 @@ impl<'a> TypeChecker<'a> {
 
     /// A compile-time array index. `None` for a fraction, a negative number, or an index
     /// at or past the end, so none of those can silently read the wrong element.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the float was just checked to be a whole number that is not negative, and one \
+                  too large for a `usize` becomes the largest `usize`, which the length test refuses"
+    )]
     pub(crate) fn array_index(value: &Value, len: usize) -> Option<usize> {
         let i = match value {
-            Value::Int(i) => {
-                if *i < 0 {
-                    return None;
-                }
-                *i as usize
-            }
+            Value::Int(i) => usize::try_from(*i).ok()?,
             // A float index is only an index when it is a whole number. Rounding one onto a
             // neighbouring element would read a value the program never asked for.
             Value::Number(n) => {
@@ -2365,6 +2610,138 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Run `name = expr`, or `let name = expr`, while compiling.
+    fn eval_bind(
+        &self,
+        name: &crate::symbol::Symbol,
+        expr: &Expr,
+        env: &mut HashMap<crate::symbol::Symbol, Value>,
+    ) -> EvalFlow {
+        // A binding the evaluator cannot compute has to become unknown. Leaving an
+        // older binding of the same name in place would answer later reads with it.
+        match self.eval_expr(expr, env) {
+            Some(val) => env.insert(name.clone(), val),
+            None => env.remove(name.as_ref()),
+        };
+        EvalFlow::Normal
+    }
+
+    /// `x op= v` is `x = x op v`. Run as that, so the arithmetic and the overflow
+    /// rules are the ones `eval_expr` already applies rather than a second copy.
+    fn eval_compound_assign(
+        &self,
+        assign: &CompoundAssignStmt,
+        env: &mut HashMap<crate::symbol::Symbol, Value>,
+    ) -> EvalFlow {
+        let CompoundAssignStmt {
+            lhs, op, rhs, span, ..
+        } = assign;
+        let folded = Expr::BinaryOp(BinaryOpExpr {
+            lhs: Box::new(lhs.clone()),
+            op: op.clone(),
+            rhs: Box::new(rhs.clone()),
+            span: *span,
+            operand_ty: None,
+        });
+        self.eval_statement(
+            &Statement::Assign(AssignStmt {
+                lhs: lhs.clone(),
+                rhs: folded,
+                span: *span,
+            }),
+            env,
+        )
+    }
+
+    /// `a[i] = v`, where `lhs` is `a[i]` and `access` is the same expression taken apart. If
+    /// any part of the store is unknown the whole array is dropped: keeping the old contents
+    /// would report a stale element as a certainty.
+    fn eval_index_assign(
+        &self,
+        lhs: &Expr,
+        access: &IndexAccessExpr,
+        rhs: &Expr,
+        env: &mut HashMap<crate::symbol::Symbol, Value>,
+    ) -> EvalFlow {
+        let IndexAccessExpr {
+            base,
+            index,
+            span: _,
+        } = access;
+        if let Some(root) = Self::place_root(lhs) {
+            // Only a write straight into a variable is carried out. A nested place
+            // like `a[i][j]` is not, so the array it belongs to becomes unknown.
+            let direct = matches!(&**base, Expr::Identifier(_));
+            let stored = direct && self.eval_array_store(root, index, rhs, env).is_some();
+            if !stored {
+                env.remove(root.as_ref());
+            }
+        }
+        EvalFlow::Normal
+    }
+
+    /// A call written as a statement. It is run only when it writes through a
+    /// mutable borrow -- that is the whole reason to run something for no value.
+    /// Anything it borrowed must be dropped when it could not be run, because the
+    /// callee has by now overwritten what the caller was holding.
+    fn eval_call_stmt(
+        &self,
+        call: &FunctionCallExpr,
+        env: &mut HashMap<crate::symbol::Symbol, Value>,
+    ) -> EvalFlow {
+        let borrowed = match self.callee_body(call.name.as_ref()) {
+            Some(func) => Self::mut_borrow_args(func, &call.args),
+            None => Vec::new(),
+        };
+        if borrowed.is_empty() {
+            self.consteval.unsupported_stmt.set(true);
+            return EvalFlow::Normal;
+        }
+        if let Some(written) = self.eval_call_effects(call, env) {
+            for (place, value) in written {
+                env.insert(place, value);
+            }
+        } else {
+            for (_, place) in borrowed {
+                env.remove(place.as_ref());
+            }
+            self.consteval.unsupported_stmt.set(true);
+        }
+        EvalFlow::Normal
+    }
+
+    /// An `if` written as a statement, which is how a loop body decides anything.
+    /// The chosen block runs against this environment rather than a copy, so what
+    /// it writes is still there afterwards, and a `break` inside it reaches the
+    /// loop. `eval_expr` has its own arm for an `if` used as a *value*, which
+    /// cannot do either: it answers with a value and keeps its writes to itself.
+    fn eval_if_stmt(
+        &self,
+        if_expr: &IfExpr,
+        env: &mut HashMap<crate::symbol::Symbol, Value>,
+    ) -> EvalFlow {
+        let IfExpr {
+            cond,
+            then_block,
+            else_block,
+            is_comptime: _,
+            span: _,
+        } = if_expr;
+        let Some(Value::Bool(taken)) = self.eval_expr(cond, env) else {
+            self.consteval.unsupported_stmt.set(true);
+            return EvalFlow::Normal;
+        };
+        if taken {
+            self.eval_block(then_block, env)
+        } else if let Some(otherwise) = else_block {
+            self.eval_block(otherwise, env)
+        } else {
+            EvalFlow::Normal
+        }
+    }
+
+    /// Run one statement while compiling, against the values in `env`. A statement that cannot
+    /// be run sets `unsupported_stmt`, so the caller gives no value instead of a wrong one.
     pub(crate) fn eval_statement(
         &self,
         stmt: &Statement,
@@ -2377,70 +2754,18 @@ impl<'a> TypeChecker<'a> {
                 ty_ann: _,
                 expr,
                 span: _,
-            }) => {
-                // A binding the evaluator cannot compute has to become unknown. Leaving an
-                // older binding of the same name in place would answer later reads with it.
-                match self.eval_expr(expr, env) {
-                    Some(val) => env.insert(name.clone(), val),
-                    None => env.remove(name.as_ref()),
-                };
-                EvalFlow::Normal
-            }
+            }) => self.eval_bind(name, expr, env),
             Statement::Assign(AssignStmt {
                 lhs: Expr::Identifier(IdentifierExpr { name, span: _ }),
                 rhs,
                 span: _,
-            }) => {
-                match self.eval_expr(rhs, env) {
-                    Some(val) => env.insert(name.clone(), val),
-                    None => env.remove(name.as_ref()),
-                };
-                EvalFlow::Normal
-            }
-            // `x op= v` is `x = x op v`. Run as that, so the arithmetic and the overflow
-            // rules are the ones `eval_expr` already applies rather than a second copy.
-            Statement::CompoundAssign(CompoundAssignStmt {
-                lhs, op, rhs, span, ..
-            }) => {
-                let folded = Expr::BinaryOp(BinaryOpExpr {
-                    lhs: Box::new(lhs.clone()),
-                    op: op.clone(),
-                    rhs: Box::new(rhs.clone()),
-                    span: *span,
-                    operand_ty: None,
-                });
-                self.eval_statement(
-                    &Statement::Assign(AssignStmt {
-                        lhs: lhs.clone(),
-                        rhs: folded,
-                        span: *span,
-                    }),
-                    env,
-                )
-            }
-            // `a[i] = v`. If any part of the store is unknown the whole array is dropped:
-            // keeping the old contents would report a stale element as a certainty.
+            }) => self.eval_bind(name, rhs, env),
+            Statement::CompoundAssign(assign) => self.eval_compound_assign(assign, env),
             Statement::Assign(AssignStmt {
-                lhs:
-                    lhs @ Expr::IndexAccess(IndexAccessExpr {
-                        base,
-                        index,
-                        span: _,
-                    }),
+                lhs: lhs @ Expr::IndexAccess(access),
                 rhs,
                 span: _,
-            }) => {
-                if let Some(root) = Self::place_root(lhs) {
-                    // Only a write straight into a variable is carried out. A nested place
-                    // like `a[i][j]` is not, so the array it belongs to becomes unknown.
-                    let direct = matches!(&**base, Expr::Identifier(_));
-                    let stored = direct && self.eval_array_store(root, index, rhs, env).is_some();
-                    if !stored {
-                        env.remove(root.as_ref());
-                    }
-                }
-                EvalFlow::Normal
-            }
+            }) => self.eval_index_assign(lhs, access, rhs, env),
             // A `return` ends the body whether or not its value could be computed. Carrying
             // on to the next statement would run code the program does not reach.
             Statement::Return(ReturnStmt { expr, span: _ }) => {
@@ -2464,67 +2789,16 @@ impl<'a> TypeChecker<'a> {
             Statement::Assert(_) => EvalFlow::Normal,
             Statement::Break(_) => EvalFlow::Break,
             Statement::Continue(_) => EvalFlow::Continue,
-            // A call written as a statement. It is run only when it writes through a
-            // mutable borrow -- that is the whole reason to run something for no value.
-            // Anything it borrowed must be dropped when it could not be run, because the
-            // callee has by now overwritten what the caller was holding.
             Statement::ExprStmt(ExprStmtStmt {
                 expr: Expr::FunctionCall(call),
                 has_semi: _,
                 span: _,
-            }) => {
-                let borrowed = match self.callee_body(call.name.as_ref()) {
-                    Some(func) => Self::mut_borrow_args(func, &call.args),
-                    None => Vec::new(),
-                };
-                if borrowed.is_empty() {
-                    self.consteval.unsupported_stmt.set(true);
-                    return EvalFlow::Normal;
-                }
-                match self.eval_call_effects(call, env) {
-                    Some(written) => {
-                        for (place, value) in written {
-                            env.insert(place, value);
-                        }
-                    }
-                    None => {
-                        for (_, place) in borrowed {
-                            env.remove(place.as_ref());
-                        }
-                        self.consteval.unsupported_stmt.set(true);
-                    }
-                }
-                EvalFlow::Normal
-            }
-            // An `if` written as a statement, which is how a loop body decides anything.
-            // The chosen block runs against this environment rather than a copy, so what
-            // it writes is still there afterwards, and a `break` inside it reaches the
-            // loop. `eval_expr` has its own arm for an `if` used as a *value*, which
-            // cannot do either: it answers with a value and keeps its writes to itself.
+            }) => self.eval_call_stmt(call, env),
             Statement::ExprStmt(ExprStmtStmt {
-                expr:
-                    Expr::If(IfExpr {
-                        cond,
-                        then_block,
-                        else_block,
-                        is_comptime: _,
-                        span: _,
-                    }),
+                expr: Expr::If(if_expr),
                 has_semi: _,
                 span: _,
-            }) => {
-                let Some(Value::Bool(taken)) = self.eval_expr(cond, env) else {
-                    self.consteval.unsupported_stmt.set(true);
-                    return EvalFlow::Normal;
-                };
-                if taken {
-                    self.eval_block(then_block, env)
-                } else if let Some(otherwise) = else_block {
-                    self.eval_block(otherwise, env)
-                } else {
-                    EvalFlow::Normal
-                }
-            }
+            }) => self.eval_if_stmt(if_expr, env),
             // Anything else: not run. Say so, so the call this body belongs to gives no
             // value rather than a half-executed one.
             _ => {
@@ -2536,15 +2810,15 @@ impl<'a> TypeChecker<'a> {
 
     fn topologies_equal(&self, a: &Topology, b: &Topology) -> bool {
         match (a, b) {
-            (Topology::CPU, Topology::CPU) => true,
-            (Topology::CpuAvx512, Topology::CpuAvx512) => true,
-            (Topology::CpuNeon, Topology::CpuNeon) => true,
-            (Topology::AMX, Topology::AMX) => true,
-            (Topology::ANE, Topology::ANE) => true,
-            (Topology::GPU(expr_a), Topology::GPU(expr_b)) => self.exprs_equal(expr_a, expr_b),
-            (Topology::Current, Topology::Current) => true,
-            (Topology::NPU(expr_a), Topology::NPU(expr_b)) => self.exprs_equal(expr_a, expr_b),
-            (Topology::AccCore(expr_a), Topology::AccCore(expr_b)) => {
+            (Topology::CPU, Topology::CPU)
+            | (Topology::CpuAvx512, Topology::CpuAvx512)
+            | (Topology::CpuNeon, Topology::CpuNeon)
+            | (Topology::AMX, Topology::AMX)
+            | (Topology::ANE, Topology::ANE)
+            | (Topology::Current, Topology::Current) => true,
+            (Topology::GPU(expr_a), Topology::GPU(expr_b))
+            | (Topology::NPU(expr_a), Topology::NPU(expr_b))
+            | (Topology::AccCore(expr_a), Topology::AccCore(expr_b)) => {
                 self.exprs_equal(expr_a, expr_b)
             }
             (Topology::Slice(top_a, start_a, end_a), Topology::Slice(top_b, start_b, end_b)) => {
@@ -2597,69 +2871,61 @@ pub(crate) struct MutReferenceTypes<'t> {
 impl MutReferenceTypes<'_> {
     /// Whether a value of this type can carry a mutable reference.
     pub(crate) fn can_carry(&self, ty: &Type) -> bool {
-        fn visit(
-            types: &MutReferenceTypes<'_>,
-            ty: &Type,
-            seen: &mut HashSet<crate::symbol::Symbol>,
-        ) -> bool {
-            match ty {
-                Type::Borrow { inner, is_mut, .. } => *is_mut || visit(types, inner, seen),
-                Type::Pointer(inner, _, is_mut) => *is_mut || visit(types, inner, seen),
-                Type::Ref(inner, _) | Type::Verified(inner) | Type::Pinned(inner, _) => {
-                    visit(types, inner, seen)
+        self.visit(ty, &mut HashSet::new())
+    }
+
+    /// Whether a value of type `ty` can carry a mutable reference. `seen` holds the names of
+    /// the structs and enums being looked through, so a type that contains itself ends.
+    fn visit(&self, ty: &Type, seen: &mut HashSet<crate::symbol::Symbol>) -> bool {
+        match ty {
+            Type::Borrow { inner, is_mut, .. } | Type::Pointer(inner, _, is_mut) => {
+                *is_mut || self.visit(inner, seen)
+            }
+            Type::Ref(inner, _) | Type::Verified(inner) | Type::Pinned(inner, _) => {
+                self.visit(inner, seen)
+            }
+            Type::GenericInstance(base, args) => {
+                self.visit(base, seen) || args.iter().any(|arg| self.visit(arg, seen))
+            }
+            Type::Struct(name, _) | Type::Enum(name, _) => {
+                if !seen.insert(name.clone()) {
+                    return false;
                 }
-                Type::GenericInstance(base, args) => {
-                    visit(types, base, seen) || args.iter().any(|arg| visit(types, arg, seen))
-                }
-                Type::Struct(name, _) | Type::Enum(name, _) => {
-                    if !seen.insert(name.clone()) {
-                        return false;
-                    }
-                    let result = types
-                        .structs
-                        .get(name)
-                        .map(|decl| {
-                            decl.fields
-                                .iter()
-                                .any(|(_, field)| visit(types, field, seen))
-                        })
-                        .or_else(|| {
-                            types
-                                .generated_structs
-                                .iter()
-                                .find(|decl| decl.name == *name)
-                                .map(|decl| {
-                                    decl.fields
-                                        .iter()
-                                        .any(|(_, field)| visit(types, field, seen))
-                                })
-                        })
-                        .or_else(|| {
-                            types.enums.get(name).map(|decl| {
-                                decl.variants.iter().any(|(_, payload)| {
-                                    payload.as_ref().is_some_and(|fields| {
-                                        fields.iter().any(|field| visit(types, field, seen))
-                                    })
+                let result = self
+                    .structs
+                    .get(name)
+                    .map(|decl| decl.fields.iter().any(|(_, field)| self.visit(field, seen)))
+                    .or_else(|| {
+                        self.generated_structs
+                            .iter()
+                            .find(|decl| decl.name == *name)
+                            .map(|decl| {
+                                decl.fields.iter().any(|(_, field)| self.visit(field, seen))
+                            })
+                    })
+                    .or_else(|| {
+                        self.enums.get(name).map(|decl| {
+                            decl.variants.iter().any(|(_, payload)| {
+                                payload.as_ref().is_some_and(|fields| {
+                                    fields.iter().any(|field| self.visit(field, seen))
                                 })
                             })
                         })
-                        .unwrap_or(false);
-                    seen.remove(name);
-                    result
-                }
-                Type::Unknown => true,
-                Type::Tensor(..)
-                | Type::Matrix
-                | Type::Scalar(..)
-                | Type::Generic(..)
-                | Type::Module(..)
-                | Type::Simd(..)
-                | Type::Function(..)
-                | Type::Closure(..)
-                | Type::Const(..) => false,
+                    })
+                    .unwrap_or(false);
+                seen.remove(name);
+                result
             }
+            Type::Unknown => true,
+            Type::Tensor(..)
+            | Type::Matrix
+            | Type::Scalar(..)
+            | Type::Generic(..)
+            | Type::Module(..)
+            | Type::Simd(..)
+            | Type::Function(..)
+            | Type::Closure(..)
+            | Type::Const(..) => false,
         }
-
-        visit(self, ty, &mut HashSet::new())
     }
 }

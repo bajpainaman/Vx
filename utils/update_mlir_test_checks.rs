@@ -14,12 +14,20 @@
 //
 //===----------------------------------------------------------------------===//
 
+//! A tool that reruns the `// RUN:` commands of MLIR tests and rewrites their `// CHECK:` lines
+//! to match the output.
+
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-fn build_vxc() -> std::path::PathBuf {
+/// Builds the debug `vxc` binary and returns its path, or `None` when the build fails.
+///
+/// # Panics
+///
+/// Panics when `cargo` cannot be started or the current directory cannot be read.
+fn build_vxc() -> Option<std::path::PathBuf> {
     println!("Building vxc...");
     let status = Command::new("cargo")
         .args(["build", "--bin", "vxc"])
@@ -28,16 +36,24 @@ fn build_vxc() -> std::path::PathBuf {
 
     if !status.success() {
         eprintln!("Failed to build vxc. Exiting.");
-        std::process::exit(1);
+        return None;
     }
 
-    env::current_dir()
-        .unwrap()
-        .join("target")
-        .join("debug")
-        .join("vxc")
+    Some(
+        env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("debug")
+            .join("vxc"),
+    )
 }
 
+/// Collects the `// RUN:` commands of a test, with `%s` replaced by the file path, and the
+/// `FileCheck` prefixes they use.
+///
+/// # Panics
+///
+/// Panics when a `--check-prefix=` has no name after it.
 fn parse_run_lines(content: &str, file_path: &str) -> (Vec<(String, String)>, Vec<String>) {
     let mut runs = Vec::new();
     let mut prefixes = Vec::new();
@@ -71,12 +87,13 @@ fn parse_run_lines(content: &str, file_path: &str) -> (Vec<(String, String)>, Ve
     (runs, prefixes)
 }
 
+/// Returns the lines of a test without its old check lines, ending in one empty line.
 fn filter_existing_checks(content: &str, prefixes: &[String]) -> Vec<String> {
     let mut new_lines = Vec::new();
     for line in content.lines() {
         let mut is_check = false;
         for prefix in prefixes {
-            let check_str = format!("// {}:", prefix);
+            let check_str = format!("// {prefix}:");
             if line.trim().starts_with(&check_str) {
                 is_check = true;
                 break;
@@ -94,10 +111,11 @@ fn filter_existing_checks(content: &str, prefixes: &[String]) -> Vec<String> {
             break;
         }
     }
-    new_lines.push("".to_string());
+    new_lines.push(String::new());
     new_lines
 }
 
+/// Splits a command line on spaces, keeping double-quoted parts together.
 fn parse_command_args(cmd: &str) -> Vec<String> {
     let mut args: Vec<String> = vec![];
     let mut current_arg = String::new();
@@ -120,6 +138,7 @@ fn parse_command_args(cmd: &str) -> Vec<String> {
     args
 }
 
+/// Turns the MLIR module in the compiler output into check lines.
 fn extract_mlir_checks(stdout: &str, prefix: &str) -> Vec<String> {
     let mut checks = Vec::new();
     let mut in_mlir = false;
@@ -133,11 +152,12 @@ fn extract_mlir_checks(stdout: &str, prefix: &str) -> Vec<String> {
         if !in_mlir || line.trim().is_empty() {
             continue;
         }
-        checks.push(format!("// {}: {}", prefix, line));
+        checks.push(format!("// {prefix}: {line}"));
     }
     checks
 }
 
+/// Turns the LLVM IR in the compiler output into check lines.
 fn extract_llvm_checks(stdout: &str, prefix: &str) -> Vec<String> {
     let mut checks = Vec::new();
     let mut in_llvm = false;
@@ -151,25 +171,30 @@ fn extract_llvm_checks(stdout: &str, prefix: &str) -> Vec<String> {
         if !in_llvm || line.trim().is_empty() {
             continue;
         }
-        checks.push(format!("// {}: {}", prefix, line));
+        checks.push(format!("// {prefix}: {line}"));
     }
     checks
 }
 
+/// Reruns the commands of one test and rewrites the file when its check lines changed.
+///
+/// # Panics
+///
+/// Panics when the compiler binary cannot be started.
 fn process_test_file(file_path: &str, vxc_bin: &Path) {
-    println!("Updating {}...", file_path);
+    println!("Updating {file_path}...");
 
     let original_content = match fs::read_to_string(file_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Warning: Failed to read {}: {}", file_path, e);
+            eprintln!("Warning: Failed to read {file_path}: {e}");
             return;
         }
     };
 
     let (runs, prefixes) = parse_run_lines(&original_content, file_path);
     if runs.is_empty() {
-        eprintln!("Warning: No RUN lines found in {}", file_path);
+        eprintln!("Warning: No RUN lines found in {file_path}");
         return;
     }
 
@@ -180,7 +205,7 @@ fn process_test_file(file_path: &str, vxc_bin: &Path) {
 
         let exec_name = args.remove(0);
         if exec_name != "vxc" && exec_name != "vx-opt" {
-            eprintln!("Unknown executable in RUN line: {}", exec_name);
+            eprintln!("Unknown executable in RUN line: {exec_name}");
             continue;
         }
 
@@ -200,21 +225,20 @@ fn process_test_file(file_path: &str, vxc_bin: &Path) {
         };
 
         new_lines.extend(checks);
-        new_lines.push("".to_string());
+        new_lines.push(String::new());
     }
 
     let new_content = new_lines.join("\n");
-    if new_content != original_content {
-        if let Err(e) = fs::write(file_path, new_content) {
-            eprintln!("Error writing {}: {}", file_path, e);
-        } else {
-            println!("  Updated.");
-        }
-    } else {
+    if new_content == original_content {
         println!("  Unchanged.");
+    } else if let Err(e) = fs::write(file_path, new_content) {
+        eprintln!("Error writing {file_path}: {e}");
+    } else {
+        println!("  Updated.");
     }
 }
 
+/// Builds the compiler, then updates every test file named on the command line.
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
@@ -222,7 +246,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    let vxc_bin = build_vxc();
+    let Some(vxc_bin) = build_vxc() else {
+        std::process::exit(1);
+    };
 
     for file_path in args {
         process_test_file(&file_path, &vxc_bin);

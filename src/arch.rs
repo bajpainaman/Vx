@@ -15,8 +15,11 @@ use crate::syntax::{MemorySpace, Topology, Type};
 use std::collections::HashMap;
 
 use crate::syntax;
+
+/// Which memory spaces data can move between in one compilation, what each move costs, and
+/// which memory each topology holds and can see.
 pub struct TransferCostGraph {
-    /// Adjacency list for MemorySpace data transfers.
+    /// Adjacency list for `MemorySpace` data transfers.
     /// Directed edge from A -> B means memory can be transferred from A to B.
     transfer_edges: HashMap<MemorySpace, Vec<(MemorySpace, u32)>>,
 
@@ -28,7 +31,7 @@ pub struct TransferCostGraph {
     /// A host↔device hop is the motivating case: `CPU_DRAM` and `HBM` do not nest, so they have no
     /// nearest common ancestor and the roofline walk returns nothing — which is why that seam, the
     /// most important one in the model, predicted `null` on every fleet file. Its bandwidth belongs
-    /// to the link (PCIe, C2C), not to either memory, so it is declared on the edge and looked up
+    /// to the link (`PCIe`, C2C), not to either memory, so it is declared on the edge and looked up
     /// here.
     edge_rates: HashMap<(MemorySpace, MemorySpace), syntax::Bandwidth>,
 
@@ -62,7 +65,7 @@ pub struct TransferCostGraph {
     /// Every topology's descriptor (built-ins plus the user-declared `Topology { ... }` of *this*
     /// compilation), held per-instance rather than in a process-global registry. This is the
     /// data-oriented, lock-free home the parallel pipeline needs (see
-    /// docs/parallel_compiler_architecture.md): the graph is built once per compilation and shared
+    /// `docs/parallel_compiler_architecture.md)`: the graph is built once per compilation and shared
     /// across worker threads by `&`, so a topology declared in one program cannot leak into
     /// another and nothing is synchronized.
     descriptors: HashMap<crate::syntax::TopologyKind, TopologyDescriptor>,
@@ -80,20 +83,17 @@ pub struct TransferCostGraph {
 /// The USE-DIRECT / USE-NEEDS-SEAM rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reachability {
+    /// The value can be read where it is.
     Visible,
-    NeedsSeam { cost: u32 },
+    /// The value has to be moved with `transfer(...)` first.
+    NeedsSeam {
+        /// The total declared cost of the cheapest route.
+        cost: u32,
+    },
+    /// No route of transfers reaches the value.
     Unreachable,
 }
 
-/// Declarative description of a topology's memory behaviour — the data that used to be
-/// hardcoded across `default_memory_for` and the special-cases in `is_type_accessible`.
-///
-/// A topology is described by where its values live (`default_space`) and which memory
-/// spaces it can directly address (`visibility`, i.e. unified-memory reach; this always
-/// includes `default_space`). The built-ins come from `builtin_descriptors`; a user
-/// `Topology { ... }` declaration is carried on the AST (`TopologyDecl` on `Program.topologies`)
-/// and seeded into the per-compilation `TransferCostGraph` — the metadata is data, not `match`
-/// arms, and not a global registry -- a registry behind the enum.
 /// A declared transfer edge (morphism): a hop `from -> to` with a `cost` grade and a
 /// consistency grade. `sync` = a synchronizing transfer (release/acquire) that preserves a
 /// boundary contract; `!sync` = a relaxed escape hatch whose visibility the seam engine
@@ -106,12 +106,20 @@ pub enum Reachability {
 /// *compose in cost*, not whether an engine exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferEdge {
+    /// The memory space the data leaves.
     pub from: MemorySpace,
+    /// The memory space the data arrives in.
     pub to: MemorySpace,
+    /// What the hop costs, or where that cost comes from.
     pub cost: EdgeCost,
+    /// Whether the transfer synchronizes, so the receiver is sure to see the data.
     pub sync: bool,
+    /// Whether a hardware copy engine can drive this hop.
     pub copy_engine: bool,
 }
+
+/// Attoseconds per second. The denomination route selection works in -- see `route_cost`.
+const ATTOS_PER_SEC: u128 = 1_000_000_000_000_000_000;
 
 /// Where a declared edge's cost comes from. **Exactly one source per edge** — an edge that both
 /// declares a cost and can have one derived from its endpoints' bandwidths is an error (E6013),
@@ -121,9 +129,6 @@ pub struct TransferEdge {
 /// The rule was not free: every fleet file declared `transfer HBM -> L2 : 40` *and* gave `L2` a
 /// bandwidth, so both costs existed for that edge, and the compiler routed by one and reported the
 /// other. Nothing detected it.
-/// Attoseconds per second. The denomination route selection works in -- see `route_cost`.
-const ATTOS_PER_SEC: u128 = 1_000_000_000_000_000_000;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeCost {
     /// `transfer A -> B` — the edge asserts reachability only. Its cost is the containment-derived
@@ -131,7 +136,7 @@ pub enum EdgeCost {
     /// a device, where the spaces nest and their bandwidths describe the move.
     Derived,
     /// `transfer A -> B : 64 GB/s` — the *link's* own bandwidth. Needed where containment cannot
-    /// derive a cost because the endpoints do not nest: a host↔device link is a property of PCIe or
+    /// derive a cost because the endpoints do not nest: a host↔device link is a property of `PCIe` or
     /// C2C, not of either memory it connects.
     Rate(crate::syntax::Bandwidth),
     /// `transfer A -> B : 300` — a unitless relative cost. Not a physical prediction, and it does
@@ -149,6 +154,7 @@ impl EdgeCost {
     /// line through the origin, so the ratio between two routes does not depend on bytes and the
     /// cheapest route can be chosen once, for all sizes, from the per-byte rate alone. Minimising
     /// hops instead picked a route 3.57x slower than one the same graph already contained.
+    #[must_use]
     pub fn routing_weight(self) -> u32 {
         match self {
             EdgeCost::Derived | EdgeCost::Rate(_) => 1,
@@ -163,16 +169,18 @@ impl EdgeCost {
     /// cannot be compared against a link declared in `B/s` without a clock the edge does not
     /// carry. All three mean "not predictable here", which routing treats as a last resort rather
     /// than as free.
+    #[must_use]
     pub fn per_byte_attos(self) -> Option<u64> {
         match self {
             EdgeCost::Rate(bw) if bw.per == crate::syntax::RatePer::Second && bw.bytes > 0 => {
-                u64::try_from(ATTOS_PER_SEC / bw.bytes as u128).ok()
+                u64::try_from(ATTOS_PER_SEC / u128::from(bw.bytes)).ok()
             }
             _ => None,
         }
     }
 
     /// The declared figure to report as this edge's cost, if it declared one at all.
+    #[must_use]
     pub fn declared(self) -> Option<u32> {
         match self {
             EdgeCost::Fixed(c) => Some(c),
@@ -181,9 +189,20 @@ impl EdgeCost {
     }
 }
 
+/// Declarative description of a topology's memory behaviour — the data that used to be
+/// hardcoded across `default_memory_for` and the special-cases in `is_type_accessible`.
+///
+/// A topology is described by where its values live (`default_space`) and which memory
+/// spaces it can directly address (`visibility`, i.e. unified-memory reach; this always
+/// includes `default_space`). The built-ins come from `builtin_descriptors`; a user
+/// `Topology { ... }` declaration is carried on the AST (`TopologyDecl` on `Program.topologies`)
+/// and seeded into the per-compilation `TransferCostGraph` — the metadata is data, not `match`
+/// arms, and not a global registry -- a registry behind the enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyDescriptor {
+    /// The memory space this topology's values live in.
     pub default_space: MemorySpace,
+    /// The memory spaces this topology can read and write in place.
     pub visibility: Vec<MemorySpace>,
     /// The instruction set this topology executes -- `arch: x86_64` in the declaration.
     ///
@@ -217,7 +236,9 @@ pub struct TopologyDescriptor {
 /// `MemoryDecl` — *not* a process-global registry. Parsed by `parser::decl::parse_topology_decl`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyDecl {
+    /// The name the topology is declared with.
     pub name: crate::symbol::Symbol,
+    /// What the declaration says about the topology.
     pub descriptor: TopologyDescriptor,
 }
 
@@ -236,6 +257,7 @@ pub enum CoherenceIssue {
 /// The graph-decidable coherence obligations for one descriptor, checked against `graph`
 /// (which must already be seeded with the topology's edges). Pure; the consistency
 /// obligation is handled by the caller via the seam engine.
+#[must_use]
 pub fn descriptor_coherence(
     desc: &TopologyDescriptor,
     graph: &TransferCostGraph,
@@ -265,10 +287,10 @@ pub fn descriptor_coherence(
 /// the derived dispatch ids are reproducible across toolchains -- they are part of the runtime
 /// dispatch contract. Shared by the `Custom` and `Slice` banded id schemes.
 fn fnv32(s: &str) -> u32 {
-    let mut hash: u32 = 2166136261;
+    let mut hash: u32 = 2_166_136_261;
     for b in s.as_bytes() {
-        hash ^= *b as u32;
-        hash = hash.wrapping_mul(16777619);
+        hash ^= u32::from(*b);
+        hash = hash.wrapping_mul(16_777_619);
     }
     hash
 }
@@ -295,18 +317,24 @@ pub const NUMA_DISPATCH_BASE: i32 = 1000;
 pub const NUMA_DISPATCH_MAX_NODE: u64 = 999;
 
 /// The dispatch id for a space on NUMA node `node`, or `None` when the node is out of band.
+#[must_use]
 pub fn numa_dispatch_id(node: u64) -> Option<i32> {
-    (node <= NUMA_DISPATCH_MAX_NODE).then(|| NUMA_DISPATCH_BASE + node as i32)
+    if node > NUMA_DISPATCH_MAX_NODE {
+        return None;
+    }
+    i32::try_from(node)
+        .ok()
+        .map(|node| NUMA_DISPATCH_BASE + node)
 }
 
 /// The NUMA node an id names, or `None` if it is not in the band. The inverse of
 /// [`numa_dispatch_id`], and `runtime/host_dispatch_common.h` decodes the same range -- the two
 /// must change together.
+#[must_use]
 pub fn numa_node_of_dispatch_id(id: i32) -> Option<u64> {
-    let node = id.checked_sub(NUMA_DISPATCH_BASE)?;
-    (0..=NUMA_DISPATCH_MAX_NODE as i32)
-        .contains(&node)
-        .then_some(node as u64)
+    // An id below the band gives a negative number here, which is not a node.
+    let node = u64::try_from(id.checked_sub(NUMA_DISPATCH_BASE)?).ok()?;
+    (node <= NUMA_DISPATCH_MAX_NODE).then_some(node)
 }
 
 /// How many ids a declared name can be given: `CUSTOM_DISPATCH_ID_BASE..=i32::MAX`.
@@ -323,12 +351,18 @@ const CUSTOM_DISPATCH_ID_SPAN: u32 = (i32::MAX as u32) - (CUSTOM_DISPATCH_ID_BAS
 /// it, and `runtime/vx_manifest.h` mirrors this function byte for byte, so the two must change
 /// together.
 fn fnv_dispatch_id(name: &str) -> i32 {
-    CUSTOM_DISPATCH_ID_BASE + (fnv32(name) % CUSTOM_DISPATCH_ID_SPAN) as i32
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "the remainder is below `CUSTOM_DISPATCH_ID_SPAN`, which fits in an `i32`"
+    )]
+    let offset = (fnv32(name) % CUSTOM_DISPATCH_ID_SPAN) as i32;
+    CUSTOM_DISPATCH_ID_BASE + offset
 }
 
 /// A topology index's compile-time value: a literal, or exact integer arithmetic over literals
 /// (`GPU[TP * 2]` once monomorphization has substituted its const generics). `None` when the index
 /// is a genuine runtime value.
+#[must_use]
 pub fn const_topology_index(expr: &crate::syntax::Expr) -> Option<i32> {
     match expr {
         crate::syntax::Expr::Number(n) => n.value.parse::<i32>().ok(),
@@ -364,6 +398,7 @@ pub fn const_topology_index(expr: &crate::syntax::Expr) -> Option<i32> {
 /// `topology_dispatch_id` falls back to 0 -- silently placing `GPU[i]` on device 0. Callers use
 /// this to warn loudly instead (#284); the fallback itself stays, since declining would reject
 /// programs that compile today.
+#[must_use]
 pub fn non_constant_index(top: &Topology) -> Option<&crate::syntax::Expr> {
     match top {
         // Every indexed kind, and the list must stay that way: an omission here is not a missing
@@ -386,6 +421,7 @@ fn topology_index(expr: &crate::syntax::Expr) -> i32 {
 }
 
 /// Dispatch id for a topology (`vx.spawn topology(N)`). Single source of truth.
+#[must_use]
 pub fn topology_dispatch_id(top: &Topology) -> i32 {
     match top {
         Topology::CPU | Topology::Current => 0,
@@ -408,7 +444,12 @@ pub fn topology_dispatch_id(top: &Topology) -> i32 {
                 topology_index(start),
                 topology_index(end)
             );
-            2000 + (fnv32(&key) % 1000) as i32
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "the remainder is below 1000, which fits in an `i32`"
+            )]
+            let offset = (fnv32(&key) % 1000) as i32;
+            2000 + offset
         }
         Topology::Custom(name) => fnv_dispatch_id(name),
     }
@@ -416,6 +457,7 @@ pub fn topology_dispatch_id(top: &Topology) -> i32 {
 
 /// Dispatch id for a memory-space transfer target (`vx.transfer target_topology = N`). Each
 /// space maps to its canonical owning topology's id, so it agrees with `topology_dispatch_id`.
+#[must_use]
 pub fn memory_space_dispatch_id(mem: &MemorySpace) -> i32 {
     match mem {
         MemorySpace::CPUDRAM => 0,     // CPU
@@ -453,7 +495,7 @@ pub fn local_device_aliases<'a>(
     let gpu0 = topology_dispatch_id(&Topology::gpu(0));
     let mut out = Vec::new();
     for (name, desc) in decls {
-        if desc.arch.as_ref().map(|a| a.as_ref()) != Some("nvptx64") {
+        if desc.arch.as_ref().map(std::convert::AsRef::as_ref) != Some("nvptx64") {
             continue;
         }
         out.push((topology_dispatch_id(&Topology::Custom(name.clone())), gpu0));
@@ -468,6 +510,7 @@ pub fn local_device_aliases<'a>(
 
 /// The name of the built-in memory space whose dispatch id is `id`, if one has it. A declared
 /// space's id is a hash of its name and cannot be turned back.
+#[must_use]
 pub fn builtin_memory_space_name(id: u64) -> Option<String> {
     [
         MemorySpace::CPUDRAM,
@@ -478,7 +521,7 @@ pub fn builtin_memory_space_name(id: u64) -> Option<String> {
         MemorySpace::RemoteHbm,
     ]
     .into_iter()
-    .find(|m| memory_space_dispatch_id(m) as u64 == id)
+    .find(|m| u64::try_from(memory_space_dispatch_id(m)) == Ok(id))
     .map(|m| m.name())
 }
 
@@ -507,6 +550,7 @@ pub enum AddressSpace {
 impl AddressSpace {
     /// The NVPTX numbering (0 generic, 1 global, 3 shared, 5 local). Only this function knows the
     /// target's numbers; everything upstream reasons in terms of the enum.
+    #[must_use]
     pub fn nvptx_addrspace(self) -> i32 {
         match self {
             AddressSpace::Host => 0,
@@ -519,6 +563,7 @@ impl AddressSpace {
     /// The MLIR `#gpu.address_space<..>` attribute this corresponds to, for the GPU lowering path
     /// that consumes `--convert-gpu-to-nvvm` (#251). `None` for host memory, which carries no
     /// attribute.
+    #[must_use]
     pub fn gpu_attr(self) -> Option<&'static str> {
         match self {
             AddressSpace::Host => None,
@@ -533,6 +578,7 @@ impl AddressSpace {
 /// intrinsic address space -- it is whatever its declaration's `scope:` says -- so this returns
 /// `None` for it and callers use [`declared_address_space`], which has the declaration in hand.
 /// `None` also for the network spaces, which have no GPU analogue at all (#258).
+#[must_use]
 pub fn builtin_address_space(mem: &MemorySpace) -> Option<AddressSpace> {
     match mem {
         MemorySpace::CPUDRAM => Some(AddressSpace::Host),
@@ -541,9 +587,9 @@ pub fn builtin_address_space(mem: &MemorySpace) -> Option<AddressSpace> {
         // On-chip scratchpad is *shared* memory, not the reserved space it used to be given.
         MemorySpace::LocalSRAM => Some(AddressSpace::Workgroup),
         // Network-attached memory is not addressable from a GPU kernel; there is no honest
-        // mapping, so callers must diagnose rather than silently pick one.
-        MemorySpace::NicRam | MemorySpace::RemoteHbm => None,
-        MemorySpace::Custom(_) => None,
+        // mapping, so callers must diagnose rather than silently pick one. A declared space
+        // has no address space of its own either.
+        MemorySpace::NicRam | MemorySpace::RemoteHbm | MemorySpace::Custom(_) => None,
     }
 }
 
@@ -555,6 +601,7 @@ pub fn builtin_address_space(mem: &MemorySpace) -> Option<AddressSpace> {
 /// `None` when no honest mapping exists -- an undeclared custom space, a declaration with no
 /// `scope:`, or a space with no GPU analogue. The caller reports that rather than defaulting,
 /// which is how every declared space used to become read-only constant memory (#258).
+#[must_use]
 pub fn declared_address_space(
     mem: &MemorySpace,
     decl: Option<&crate::syntax::MemoryDecl>,
@@ -571,9 +618,14 @@ pub fn declared_address_space(
 
 /// The address space for a topology, derived from its default memory space so that a value
 /// expressed as `Pinned<T, GPU>` and one as `Ref<T, GpuHbm>` land in the same address space
-/// (previously two separate maps disagreed -- GPU was 5 but GpuHbm was 1). `decls` supplies the
+/// (previously two separate maps disagreed -- GPU was 5 but `GpuHbm` was 1). `decls` supplies the
 /// compilation's memory declarations so a custom topology's space is scope-mapped (#258); `None`
 /// when the space has no honest mapping, which the caller diagnoses.
+#[must_use]
+#[allow(
+    clippy::implicit_hasher,
+    reason = "callers are in other files, and pass the compiler's own maps with the default hasher"
+)]
 pub fn topology_address_space(
     top: &Topology,
     decls: &std::collections::HashMap<MemorySpace, crate::syntax::MemoryDecl>,
@@ -590,6 +642,11 @@ pub fn topology_address_space(
 /// topology names its memory (`Topology SmemDev { memory: Memory::SMEM }`), so its descriptor is
 /// consulted before falling back to the like-named convention (`Memory::Foo <-> Topology::Foo`)
 /// for an undeclared one.
+#[must_use]
+#[allow(
+    clippy::implicit_hasher,
+    reason = "callers are in other files, and pass the compiler's own maps with the default hasher"
+)]
 pub fn topology_default_space(
     top: &Topology,
     topologies: &std::collections::HashMap<crate::symbol::Symbol, TopologyDescriptor>,
@@ -612,23 +669,23 @@ pub fn topology_default_space(
 /// The parser has no declaration table, so a placement written as a device starts here and
 /// `resolve_names` corrects it where a declaration says otherwise. A custom kind falls back to
 /// the like-named space, which is the convention `default_memory_for` already applies.
+#[must_use]
 pub fn builtin_default_space(kind: &crate::syntax::TopologyKind) -> MemorySpace {
     use crate::syntax::TopologyKind as K;
     match kind {
-        K::CPU | K::AMX | K::CpuAvx512 | K::CpuNeon => MemorySpace::CPUDRAM,
+        K::CPU | K::AMX | K::CpuAvx512 | K::CpuNeon | K::Current => MemorySpace::CPUDRAM,
         K::GPU => MemorySpace::GpuHbm,
         K::NPU | K::ANE | K::Slice => MemorySpace::NPUHBM,
         K::AccCore => MemorySpace::LocalSRAM,
         K::Custom(name) => MemorySpace::from_name(name.as_ref()),
-        K::Current => MemorySpace::CPUDRAM,
     }
 }
 
 /// The topology a built-in memory space belongs to.
 ///
 /// Stated rather than derived. The obvious derivation -- invert `default_space` over the
-/// descriptor table -- is not a function: `CPU_DRAM` is the default of CPU, AMX, CpuAvx512 and
-/// CpuNeon, and `NPU_HBM` of NPU, ANE and Slice. Nor does `within:` answer it, since that is a
+/// descriptor table -- is not a function: `CPU_DRAM` is the default of CPU, AMX, `CpuAvx512` and
+/// `CpuNeon`, and `NPU_HBM` of NPU, ANE and Slice. Nor does `within:` answer it, since that is a
 /// containment relation whose root is always host memory, which would make GPU memory
 /// host-owned. Ownership is a fact about the space, so it is written here once.
 ///
@@ -636,14 +693,14 @@ pub fn builtin_default_space(kind: &crate::syntax::TopologyKind) -> MemorySpace 
 /// is close to right; remote HBM is memory on another machine and its owner is a topology the
 /// type system cannot name yet. Neither is added to any topology's visibility, so this settles
 /// where they are without granting local access to them.
+#[must_use]
 pub fn builtin_space_owner(space: &MemorySpace) -> Option<crate::syntax::TopologyKind> {
     use crate::syntax::TopologyKind as K;
     Some(match space {
-        MemorySpace::CPUDRAM => K::CPU,
+        MemorySpace::CPUDRAM | MemorySpace::NicRam | MemorySpace::RemoteHbm => K::CPU,
         MemorySpace::GpuHbm => K::GPU,
         MemorySpace::NPUHBM => K::NPU,
         MemorySpace::LocalSRAM => K::AccCore,
-        MemorySpace::NicRam | MemorySpace::RemoteHbm => K::CPU,
         MemorySpace::Custom(_) => return None,
     })
 }
@@ -678,6 +735,11 @@ fn first_device_of(kind: &crate::syntax::TopologyKind) -> Topology {
 /// The declaration wins where there is one -- `Topology SmemDev { memory: Memory::SMEM }` holds
 /// `SMEM`, not the like-named `Memory::SmemDev` the built-in fallback would invent. Declarations
 /// are always `TopologyKind::Custom`, so consulting them first cannot shadow a built-in.
+#[must_use]
+#[allow(
+    clippy::implicit_hasher,
+    reason = "callers are in other files, and one passes an empty default map, which needs the hasher type fixed"
+)]
 pub fn default_space_in(
     top: &Topology,
     descriptors: &HashMap<crate::syntax::TopologyKind, TopologyDescriptor>,
@@ -685,8 +747,7 @@ pub fn default_space_in(
     let kind = top.kind();
     descriptors
         .get(&kind)
-        .map(|d| d.default_space.clone())
-        .unwrap_or_else(|| builtin_default_space(&kind))
+        .map_or_else(|| builtin_default_space(&kind), |d| d.default_space.clone())
 }
 
 /// The topology a memory space belongs to, over a table of topology descriptors, or why it
@@ -701,6 +762,14 @@ pub fn default_space_in(
 /// Taking the table rather than a `TransferCostGraph` is what lets name resolution answer this
 /// without building one: the graph is a per-compilation object with an all-pairs sweep in it, and
 /// resolution runs before there is one.
+///
+/// # Errors
+///
+/// Returns a message when no topology declares the space as its memory, or more than one does.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "callers are in other files, and one passes an empty default map, which needs the hasher type fixed"
+)]
 pub fn owning_topology_in(
     space: &MemorySpace,
     descriptors: &HashMap<crate::syntax::TopologyKind, TopologyDescriptor>,
@@ -741,7 +810,7 @@ pub fn owning_topology_in(
 /// GPU→GpuHbm).
 fn builtin_descriptors() -> HashMap<crate::syntax::TopologyKind, TopologyDescriptor> {
     use crate::syntax::TopologyKind as K;
-    use MemorySpace::*;
+    use MemorySpace::{GpuHbm, LocalSRAM, CPUDRAM, NPUHBM};
     let d = |default_space: MemorySpace, visibility: &[MemorySpace]| TopologyDescriptor {
         arch: None,
         default_space,
@@ -847,7 +916,37 @@ pub(crate) fn sweep_sizes() -> Vec<usize> {
     SWEEP_SIZES.with(|v| v.borrow().clone())
 }
 
+/// What one route search is minimising: the cost of the route so far.
+#[derive(Eq, PartialEq, PartialOrd, Ord, Clone, Copy, Default)]
+struct SearchKey {
+    /// Attoseconds per byte on a priced pass; zero and unused otherwise.
+    cost: u64,
+    /// Declared weights, the objective on the unpriced pass and a tie-break on the priced
+    /// one.
+    weight: u32,
+}
+
+/// A memory space waiting to be visited by a route search, with the cost of reaching it.
+#[derive(Eq, PartialEq)]
+struct SearchState {
+    key: SearchKey,
+    mem: MemorySpace,
+}
+
+impl Ord for SearchState {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.key.cmp(&self.key) // Reverse for min-heap
+    }
+}
+
+impl PartialOrd for SearchState {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl TransferCostGraph {
+    /// Adds a one-way edge: data can move from `src` to `dst` at the declared cost `cost`.
     pub fn add_transfer_edge(&mut self, src: MemorySpace, dst: MemorySpace, cost: u32) {
         self.transfer_edges
             .entry(src)
@@ -909,7 +1008,7 @@ impl TransferCostGraph {
             if let Some(d) = hierarchy.derived_transfer_cost(from, to, PROBE_BYTES) {
                 if d.per == crate::syntax::RatePer::Second {
                     // `hop_cost` yields picoseconds; 1 ps = 10^6 as.
-                    let attos = (d.value as u128 * 1_000_000) / PROBE_BYTES as u128;
+                    let attos = (u128::from(d.value) * 1_000_000) / u128::from(PROBE_BYTES);
                     if let Ok(a) = u64::try_from(attos) {
                         self.route_cost.insert((from.clone(), to.clone()), a);
                     }
@@ -958,6 +1057,7 @@ impl TransferCostGraph {
     /// descriptor (see `topology_descriptor`).
     /// The descriptor for a topology kind (built-in or a topology declared in this compilation),
     /// from the graph's per-compilation `descriptors` — no global registry.
+    #[must_use]
     pub fn descriptor(&self, kind: &crate::syntax::TopologyKind) -> Option<&TopologyDescriptor> {
         self.descriptors.get(kind)
     }
@@ -971,6 +1071,11 @@ impl TransferCostGraph {
     /// This is the direction `default_memory_for` does not run, and the reason a placement can
     /// be written either way round: `Topology::GPU` gives the space, `Memory::GPU_HBM` gives
     /// the device.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no topology declares the space as its memory, or more than one
+    /// does.
     pub fn owning_topology(&self, space: &MemorySpace) -> Result<Topology, String> {
         owning_topology_in(space, &self.descriptors)
     }
@@ -981,6 +1086,7 @@ impl TransferCostGraph {
     /// space, and a space that several devices can see, or that only appears in a `visible:` list,
     /// has no single owner while still being a real place. A space no topology names either way is
     /// nowhere, and a value cannot be put there.
+    #[must_use]
     pub fn is_space_held(&self, space: &MemorySpace) -> bool {
         self.descriptors
             .values()
@@ -988,13 +1094,13 @@ impl TransferCostGraph {
     }
 
     /// The default memory space a topology's values live in.
+    #[must_use]
     pub fn default_memory_for(&self, topology: &Topology) -> MemorySpace {
         if let Topology::Current = topology {
             unreachable!("Must specify a concrete topology other than Current")
         }
-        self.descriptor(&topology.kind())
-            .map(|d| d.default_space.clone())
-            .unwrap_or_else(|| match topology {
+        self.descriptor(&topology.kind()).map_or_else(
+            || match topology {
                 // The `Memory::Foo <-> Topology::Foo` naming convention, in the direction
                 // `topology_address_space` already applies: a transfer into a custom space
                 // records residence as `Pinned<_, Topology::Foo>`, so an *undeclared* custom
@@ -1002,7 +1108,9 @@ impl TransferCostGraph {
                 // custom-space value look CPU-resident to the visibility check (#253).
                 Topology::Custom(name) => MemorySpace::from_name(name.as_ref()),
                 _ => MemorySpace::CPUDRAM,
-            })
+            },
+            |d| d.default_space.clone(),
+        )
     }
 
     /// Precomputes the all-pairs shortest path transfer costs. Covers the built-in spaces
@@ -1051,6 +1159,7 @@ impl TransferCostGraph {
 
     /// Verifies if a variable belonging to `var_topology` with type `ty`
     /// is accessible from the `active_topology`.
+    #[must_use]
     pub fn is_type_accessible(
         &self,
         active_topology: &Topology,
@@ -1113,6 +1222,7 @@ impl TransferCostGraph {
     /// never resolved at all -- so a rule that reads the derived half sees whatever the parser
     /// guessed. For `Topology::Dev` the guess is a like-named `Memory::Dev` that no declaration
     /// mentions, which made a tensor on a declared topology unreachable from that same topology.
+    #[must_use]
     pub fn placement_space(&self, p: &crate::syntax::Placement) -> MemorySpace {
         match p.written() {
             crate::syntax::Written::Space => p.space.clone(),
@@ -1122,6 +1232,7 @@ impl TransferCostGraph {
 
     /// The device holding a placement, derived from the half the source wrote. The mirror of
     /// [`Self::placement_space`], for the same reason.
+    #[must_use]
     pub fn placement_topology(&self, p: &crate::syntax::Placement) -> Topology {
         match p.written() {
             crate::syntax::Written::Device => p.topology.clone(),
@@ -1147,6 +1258,7 @@ impl TransferCostGraph {
     /// exists (`NeedsSeam`, carrying its cost) or not (`Unreachable`). This is purely
     /// a refinement of `is_type_accessible` used to produce precise diagnostics; it
     /// does not change what is accepted. See `Reachability`.
+    #[must_use]
     pub fn reachable(
         &self,
         active_topology: &Topology,
@@ -1170,6 +1282,7 @@ impl TransferCostGraph {
     /// transfer's use site consults this so a hop over a declared relaxed edge is routed through the
     /// same seam obligation the `*_relaxed` intrinsics take — yielding a per-buffer E6004 at the use
     /// site, not only the coarse declaration-time W1027.
+    #[must_use]
     pub fn is_relaxed_edge(&self, from: &MemorySpace, to: &MemorySpace) -> bool {
         self.descriptors.values().any(|d| {
             d.transfers
@@ -1182,7 +1295,7 @@ impl TransferCostGraph {
     ///
     /// Route selection minimises PREDICTED COST, not hop count. The old objective
     /// was hop count, which is unrelated to time: on a partially-meshed box it took a one-hop SYS
-    /// crawl over a two-hop NVLink relay the same graph already contained, 3.57x slower.
+    /// crawl over a two-hop `NVLink` relay the same graph already contained, 3.57x slower.
     ///
     /// Two passes, because the graph mixes two incomparable currencies. An edge that declares a
     /// bandwidth has a per-byte time; an edge that declares only a unitless `: N` has a relative
@@ -1210,6 +1323,7 @@ impl TransferCostGraph {
     /// precomputed all-pairs matrix stays valid: every edge costs `bytes/bandwidth`, a line
     /// through the origin, so the ratio between two routes does not depend on bytes. Adding a
     /// fixed per-transfer term would break that.
+    #[must_use]
     pub fn transfer_path(
         &self,
         source: &MemorySpace,
@@ -1230,6 +1344,11 @@ impl TransferCostGraph {
     /// -- the cost matrix, the `total_cost` field of the diagnostics record -- reads that as "the
     /// unitless figures along this route", and changing which route is chosen must not quietly
     /// change what the number means.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a space on the chosen route has no recorded predecessor. Every space except
+    /// the source gets one before it is queued, so that would be a bug in this search.
     fn search(
         &self,
         source: &MemorySpace,
@@ -1238,44 +1357,17 @@ impl TransferCostGraph {
     ) -> Option<(u32, Vec<MemorySpace>)> {
         use std::collections::BinaryHeap;
 
-        #[derive(Eq, PartialEq, PartialOrd, Ord, Clone, Copy, Default)]
-        struct Key {
-            /// Attoseconds per byte on a priced pass; zero and unused otherwise.
-            cost: u64,
-            /// Declared weights, the objective on the unpriced pass and a tie-break on the priced
-            /// one.
-            weight: u32,
-        }
-
-        #[derive(Eq, PartialEq)]
-        struct State {
-            key: Key,
-            mem: MemorySpace,
-        }
-
-        impl Ord for State {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                other.key.cmp(&self.key) // Reverse for min-heap
-            }
-        }
-
-        impl PartialOrd for State {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
         let mut heap = BinaryHeap::new();
-        let mut dists: HashMap<MemorySpace, Key> = HashMap::new();
+        let mut dists: HashMap<MemorySpace, SearchKey> = HashMap::new();
         let mut predecessors: HashMap<MemorySpace, MemorySpace> = HashMap::new();
 
-        heap.push(State {
-            key: Key::default(),
+        heap.push(SearchState {
+            key: SearchKey::default(),
             mem: source.clone(),
         });
-        dists.insert(source.clone(), Key::default());
+        dists.insert(source.clone(), SearchKey::default());
 
-        while let Some(State { key, mem }) = heap.pop() {
+        while let Some(SearchState { key, mem }) = heap.pop() {
             if mem == *target {
                 let mut path = Vec::new();
                 let mut curr = mem.clone();
@@ -1300,7 +1392,7 @@ impl TransferCostGraph {
                     if priced_only && priced.is_none() {
                         continue;
                     }
-                    let next_key = Key {
+                    let next_key = SearchKey {
                         cost: key.cost.saturating_add(if priced_only {
                             priced.unwrap_or(0)
                         } else {
@@ -1313,7 +1405,7 @@ impl TransferCostGraph {
                     if is_better {
                         dists.insert(next.clone(), next_key);
                         predecessors.insert(next.clone(), mem.clone());
-                        heap.push(State {
+                        heap.push(SearchState {
                             key: next_key,
                             mem: next.clone(),
                         });
@@ -1326,6 +1418,7 @@ impl TransferCostGraph {
     }
 
     /// Determines the minimum data movement cost between two memory spaces using Dijkstra's algorithm.
+    #[must_use]
     pub fn transfer_cost(&self, source: &MemorySpace, target: &MemorySpace) -> Option<u32> {
         self.cost_matrix
             .get(&(source.clone(), target.clone()))
@@ -1338,6 +1431,7 @@ impl TransferCostGraph {
     /// *this* hop, while the roofline infers one from the spaces at its ends. The two cannot both
     /// apply — E6013 rejects an edge that has a declared cost and a derivable one — so this is a
     /// lookup, not a tie-break.
+    #[must_use]
     pub fn link_rate(
         &self,
         source: &MemorySpace,
@@ -1354,6 +1448,7 @@ impl TransferCostGraph {
     /// the built-in topology seeds edges of its own. A reachability oracle that enumerates only
     /// the file's spaces is searching a subgraph and will "prove" routes non-minimal that are in
     /// fact minimal through a space it never looked at (S1).
+    #[must_use]
     pub fn nodes(&self) -> Vec<MemorySpace> {
         let mut out: Vec<MemorySpace> = Vec::new();
         let mut keys: Vec<&MemorySpace> = self.transfer_edges.keys().collect();
@@ -1378,6 +1473,7 @@ impl TransferCostGraph {
     /// `None` for an edge that leaves its cost to be derived — which is not the same as a cost of
     /// zero or of one, and the diagnostics record says `null` rather than quoting a routing weight
     /// nobody wrote.
+    #[must_use]
     pub fn declared_edge_cost(&self, from: &MemorySpace, to: &MemorySpace) -> Option<u32> {
         self.edge_declared.get(&(from.clone(), to.clone())).copied()
     }
@@ -1387,6 +1483,7 @@ impl TransferCostGraph {
     /// `can_transfer` consults the all-pairs matrix and so is true for multi-hop routes too;
     /// this is the single-hop question, which is what "every hop in a synthesized path is a
     /// declared edge" needs in order to mean anything (S1).
+    #[must_use]
     pub fn has_direct_edge(&self, from: &MemorySpace, to: &MemorySpace) -> bool {
         self.transfer_edges
             .get(from)
@@ -1395,6 +1492,7 @@ impl TransferCostGraph {
 
     /// The weight of a directly declared `from -> to` edge, if there is one. When several
     /// declarations contribute the same edge, the cheapest wins -- which is what the router uses.
+    #[must_use]
     pub fn direct_edge_weight(&self, from: &MemorySpace, to: &MemorySpace) -> Option<u32> {
         self.transfer_edges
             .get(from)?
@@ -1405,6 +1503,7 @@ impl TransferCostGraph {
     }
 
     /// Determines if a data transfer between two memory spaces is physically supported.
+    #[must_use]
     pub fn can_transfer(&self, source: &MemorySpace, target: &MemorySpace) -> bool {
         self.cost_matrix
             .contains_key(&(source.clone(), target.clone()))
@@ -1412,6 +1511,11 @@ impl TransferCostGraph {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use syntax::{ElementType, Expr, NumberExpr, Span};
@@ -1448,7 +1552,7 @@ mod tests {
             bandwidth: None,
             clock_hz: None,
             replicas: None,
-            managed: Default::default(),
+            managed: crate::syntax::Management::default(),
             granule: None,
             scope,
             overcommit: false,
@@ -1971,8 +2075,7 @@ mod tests {
         ] {
             assert!(
                 graph.can_transfer(space, space),
-                "Reflexive transfer should always work for {:?}",
-                space
+                "Reflexive transfer should always work for {space:?}"
             );
         }
     }

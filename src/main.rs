@@ -12,13 +12,15 @@
 //
 //===----------------------------------------------------------------------===//
 
+//! The `vxc` command line program: it parses the options and runs the compiler driver.
+
 use clap::Parser;
 use std::process;
 use vxc::driver::{CompilerDriver, DriverOptions};
 
 fn main() {
     std::panic::set_hook(Box::new(|panic_info| {
-        eprintln!("Vx Compiler Internal Error: {}", panic_info);
+        eprintln!("Vx Compiler Internal Error: {panic_info}");
         eprintln!("Please report this bug at: https://github.com/vx-lang/Vx/issues");
     }));
 
@@ -26,7 +28,7 @@ fn main() {
     let driver = CompilerDriver::new(options);
 
     if let Err(e) = driver.execute() {
-        eprintln!("{}", e);
+        eprintln!("{e}");
         process::exit(1);
     }
 }

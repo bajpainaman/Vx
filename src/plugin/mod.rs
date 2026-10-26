@@ -13,10 +13,13 @@
 //
 //===----------------------------------------------------------------------===//
 
+/// The plugin for the Apple Neural Engine.
 #[cfg(target_os = "macos")]
 pub mod apple_npe;
 
+/// The trait every hardware accelerator plugin implements, and the types it uses.
 pub mod hardware_trait;
+/// The table of registered plugins, looked up by topology dispatch id.
 pub mod registry;
 
 pub use hardware_trait::VxHardwarePlugin;
@@ -46,6 +49,11 @@ pub fn plugin_for(topology_id: TopologyID) -> Option<Arc<dyn VxHardwarePlugin + 
 }
 
 #[cfg(all(test, target_os = "macos"))]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 
@@ -53,13 +61,15 @@ mod tests {
     fn apple_npe_is_selected_by_ane_dispatch_id() {
         // The plugin must be keyed by the same dispatch id codegen stamps on `vx.spawn`, so
         // the topology → plugin lookup in the spawn lowering actually finds it.
-        let ane_id = crate::arch::topology_dispatch_id(&crate::syntax::Topology::ANE) as TopologyID;
+        let ane_id =
+            crate::arch::topology_dispatch_id(&crate::syntax::Topology::ANE).cast_unsigned();
         let plugin = plugin_for(ane_id).expect("ANE plugin should be registered on macOS");
         assert_eq!(plugin.plugin_name(), "Apple_NPE_v1");
         assert_eq!(plugin.target_topology(), ane_id);
 
         // A topology no plugin claims (CPU) selects nothing.
-        let cpu_id = crate::arch::topology_dispatch_id(&crate::syntax::Topology::CPU) as TopologyID;
+        let cpu_id =
+            crate::arch::topology_dispatch_id(&crate::syntax::Topology::CPU).cast_unsigned();
         assert!(plugin_for(cpu_id).is_none());
     }
 }

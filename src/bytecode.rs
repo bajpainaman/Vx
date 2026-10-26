@@ -22,8 +22,11 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Opcode {
+    /// Does nothing.
     Nop = 0,
+    /// A constant. The literal is in `imm` and `type_idx` is its scalar type.
     Const = 1,
+    /// Reads a parameter of the function. `imm` is the parameter's position.
     Load = 2,
     /// `imm` is normally 0. `IMM_PARALLEL_INIT` marks the one store `lower_for` emits to
     /// initialize the induction variable of a loop `parallel_outer_for` proved disjoint — codegen
@@ -35,15 +38,20 @@ pub enum Opcode {
     /// rendered with `vx.parallel_step` so the device clone can widen the step to the grid stride
     /// (#251). Inert everywhere else.
     Add = 4,
+    /// `operand1 - operand2`.
     Sub = 5,
+    /// `operand1 * operand2`.
     Mul = 6,
+    /// `operand1 / operand2`.
     Div = 7,
     /// Call a function. `type_idx` is the callee's GID (its identity -- the flat codegen resolves the
     /// name and the result type from it); `imm` is the argument count `N`; the arguments are the
     /// `operand1`s of the N `Arg` instructions immediately preceding this `Call`. The result value is
     /// this instruction's register.
     Call = 8,
+    /// Returns from the function. `operand1` is the value returned, when there is one.
     Ret = 9,
+    /// The matrix product of the tensors in `operand1` and `operand2`, as a new tensor.
     Matmul = 10,
     /// Scalar comparison; the relation (0=Eq,1=Ne,2=Lt,3=Gt,4=Le,5=Ge) is carried in `imm`, result
     /// is a `bool`.
@@ -307,8 +315,21 @@ impl Opcode {
     /// Recover an opcode from its `#[repr(u32)]` discriminant, e.g. when decoding a serialized flat
     /// HIR body (`crate::metadata`). Returns `None` for an out-of-range value -- a checked conversion,
     /// never a `transmute`, so a corrupt/forward-version stream is rejected rather than UB.
+    #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a table with one line for each opcode; splitting it would make a missing number hard to see"
+    )]
     pub fn from_u32(v: u32) -> Option<Self> {
-        use Opcode::*;
+        use Opcode::{
+            Abort, Add, Alloca, Arg, AutoDiff, Barrier, BitAnd, BitOr, BitXor, BlockStart, Br,
+            Call, CallIndirect, Cast, Cmp, CondBr, Const, ConstTable, Div, FieldAddr, FieldLoad,
+            FieldStore, FuncConst, InlineMlir, Load, Matmul, MatmulInto, Mul, Neg, Nop, Not, Print,
+            PrintStr, PtrIndex, PtrStore, Rem, Ret, Shl, Shr, SlotLoad, Spawn, SpawnEnd, Store,
+            StringConst, Sub, TensorAlloc, TensorClone, TensorDataPtr, TensorDim, TensorDrop,
+            TensorFill, TensorIndex, TensorLoad, TensorMap, TensorReduce, TensorReshape,
+            TensorStore, TensorTranspose, TensorView, TensorZero, Transfer,
+        };
         Some(match v {
             0 => Nop,
             1 => Const,
@@ -376,12 +397,16 @@ impl Opcode {
     }
 }
 
+/// A register: the number that names one value in a function's bytecode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Register(pub u32);
 
+/// An index into a function's list of types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TypeIdx(pub u32);
 
+/// One bytecode instruction: an operation, up to two operand registers, a type and an
+/// immediate value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct HirInstruction {
@@ -399,6 +424,8 @@ pub struct HirInstruction {
 }
 
 impl HirInstruction {
+    /// Creates an instruction from its fields.
+    #[must_use]
     pub fn new(
         opcode: Opcode,
         operand1: Register,
@@ -428,11 +455,13 @@ pub const IMM_PARALLEL_STEP: u64 = 1;
 /// block walks the same block iterations (redundant execution on identical values is the
 /// two-level model's block-scope semantics); only thread-mapped loops partition within a block.
 pub const IMM_BLOCK_INIT: u64 = 2;
+/// `imm` tag on the latch `Add` of a block-mapped loop; see [`IMM_BLOCK_INIT`].
 pub const IMM_BLOCK_STEP: u64 = 2;
 /// The same pair for a THREAD-mapped loop -- offset by `threadIdx.x`, stride `blockDim.x`. At a
 /// 1x1x1 launch both mappings collapse to the serial loop, which is what keeps the launcher's
 /// EXPECT degeneracy and the host path exact.
 pub const IMM_THREAD_INIT: u64 = 3;
+/// `imm` tag on the latch `Add` of a thread-mapped loop; see [`IMM_THREAD_INIT`].
 pub const IMM_THREAD_STEP: u64 = 3;
 
 /// `imm` tag on the loop-bound `Store` of a stridable loop -- the slot the header compares the

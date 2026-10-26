@@ -10,7 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::super::*;
+use super::super::{decl, TypeChecker};
 
 impl TypeChecker<'_> {
     /// Refuse a bound such as `T : NoSuchTrait` whose trait is not declared (E3042).
@@ -59,7 +59,11 @@ impl TypeChecker<'_> {
                 None => format!("impl {}", block.target_type),
             };
             collect(&owner, &block.generics);
-            let impl_params: Vec<&str> = block.generics.iter().map(|g| g.name()).collect();
+            let impl_params: Vec<&str> = block
+                .generics
+                .iter()
+                .map(crate::syntax::decl::GenericParam::name)
+                .collect();
             for m in &block.methods {
                 // A method is also given its impl's parameters, already reported above.
                 let own: Vec<decl::GenericParam> = m
@@ -74,7 +78,12 @@ impl TypeChecker<'_> {
         for (f, _) in self.env.generic_functions.values() {
             collect(&format!("fn {}", f.name), &f.generics);
         }
+        self.report_bounds_naming_no_trait(unknown);
+    }
 
+    /// Report each bound found by [`Self::check_bounds_name_a_trait`], as (where the bound is
+    /// written, the parameter, the trait it names).
+    fn report_bounds_naming_no_trait(&mut self, mut unknown: Vec<(String, String, String)>) {
         // The tables are hash maps, and a generic method can be listed under its impl and as a
         // function, so sort for a stable order and drop the repeats.
         unknown.sort();

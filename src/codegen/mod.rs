@@ -1,5 +1,8 @@
+/// Generates MLIR text from a function's flat instruction stream, one instruction at a time.
 pub mod flat;
+/// The code generator that walks the syntax tree and builds an MLIR module with Melior.
 pub mod generator;
+/// How each statement and expression of the syntax tree becomes MLIR operations.
 pub mod lower;
 pub use generator::*;
 pub use lower::*;
@@ -26,12 +29,16 @@ use melior::{
     Context,
 };
 
-use crate::syntax::*;
+use crate::syntax::{
+    BinaryOp, ElementType, Expr, Function, LogicalOp, MatchArm, NumberExpr, Pattern, Program,
+    RelationalOp, Statement,
+};
 
 /// The name of the Enzyme wrapper a differentiated call goes through.
 ///
 /// Enzyme recognizes the call by this name, so both backends have to spell it the same way:
 /// `__enzyme_fwddiff_jvp_f` for forward mode, `__enzyme_autodiff_grad_f` for reverse.
+#[must_use]
 pub fn enzyme_wrapper_name(forward: bool, target: &str) -> String {
     if forward {
         format!("__enzyme_fwddiff_jvp_{target}")
@@ -95,6 +102,11 @@ const ENZYME_KNOWN_LIBM: &[(&str, &str)] = &[
 ];
 
 /// Gives each function in `ENZYME_KNOWN_LIBM` the `enzyme_math` attribute naming its C function.
+///
+/// # Panics
+///
+/// Panics when one of those functions already has a `passthrough` attribute, because this
+/// would overwrite it.
 pub fn mark_libm_for_enzyme<'c>(context: &'c Context, module: &mut Module<'c>) {
     use melior::ir::attribute::{Attribute, StringAttribute};
     use melior::ir::operation::{OperationLike, OperationMutLike};
@@ -135,6 +147,7 @@ use std::sync::Once;
 
 static INIT: Once = Once::new();
 
+/// Registers the MLIR passes, the built-in ones and the Vx ones, once per process.
 pub fn init_codegen_globals() {
     INIT.call_once(|| {
         melior::utility::register_all_passes();
@@ -142,24 +155,51 @@ pub fn init_codegen_globals() {
     });
 }
 
+/// Registers the `vx` dialect with `context`, so MLIR can parse and print `vx.*` operations.
+#[allow(
+    unsafe_code,
+    reason = "calls the C++ function that registers the dialect"
+)]
 pub fn register_vx_dialect(context: &Context) {
+    // SAFETY: `context` is a live MLIR context for the whole call, and the C++ side only
+    // adds the dialect to it.
     unsafe {
         registerVxDialect(context.to_raw());
     }
 }
 
+/// Makes the passes that run on `context` report which optimizations they applied or missed.
+#[allow(
+    unsafe_code,
+    reason = "calls the C++ function that turns the remarks on"
+)]
 pub fn enable_optimization_remarks(context: &Context) {
+    // SAFETY: `context` is a live MLIR context for the whole call, and the C++ side only
+    // sets an option on it.
     unsafe {
         mlirEnableOptimizationRemarks(context.to_raw());
     }
 }
 
+/// Registers the Vx passes with MLIR's global pass registry.
+#[allow(
+    unsafe_code,
+    reason = "calls the C++ function that registers the passes"
+)]
 pub fn register_vx_passes() {
+    // SAFETY: the C++ function takes no arguments and only adds entries to MLIR's pass
+    // registry.
     unsafe {
         registerVxPassesC();
     }
 }
 
+/// Runs the pass pipeline that lowers `module` from the Vx and standard MLIR dialects to the
+/// LLVM dialect. Returns whether the Enzyme plugin named by `ENZYME_LIB` was loaded.
+///
+/// # Errors
+///
+/// Returns a message when the pass pipeline does not parse or a pass fails on the module.
 pub fn lower_to_llvm<'c>(context: &'c Context, module: &mut Module<'c>) -> Result<bool, String> {
     // Register the custom `vx` dialect before loading dialects
     register_vx_dialect(context);
@@ -179,15 +219,18 @@ pub fn lower_to_llvm<'c>(context: &'c Context, module: &mut Module<'c>) -> Resul
     if let Ok(enzyme_lib) = std::env::var("ENZYME_LIB") {
         match std::ffi::CString::new(enzyme_lib.as_str()) {
             Ok(c_path) => {
+                #[allow(
+                    unsafe_code,
+                    reason = "calls the C++ function that loads a pass plugin"
+                )]
+                // SAFETY: `c_path` is a NUL-terminated string that lives until the call
+                // returns, and the C++ side only reads it.
                 let loaded = unsafe { loadMlirPassPlugin(c_path.as_ptr()) };
                 if loaded {
-                    println!("[CodeGen] Loaded MLIR Pass Plugin from {}", enzyme_lib);
+                    println!("[CodeGen] Loaded MLIR Pass Plugin from {enzyme_lib}");
                     has_enzyme = true;
                 } else {
-                    eprintln!(
-                        "[CodeGen] Failed to load MLIR Pass Plugin at {}",
-                        enzyme_lib
-                    );
+                    eprintln!("[CodeGen] Failed to load MLIR Pass Plugin at {enzyme_lib}");
                 }
             }
             Err(_) => {
@@ -217,11 +260,11 @@ pub fn lower_to_llvm<'c>(context: &'c Context, module: &mut Module<'c>) -> Resul
     pipeline.push_str("symbol-dce,func.func(convert-linalg-to-loops,lower-affine),convert-scf-to-cf,expand-strided-metadata,func.func(vx-promote-buffers-to-stack),func.func(vx-normalize-stack-buffers),func.func(lower-affine),convert-vector-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm,convert-index-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-func-to-llvm,convert-cf-to-llvm,convert-arith-to-llvm,convert-ub-to-llvm,reconcile-unrealized-casts)");
 
     melior::utility::parse_pass_pipeline(pass_manager.as_operation_pass_manager(), &pipeline)
-        .map_err(|e| format!("Failed to parse pass pipeline: {}", e))?;
+        .map_err(|e| format!("Failed to parse pass pipeline: {e}"))?;
 
     pass_manager
         .run(module)
-        .map_err(|e| format!("Failed to lower MLIR module to LLVM: {}", e))?;
+        .map_err(|e| format!("Failed to lower MLIR module to LLVM: {e}"))?;
 
     Ok(has_enzyme)
 }

@@ -26,7 +26,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::*;
+use super::{BlockLike, LowerError, MeliorGenerator};
 use crate::syntax::{Expr, Statement};
 use melior::ir::operation::OperationBuilder;
 use std::collections::HashSet;
@@ -36,6 +36,15 @@ use std::collections::HashSet;
 /// the body into (unchanged for the simple boolean facts we transport). Called at the
 /// top of a device `spawn`'s region, before its statements are lowered, so the assume
 /// dominates the guard it is meant to fold.
+///
+/// # Errors
+///
+/// Returns an error when a fact cannot be lowered again inside the kernel, or when the
+/// `llvm.intr.assume` operation cannot be built.
+#[allow(
+    clippy::ref_option,
+    reason = "the caller is in another file and passes a reference to a field of this type"
+)]
 pub(crate) fn emit_seam_certificates<'c>(
     gen: &mut MeliorGenerator<'c>,
     stmts: &[Statement],
@@ -186,6 +195,11 @@ pub(crate) fn collect_stmt_idents(s: &Statement, out: &mut HashSet<String>) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use crate::symbol::Symbol;

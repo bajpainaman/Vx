@@ -3,9 +3,23 @@
 //! One `impl` block on the per-function emitter; the dispatch that reaches these
 //! lives in `step`, next to the struct.
 
-use super::super::*;
+use std::fmt::Write as _;
+
+use crate::gid::TypeId;
+
+use super::super::{
+    arith_op, cast_op, cmp_op, coerce_vector, elem_of_gid, int_bits, is_signed, mlir_float_literal,
+    mlir_scalar, ptr_gid, tensor_memref_ty, Decline, ElementType, FnEmit, HirInstruction, Lowered,
+    Opcode, DYN_DIM,
+};
 
 impl FnEmit<'_> {
+    /// A constant: `arith.constant` of the literal in `imm`, at the scalar type of this
+    /// instruction.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the type of the constant is not a scalar the emitter models.
     pub(crate) fn op_const(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let e = self.ty_at(ins.type_idx.0).ok_or(crate::emitter_gap!())?;
         let mt = mlir_scalar(&e).ok_or(crate::emitter_gap!())?;
@@ -16,112 +30,149 @@ impl FnEmit<'_> {
             // `2^64 - 1` stays positive in a `u128`.
             ins.imm.to_string()
         } else {
-            (ins.imm as i64).to_string()
+            ins.imm.cast_signed().to_string()
         };
         let n = format!("%v{idx}");
-        self.body += &format!("  {n} = arith.constant {lit} : {mt}\n");
+        let _ = writeln!(self.body, "  {n} = arith.constant {lit} : {mt}");
         self.names[idx] = n;
         self.etypes[idx] = Some(e);
         Ok(())
     }
 
-    // Arithmetic: scalar (a scalar-GID result) or *elementwise* over a rank-1 float slice (a
-    // tensor-GID result). The scalar form is `arith.{addi,mulf,…}`; the elementwise form
-    // coerces each operand to a `vector<Nxf32>` (`vector.load`/`broadcast`), applies
-    // `arith.{addf,subf,mulf,divf}`, and yields a vector that a row `TensorStore` writes back.
+    /// Arithmetic: scalar (a scalar-GID result) or *elementwise* over a rank-1 float slice (a
+    /// tensor-GID result). The scalar form is `arith.{addi,mulf,…}`; the elementwise form
+    /// coerces each operand to a `vector<Nxf32>` (`vector.load`/`broadcast`), applies
+    /// `arith.{addf,subf,mulf,divf}`, and yields a vector that a row `TensorStore` writes back.
+    ///
+    /// # Errors
+    ///
+    /// Declines when an operand or the result type is not tracked, when the operator has no
+    /// `arith` op for the type, or when an elementwise operand does not hold floats.
     pub(crate) fn op_binary(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let result_gid = *self
             .types
             .get(ins.type_idx.0 as usize)
             .ok_or(crate::emitter_gap!())?;
         if let Some(e) = elem_of_gid(result_gid) {
-            let mt = mlir_scalar(&e).ok_or(crate::emitter_gap!())?;
-            let op = arith_op(ins.opcode, &e).ok_or(crate::emitter_gap!())?;
-            let a = self
-                .names
-                .get(ins.operand1.0 as usize)
-                .ok_or(crate::emitter_gap!())?;
-            let b = self
-                .names
-                .get(ins.operand2.0 as usize)
-                .ok_or(crate::emitter_gap!())?;
-            let n = format!("%v{idx}");
-            // The latch increment of a stridable loop -- the marker the device clone
-            // widens to a stride (#251 flat; Vx#379 block/thread). Only an `Add` can
-            // carry it: `lower_for` is the sole tagger.
-            let attr = if ins.opcode == Opcode::Add {
-                match ins.imm {
-                    crate::bytecode::IMM_PARALLEL_STEP => " {vx.parallel_step}",
-                    crate::bytecode::IMM_BLOCK_STEP => " {vx.parallel_bstep}",
-                    crate::bytecode::IMM_THREAD_STEP => " {vx.parallel_tstep}",
-                    _ => "",
-                }
-            } else {
-                ""
-            };
-            let (a, b) = (a.clone(), b.clone());
-            if e == ElementType::USize && self.check_usize_operands(idx, ins.opcode, &a, &b) {
-                self.body += &format!("  {n} = {op} {a}, {b} overflow<nsw, nuw>{attr} : {mt}\n");
-            } else {
-                self.body += &format!("  {n} = {op} {a}, {b}{attr} : {mt}\n");
-            }
-            self.names[idx] = n;
-            self.etypes[idx] = Some(e);
+            self.binary_scalar(idx, ins, e)
         } else {
-            let (elem, shape) = self
-                .ctx
-                .tensors
-                .get(&result_gid)
-                .ok_or(crate::emitter_gap!())?;
-            if !elem.is_float() {
-                return Err(Decline::TypeNotModelled {
-                    what: "an elementwise op on non-float elements",
-                });
-            }
-            let et = mlir_scalar(elem).ok_or(crate::emitter_gap!())?;
-            // Rank 1 takes the vector path below: the operands are read with a single-index
-            // `vector.load`, which a rank-2 memref rejects ("requires 2 indices"). Anything
-            // deeper is a named linalg op over the operand memrefs.
-            if shape.len() != 1 {
-                let (elem, shape) = (elem.clone(), shape.clone());
-                return self.elementwise_linalg(idx, ins, &elem, &shape);
-            }
-            let d: i64 = shape[0].parse::<i64>().map_err(|_| crate::emitter_gap!())?;
-            let vecty = format!("vector<{d}x{et}>");
-            let va = coerce_vector(
-                &mut self.body,
-                &format!("{idx}a"),
-                ins.operand1.0,
-                &vecty,
-                et,
-                &self.names,
-                &self.mem_of,
-                &self.vec_of,
-                &self.etypes,
-            )?;
-            let vb = coerce_vector(
-                &mut self.body,
-                &format!("{idx}b"),
-                ins.operand2.0,
-                &vecty,
-                et,
-                &self.names,
-                &self.mem_of,
-                &self.vec_of,
-                &self.etypes,
-            )?;
-            let op = match ins.opcode {
-                Opcode::Add => "arith.addf",
-                Opcode::Sub => "arith.subf",
-                Opcode::Mul => "arith.mulf",
-                Opcode::Div => "arith.divf",
-                _ => return Err(crate::emitter_gap!()),
-            };
-            let n = format!("%v{idx}");
-            self.body += &format!("  {n} = {op} {va}, {vb} : {vecty}\n");
-            self.names[idx] = n;
-            self.vec_of[idx] = Some(vecty);
+            self.binary_slice(idx, ins, result_gid)
         }
+    }
+
+    /// Scalar arithmetic: one `arith` op on the two operand values.
+    ///
+    /// # Errors
+    ///
+    /// Declines when an operand is not tracked or the operator has no `arith` op for `e`.
+    fn binary_scalar(&mut self, idx: usize, ins: &HirInstruction, e: ElementType) -> Lowered<()> {
+        let mt = mlir_scalar(&e).ok_or(crate::emitter_gap!())?;
+        let op = arith_op(ins.opcode, &e).ok_or(crate::emitter_gap!())?;
+        let a = self
+            .names
+            .get(ins.operand1.0 as usize)
+            .ok_or(crate::emitter_gap!())?;
+        let b = self
+            .names
+            .get(ins.operand2.0 as usize)
+            .ok_or(crate::emitter_gap!())?;
+        let n = format!("%v{idx}");
+        // The latch increment of a stridable loop -- the marker the device clone
+        // widens to a stride (#251 flat; Vx#379 block/thread). Only an `Add` can
+        // carry it: `lower_for` is the sole tagger.
+        let attr = if ins.opcode == Opcode::Add {
+            match ins.imm {
+                crate::bytecode::IMM_PARALLEL_STEP => " {vx.parallel_step}",
+                crate::bytecode::IMM_BLOCK_STEP => " {vx.parallel_bstep}",
+                crate::bytecode::IMM_THREAD_STEP => " {vx.parallel_tstep}",
+                _ => "",
+            }
+        } else {
+            ""
+        };
+        let (a, b) = (a.clone(), b.clone());
+        if e == ElementType::USize && self.check_usize_operands(idx, ins.opcode, &a, &b) {
+            let _ = writeln!(
+                self.body,
+                "  {n} = {op} {a}, {b} overflow<nsw, nuw>{attr} : {mt}"
+            );
+        } else {
+            let _ = writeln!(self.body, "  {n} = {op} {a}, {b}{attr} : {mt}");
+        }
+        self.names[idx] = n;
+        self.etypes[idx] = Some(e);
+        Ok(())
+    }
+
+    /// Elementwise arithmetic over a float tensor whose type is `result_gid`. Rank 1 is done on
+    /// vectors; a deeper rank goes to [`Self::elementwise_linalg`].
+    ///
+    /// # Errors
+    ///
+    /// Declines when `result_gid` is not a tracked tensor of floats, an operand cannot be read
+    /// as a vector, or the operator is not `+`, `-`, `*` or `/`.
+    fn binary_slice(
+        &mut self,
+        idx: usize,
+        ins: &HirInstruction,
+        result_gid: TypeId,
+    ) -> Lowered<()> {
+        let (elem, shape) = self
+            .ctx
+            .tensors
+            .get(&result_gid)
+            .ok_or(crate::emitter_gap!())?;
+        if !elem.is_float() {
+            return Err(Decline::TypeNotModelled {
+                what: "an elementwise op on non-float elements",
+            });
+        }
+        let et = mlir_scalar(elem).ok_or(crate::emitter_gap!())?;
+        // Rank 1 takes the vector path below: the operands are read with a single-index
+        // `vector.load`, which a rank-2 memref rejects ("requires 2 indices"). Anything
+        // deeper is a named linalg op over the operand memrefs.
+        if shape.len() != 1 {
+            let (elem, shape) = (elem.clone(), shape.clone());
+            return self.elementwise_linalg(idx, ins, &elem, &shape);
+        }
+        // A `?` extent is not a number, and a vector needs a known lane count.
+        let Ok(d) = shape[0].parse::<i64>() else {
+            return Err(crate::emitter_gap!());
+        };
+        let vecty = format!("vector<{d}x{et}>");
+        let va = coerce_vector(
+            &mut self.body,
+            &format!("{idx}a"),
+            ins.operand1.0,
+            &vecty,
+            et,
+            &self.names,
+            &self.mem_of,
+            &self.vec_of,
+            &self.etypes,
+        )?;
+        let vb = coerce_vector(
+            &mut self.body,
+            &format!("{idx}b"),
+            ins.operand2.0,
+            &vecty,
+            et,
+            &self.names,
+            &self.mem_of,
+            &self.vec_of,
+            &self.etypes,
+        )?;
+        let op = match ins.opcode {
+            Opcode::Add => "arith.addf",
+            Opcode::Sub => "arith.subf",
+            Opcode::Mul => "arith.mulf",
+            Opcode::Div => "arith.divf",
+            _ => return Err(crate::emitter_gap!()),
+        };
+        let n = format!("%v{idx}");
+        let _ = writeln!(self.body, "  {n} = {op} {va}, {vb} : {vecty}");
+        self.names[idx] = n;
+        self.vec_of[idx] = Some(vecty);
         Ok(())
     }
 
@@ -175,7 +226,7 @@ impl FnEmit<'_> {
             _ => return false,
         };
         self.body += &check;
-        self.body += &format!("  cf.assert {p}ok, \"{failure}\"\n");
+        let _ = writeln!(self.body, "  cf.assert {p}ok, \"{failure}\"");
         true
     }
 
@@ -183,6 +234,11 @@ impl FnEmit<'_> {
     /// over the two operand memrefs into a fresh buffer of the result shape, which is what the
     /// oracle emits and what `convert-linalg-to-loops` (or the vectorize pipeline's affine
     /// route) already lowers. A `?` in the result shape is read off the first operand.
+    ///
+    /// # Errors
+    ///
+    /// Declines when an operand is not a tracked tensor, or the operator is not `+`, `-`, `*`
+    /// or `/`.
     fn elementwise_linalg(
         &mut self,
         idx: usize,
@@ -218,30 +274,40 @@ impl FnEmit<'_> {
             if d == DYN_DIM {
                 let c = format!("%ewc{idx}_{k}");
                 let s = format!("%ews{idx}_{k}");
-                self.body += &format!("  {c} = arith.constant {k} : index\n");
-                self.body += &format!("  {s} = memref.dim {a}, {c} : {ma}\n");
+                let _ = writeln!(self.body, "  {c} = arith.constant {k} : index");
+                let _ = writeln!(self.body, "  {s} = memref.dim {a}, {c} : {ma}");
                 sizes.push(s);
             }
         }
         // When this result is what the function returns, `outs` is the caller's buffer and no
         // intermediate is allocated at all -- the elementwise op writes the answer where it is
         // wanted. Otherwise it needs a buffer of its own.
-        let n = match self.nrvo_slot(idx, &memty) {
-            Some(slot) => slot,
-            None => {
-                let n = format!("%v{idx}");
-                self.body += &format!("  {n} = memref.alloc({}) : {memty}\n", sizes.join(", "));
-                n
-            }
+        let n = if let Some(slot) = self.nrvo_slot(idx, &memty) {
+            slot
+        } else {
+            let n = format!("%v{idx}");
+            let _ = writeln!(
+                self.body,
+                "  {n} = memref.alloc({}) : {memty}",
+                sizes.join(", ")
+            );
+            n
         };
-        self.body += &format!("  {op} ins({a}, {b} : {ma}, {mb}) outs({n} : {memty})\n");
+        let _ = writeln!(
+            self.body,
+            "  {op} ins({a}, {b} : {ma}, {mb}) outs({n} : {memty})"
+        );
         self.names[idx] = n;
         self.mem_of[idx] = Some(memty);
         Ok(())
     }
 
-    // `-t` on a tensor: a new tensor of each element negated. A float uses `arith.negf`, which
-    // keeps the sign of zero right (`0 - x` would not); an integer is `0 - x`.
+    /// `-t` on a tensor: a new tensor of each element negated. A float uses `arith.negf`, which
+    /// keeps the sign of zero right (`0 - x` would not); an integer is `0 - x`.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the operand is not tracked or the result is not a tracked tensor type.
     fn op_neg_tensor(&mut self, idx: usize, ins: &HirInstruction, ma: &str) -> Lowered<()> {
         let gid = *self
             .types
@@ -265,18 +331,21 @@ impl FnEmit<'_> {
             if d == DYN_DIM {
                 let c = format!("%ngc{idx}_{k}");
                 let s = format!("%ngs{idx}_{k}");
-                self.body += &format!("  {c} = arith.constant {k} : index\n");
-                self.body += &format!("  {s} = memref.dim {a}, {c} : {ma}\n");
+                let _ = writeln!(self.body, "  {c} = arith.constant {k} : index");
+                let _ = writeln!(self.body, "  {s} = memref.dim {a}, {c} : {ma}");
                 sizes.push(s);
             }
         }
-        let n = match self.nrvo_slot(idx, &memty) {
-            Some(slot) => slot,
-            None => {
-                let n = format!("%v{idx}");
-                self.body += &format!("  {n} = memref.alloc({}) : {memty}\n", sizes.join(", "));
-                n
-            }
+        let n = if let Some(slot) = self.nrvo_slot(idx, &memty) {
+            slot
+        } else {
+            let n = format!("%v{idx}");
+            let _ = writeln!(
+                self.body,
+                "  {n} = memref.alloc({}) : {memty}",
+                sizes.join(", ")
+            );
+            n
         };
         let dims: Vec<String> = (0..shape.len()).map(|k| format!("d{k}")).collect();
         let map = format!("affine_map<({0}) -> ({0})>", dims.join(", "));
@@ -286,18 +355,24 @@ impl FnEmit<'_> {
         } else {
             format!("    %z = arith.constant 0 : {et}\n    %r = arith.subi %z, %x : {et}\n")
         };
-        self.body += &format!(
+        let _ = writeln!(
+            self.body,
             "  linalg.generic {{indexing_maps = [{map}, {map}], iterator_types = [{iters}]}} \
              ins({a} : {ma}) outs({n} : {memty}) {{\n  ^bb0(%x: {et}, %o: {et}):\n{body}    \
-             linalg.yield %r : {et}\n  }}\n"
+             linalg.yield %r : {et}\n  }}"
         );
         self.names[idx] = n;
         self.mem_of[idx] = Some(memty);
         Ok(())
     }
 
-    // Scalar comparison → `i1`; the relation is in `imm`, the operand type comes from the
-    // first operand's tracked type (this instruction's own type is `bool`, the result).
+    /// Scalar comparison → `i1`; the relation is in `imm`, the operand type comes from the
+    /// first operand's tracked type (this instruction's own type is `bool`, the result).
+    ///
+    /// # Errors
+    ///
+    /// Declines when an operand is not tracked, or the relation has no comparison op for the
+    /// operand type.
     pub(crate) fn op_cmp(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let e = self.elem_at(ins.operand1.0).ok_or(crate::emitter_gap!())?;
         let mt = mlir_scalar(&e).ok_or(crate::emitter_gap!())?;
@@ -311,14 +386,18 @@ impl FnEmit<'_> {
             .get(ins.operand2.0 as usize)
             .ok_or(crate::emitter_gap!())?;
         let n = format!("%v{idx}");
-        self.body += &format!("  {n} = {op} {pred}, {a}, {b} : {mt}\n");
+        let _ = writeln!(self.body, "  {n} = {op} {pred}, {a}, {b} : {mt}");
         self.names[idx] = n;
         self.etypes[idx] = Some(ElementType::Bool);
         Ok(())
     }
 
-    // Arithmetic negation `-x` (#214). `type_idx` is the result (= operand) scalar type. Float
-    // → `arith.negf`; integers have no `negi`, so `0 - x` via `arith.subi`.
+    /// Arithmetic negation `-x` (#214). `type_idx` is the result (= operand) scalar type. Float
+    /// → `arith.negf`; integers have no `negi`, so `0 - x` via `arith.subi`.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the operand is not tracked or the result type is not a modelled scalar.
     pub(crate) fn op_neg(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         if let Some(Some(ma)) = self.mem_of.get(ins.operand1.0 as usize).cloned() {
             return self.op_neg_tensor(idx, ins, &ma);
@@ -338,18 +417,22 @@ impl FnEmit<'_> {
             .clone();
         let n = format!("%v{idx}");
         if e.is_float() {
-            self.body += &format!("  {n} = arith.negf {a} : {mt}\n");
+            let _ = writeln!(self.body, "  {n} = arith.negf {a} : {mt}");
         } else {
             let z = format!("%z{idx}");
-            self.body += &format!("  {z} = arith.constant 0 : {mt}\n");
-            self.body += &format!("  {n} = arith.subi {z}, {a} : {mt}\n");
+            let _ = writeln!(self.body, "  {z} = arith.constant 0 : {mt}");
+            let _ = writeln!(self.body, "  {n} = arith.subi {z}, {a} : {mt}");
         }
         self.names[idx] = n;
         self.etypes[idx] = Some(e);
         Ok(())
     }
 
-    // Logical / bitwise not `!x` (#214): `x ^ all-ones` (`1` for a bool `i1`, `-1` for ints).
+    /// Logical / bitwise not `!x` (#214): `x ^ all-ones` (`1` for a bool `i1`, `-1` for ints).
+    ///
+    /// # Errors
+    ///
+    /// Declines when the operand is not tracked or the result type is not a modelled scalar.
     pub(crate) fn op_not(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let e = elem_of_gid(
             *self
@@ -371,83 +454,33 @@ impl FnEmit<'_> {
         };
         let ones = format!("%ones{idx}");
         let n = format!("%v{idx}");
-        self.body += &format!("  {ones} = arith.constant {ones_val} : {mt}\n");
-        self.body += &format!("  {n} = arith.xori {a}, {ones} : {mt}\n");
+        let _ = writeln!(self.body, "  {ones} = arith.constant {ones_val} : {mt}");
+        let _ = writeln!(self.body, "  {n} = arith.xori {a}, {ones} : {mt}");
         self.names[idx] = n;
         self.etypes[idx] = Some(e);
         Ok(())
     }
 
-    // Scalar `as` cast (#214): `type_idx` is the *target* type, `operand1` the source value
-    // (whose type comes from its tracked `etypes`). The right `arith` conversion is chosen by
-    // the source/target kinds + widths; a same-type cast is a no-op that just aliases.
+    /// Scalar `as` cast (#214): `type_idx` is the *target* type, `operand1` the source value
+    /// (whose type comes from its tracked `etypes`). The right `arith` conversion is chosen by
+    /// the source/target kinds + widths; a same-type cast is a no-op that just aliases.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the operand or the target type is not tracked, or when there is no
+    /// conversion between the two types.
     pub(crate) fn op_cast(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let gid = *self
             .types
             .get(ins.type_idx.0 as usize)
             .ok_or(crate::emitter_gap!())?;
-        // A slice `as`: the source is a vector an elementwise op produced, so the cast is
-        // `arith.truncf`/`arith.extf` over the lanes. This is the spelling that narrows a
-        // widened slice back into half storage, which the checker requires be written.
         if let Some(src_vec) = self
             .vec_of
             .get(ins.operand1.0 as usize)
             .ok_or(crate::emitter_gap!())?
             .clone()
         {
-            // `as f16` names an element type, so the target GID is the scalar; the lane
-            // count comes from the operand it is applied to.
-            let elem = elem_of_gid(gid).ok_or(crate::emitter_gap!())?;
-            if !elem.is_float() {
-                return Err(Decline::TypeNotModelled {
-                    what: "a slice cast to a non-float element type",
-                });
-            }
-            let lanes = src_vec
-                .strip_prefix("vector<")
-                .ok_or(crate::emitter_gap!())?
-                .split('x')
-                .next()
-                .ok_or(crate::emitter_gap!())?
-                .to_string();
-            let src_elem = src_vec
-                .rsplit('x')
-                .next()
-                .ok_or(crate::emitter_gap!())?
-                .trim_end_matches('>')
-                .to_string();
-            let et = mlir_scalar(&elem).ok_or(crate::emitter_gap!())?;
-            let dst_vec = format!("vector<{lanes}x{et}>");
-            let a = self
-                .names
-                .get(ins.operand1.0 as usize)
-                .ok_or(crate::emitter_gap!())?
-                .clone();
-            if src_elem == et {
-                self.names[idx] = a;
-                self.vec_of[idx] = Some(dst_vec);
-                return Ok(());
-            }
-            let src_ty =
-                crate::mlir_ty::float_elem_of_mlir(&src_elem).ok_or(crate::emitter_gap!())?;
-            let src_bits = src_ty.bits().ok_or(crate::emitter_gap!())?;
-            let dst_bits = elem.bits().ok_or(crate::emitter_gap!())?;
-            // f16 and bf16 are both 16 bits and neither `truncf` nor `extf` converts between
-            // them, so that pair declines rather than emitting a conversion that lies.
-            let conv = match dst_bits.cmp(&src_bits) {
-                std::cmp::Ordering::Less => "arith.truncf",
-                std::cmp::Ordering::Greater => "arith.extf",
-                std::cmp::Ordering::Equal => {
-                    return Err(Decline::TypeNotModelled {
-                        what: "a slice cast between two equal-width float types",
-                    })
-                }
-            };
-            let n = format!("%v{idx}");
-            self.body += &format!("  {n} = {conv} {a} : {src_vec} to {dst_vec}\n");
-            self.names[idx] = n;
-            self.vec_of[idx] = Some(dst_vec);
-            return Ok(());
+            return self.cast_slice(idx, ins, gid, &src_vec);
         }
         // A tensor target: the two memref types differ only in which extents are known, so this
         // is `memref.cast` rather than any arithmetic conversion.
@@ -464,8 +497,9 @@ impl FnEmit<'_> {
                 .ok_or(crate::emitter_gap!())?
                 .clone();
             let n = format!("%v{idx}");
-            self.body += &format!(
-                "  {n} = llvm.inttoptr {a} : {} to !llvm.ptr\n",
+            let _ = writeln!(
+                self.body,
+                "  {n} = llvm.inttoptr {a} : {} to !llvm.ptr",
                 mlir_scalar(&src).ok_or(crate::emitter_gap!())?
             );
             self.names[idx] = n;
@@ -483,8 +517,9 @@ impl FnEmit<'_> {
             self.names[idx] = a; // reinterpret (e.g. i32 as u32) -> alias
         } else {
             let n = format!("%v{idx}");
-            self.body += &format!(
-                "  {n} = {op} {a} : {} to {}\n",
+            let _ = writeln!(
+                self.body,
+                "  {n} = {op} {a} : {} to {}",
                 mlir_scalar(&src).ok_or(crate::emitter_gap!())?,
                 mlir_scalar(&tgt).ok_or(crate::emitter_gap!())?
             );
@@ -494,9 +529,82 @@ impl FnEmit<'_> {
         Ok(())
     }
 
+    /// A slice `as`: the source is a vector an elementwise op produced, so the cast is
+    /// `arith.truncf`/`arith.extf` over the lanes. This is the spelling that narrows a
+    /// widened slice back into half storage, which the checker requires be written.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the target is not a float type, the operand is not tracked, or the two
+    /// float types have the same width.
+    fn cast_slice(
+        &mut self,
+        idx: usize,
+        ins: &HirInstruction,
+        gid: TypeId,
+        src_vec: &str,
+    ) -> Lowered<()> {
+        // `as f16` names an element type, so the target GID is the scalar; the lane
+        // count comes from the operand it is applied to.
+        let elem = elem_of_gid(gid).ok_or(crate::emitter_gap!())?;
+        if !elem.is_float() {
+            return Err(Decline::TypeNotModelled {
+                what: "a slice cast to a non-float element type",
+            });
+        }
+        let lanes = src_vec
+            .strip_prefix("vector<")
+            .ok_or(crate::emitter_gap!())?
+            .split('x')
+            .next()
+            .ok_or(crate::emitter_gap!())?
+            .to_string();
+        let src_elem = src_vec
+            .rsplit('x')
+            .next()
+            .ok_or(crate::emitter_gap!())?
+            .trim_end_matches('>')
+            .to_string();
+        let et = mlir_scalar(&elem).ok_or(crate::emitter_gap!())?;
+        let dst_vec = format!("vector<{lanes}x{et}>");
+        let a = self
+            .names
+            .get(ins.operand1.0 as usize)
+            .ok_or(crate::emitter_gap!())?
+            .clone();
+        if src_elem == et {
+            self.names[idx] = a;
+            self.vec_of[idx] = Some(dst_vec);
+            return Ok(());
+        }
+        let src_ty = crate::mlir_ty::float_elem_of_mlir(&src_elem).ok_or(crate::emitter_gap!())?;
+        let src_bits = src_ty.bits().ok_or(crate::emitter_gap!())?;
+        let dst_bits = elem.bits().ok_or(crate::emitter_gap!())?;
+        // f16 and bf16 are both 16 bits and neither `truncf` nor `extf` converts between
+        // them, so that pair declines rather than emitting a conversion that lies.
+        let conv = match dst_bits.cmp(&src_bits) {
+            std::cmp::Ordering::Less => "arith.truncf",
+            std::cmp::Ordering::Greater => "arith.extf",
+            std::cmp::Ordering::Equal => {
+                return Err(Decline::TypeNotModelled {
+                    what: "a slice cast between two equal-width float types",
+                })
+            }
+        };
+        let n = format!("%v{idx}");
+        let _ = writeln!(self.body, "  {n} = {conv} {a} : {src_vec} to {dst_vec}");
+        self.names[idx] = n;
+        self.vec_of[idx] = Some(dst_vec);
+        Ok(())
+    }
+
     /// Forget a tensor's extents: `memref.cast %a : memref<2x3xf32> to memref<?x?xf32>`. Emitted
     /// where a shaped value reaches a position with `?` extents, which in MLIR is a different type
     /// rather than a subtype. Identical types alias instead of emitting a no-op cast.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the operand is not a tracked tensor or the target has no memref type.
     fn cast_memref(
         &mut self,
         idx: usize,

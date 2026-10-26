@@ -21,7 +21,11 @@
 //! back to the arms below it. The last arm must match every value, so it is the final `else` and
 //! the result is a value wherever the `match` was.
 
-use super::*;
+use super::{
+    BorrowExpr, Expr, ExprStmtStmt, FunctionCallExpr, IdentifierExpr, IfExpr, LetDeclStmt,
+    LogicalOp, LogicalOpExpr, MatchArm, MatchExpr, MemberAccessExpr, ParseResult, Parser, Pattern,
+    RelationalOp, RelationalOpExpr, Span, Statement, Token, TokenType,
+};
 use crate::symbol::Symbol;
 
 /// A `match` arm's pattern: a tuple of patterns, or any other pattern.
@@ -32,6 +36,11 @@ pub(crate) enum ArmPattern {
 
 impl<'a> Parser<'a> {
     /// A `match` arm's pattern, which may be a tuple: `(0, y)`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when one of the patterns does not parse, when the `)` that closes a tuple pattern is
+    /// missing, or when `tuple_struct` fails for a tuple of that many elements.
     pub(crate) fn parse_arm_pattern(&mut self) -> ParseResult<'a, ArmPattern> {
         if !self.match_token(&TokenType::LeftParen) {
             return Ok(ArmPattern::Plain(Box::new(self.parse_pattern()?)));
@@ -49,35 +58,24 @@ impl<'a> Parser<'a> {
     }
 
     /// Rewrite `match scrutinee { arms }`, where some arm is a tuple pattern, into `if`s and `match`es.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the matched value is not a variable and the `match` is used as a value, when
+    /// the tuple patterns do not all have as many elements as the tuple, when an arm that matches
+    /// every value is not the last one, or when the last arm does not match every value.
+    ///
+    /// # Panics
+    ///
+    /// If no arm has a tuple pattern; the caller only calls this when one has. Also if the
+    /// rewritten arms do not start with a test, which the checks on the arms rule out.
     pub(crate) fn lower_tuple_match(
         &mut self,
         scrutinee: Expr,
         arms: Vec<(ArmPattern, Vec<Statement>, Token<'a>)>,
         at_statement: bool,
     ) -> ParseResult<'a, Expr> {
-        // The matched value is read once per test, so it must be one that can be read again: a
-        // variable, or a tuple literal of variables and constants. Anything else goes in a
-        // temporary, which needs the `match` to be a whole statement.
-        let value = if is_rereadable(&scrutinee) {
-            scrutinee
-        } else if at_statement {
-            let temp = format!("$match{}", self.tuple_lets);
-            self.tuple_lets += 1;
-            self.prefix_stmts.push(Statement::LetDecl(LetDeclStmt {
-                name: temp.clone().into(),
-                is_mut: false,
-                ty_ann: None,
-                expr: scrutinee,
-                span: Span::default(),
-            }));
-            identifier(&temp)
-        } else {
-            return Err(self.error_at(
-                &arms[0].2,
-                "a `match` on a tuple used as a value must match a variable; \
-                 put the value in a `let` first",
-            ));
-        };
+        let value = self.rereadable_match_value(scrutinee, at_statement, &arms[0].2)?;
 
         let arity = arms
             .iter()
@@ -103,39 +101,7 @@ impl<'a> Parser<'a> {
             }
             _ => Some(has_elements(arity, &value)),
         };
-        let mut lowered = Vec::new();
-        let last = arms.len() - 1;
-        for (i, (pattern, body, token)) in arms.into_iter().enumerate() {
-            if let ArmPattern::Tuple(e) = &pattern {
-                if e.len() != arity {
-                    return Err(self.error_at(
-                        &token,
-                        &format!(
-                            "every tuple pattern in this `match` has {arity} elements; this one has {}",
-                            e.len()
-                        ),
-                    ));
-                }
-            }
-            let mut steps = Vec::new();
-            let mut binds = Vec::new();
-            self.arm_steps(&pattern, &value, &mut steps, &mut binds);
-            if i < last && steps.is_empty() {
-                return Err(self.error_at(
-                    &token,
-                    "this arm matches every value, so the arms after it can never run",
-                ));
-            }
-            if i == last && !steps.is_empty() {
-                return Err(self.error_at(
-                    &token,
-                    "a `match` on a tuple must end with an arm that matches every value, \
-                     such as `_` or `(a, b)`",
-                ));
-            }
-            binds.extend(body);
-            lowered.push((steps, binds));
-        }
+        let mut lowered = self.lower_tuple_arms(arms, &value, arity)?;
 
         if lowered.len() == 1 {
             // One arm that matches everything: run it unconditionally, after the size check.
@@ -157,6 +123,92 @@ impl<'a> Parser<'a> {
         Ok(top.expr)
     }
 
+    /// The value a tuple `match` tests, in a form that can be read once for each test.
+    /// `first_arm` is where an error is reported.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `scrutinee` cannot be read again and the `match` is not a whole statement.
+    fn rereadable_match_value(
+        &mut self,
+        scrutinee: Expr,
+        at_statement: bool,
+        first_arm: &Token<'a>,
+    ) -> ParseResult<'a, Expr> {
+        // The matched value is read once per test, so it must be one that can be read again: a
+        // variable, or a tuple literal of variables and constants. Anything else goes in a
+        // temporary, which needs the `match` to be a whole statement.
+        if is_rereadable(&scrutinee) {
+            Ok(scrutinee)
+        } else if at_statement {
+            let temp = format!("$match{}", self.tuple_lets);
+            self.tuple_lets += 1;
+            self.prefix_stmts.push(Statement::LetDecl(LetDeclStmt {
+                name: temp.clone().into(),
+                is_mut: false,
+                ty_ann: None,
+                expr: scrutinee,
+                span: Span::default(),
+            }));
+            Ok(identifier(&temp))
+        } else {
+            Err(self.error_at(
+                first_arm,
+                "a `match` on a tuple used as a value must match a variable; \
+                 put the value in a `let` first",
+            ))
+        }
+    }
+
+    /// The steps and the body of each arm of a tuple `match` on `value`, in the order written.
+    /// `arity` is the number of elements every tuple pattern must have.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a tuple pattern does not have `arity` elements, when an arm that matches every
+    /// value is not the last one, or when the last arm does not match every value.
+    fn lower_tuple_arms(
+        &mut self,
+        arms: Vec<(ArmPattern, Vec<Statement>, Token<'a>)>,
+        value: &Expr,
+        arity: usize,
+    ) -> ParseResult<'a, Vec<LoweredArm>> {
+        let mut lowered = Vec::new();
+        let last = arms.len() - 1;
+        for (i, (pattern, body, token)) in arms.into_iter().enumerate() {
+            if let ArmPattern::Tuple(e) = &pattern {
+                if e.len() != arity {
+                    return Err(self.error_at(
+                        &token,
+                        &format!(
+                            "every tuple pattern in this `match` has {arity} elements; this one has {}",
+                            e.len()
+                        ),
+                    ));
+                }
+            }
+            let mut steps = Vec::new();
+            let mut binds = Vec::new();
+            self.arm_steps(&pattern, value, &mut steps, &mut binds);
+            if i < last && steps.is_empty() {
+                return Err(self.error_at(
+                    &token,
+                    "this arm matches every value, so the arms after it can never run",
+                ));
+            }
+            if i == last && !steps.is_empty() {
+                return Err(self.error_at(
+                    &token,
+                    "a `match` on a tuple must end with an arm that matches every value, \
+                     such as `_` or `(a, b)`",
+                ));
+            }
+            binds.extend(body);
+            lowered.push((steps, binds));
+        }
+        Ok(lowered)
+    }
+
     /// The steps `pattern` takes on `value`, in order, and the `let`s that bind its names.
     fn arm_steps(
         &mut self,
@@ -175,7 +227,7 @@ impl<'a> Parser<'a> {
                 Pattern::Wildcard => {}
                 Pattern::Literal(lit) => steps.push(Step::Test(equals(value, lit))),
                 Pattern::Identifier(name) if is_bool(name) => {
-                    steps.push(Step::Test(equals(value, &identifier(name.as_ref()))))
+                    steps.push(Step::Test(equals(value, &identifier(name.as_ref()))));
                 }
                 Pattern::Identifier(name) => binds.push(Statement::LetDecl(LetDeclStmt {
                     name: name.clone(),
@@ -237,9 +289,13 @@ enum Step {
     },
 }
 
+/// One arm of a tuple `match`: the steps of its pattern, and the statements that run when every
+/// step passes.
+type LoweredArm = (Vec<Step>, Vec<Statement>);
+
 /// The statements for arms `i..`: arm `i`'s steps, each falling back to arms `i + 1..` when it
 /// fails. The fallback is written out at every step that can fail, so it is copied once per step.
-fn build(arms: &[(Vec<Step>, Vec<Statement>)], i: usize) -> Vec<Statement> {
+fn build(arms: &[LoweredArm], i: usize) -> Vec<Statement> {
     let (steps, body) = &arms[i];
     if i == arms.len() - 1 {
         return body.clone();
@@ -248,7 +304,7 @@ fn build(arms: &[(Vec<Step>, Vec<Statement>)], i: usize) -> Vec<Statement> {
 }
 
 fn build_steps(
-    arms: &[(Vec<Step>, Vec<Statement>)],
+    arms: &[LoweredArm],
     i: usize,
     steps: &[Step],
     body: &[Statement],
@@ -306,6 +362,12 @@ fn build_steps(
             ))
         }
     };
+    vec![value_or_statement(expr)]
+}
+
+/// `expr`, an `if` or a `match` built for one step, as the last statement of a block: a value,
+/// unless it returns on every path.
+fn value_or_statement(expr: Expr) -> Statement {
     // An `if` or `match` that returns on every path is a statement, not a value. The checker types
     // a `match` from the arms that end in a value, and in a `match` the parser has turned into
     // `return <match>` this one would otherwise count as a `void` value.
@@ -320,7 +382,7 @@ fn build_steps(
         };
         e.has_semi = true;
     }
-    vec![stmt]
+    stmt
 }
 
 fn is_bool(name: &Symbol) -> bool {
@@ -401,6 +463,10 @@ fn equals(lhs: &Expr, rhs: &Expr) -> Expr {
 }
 
 /// The tests joined with `&&`.
+///
+/// # Panics
+///
+/// If `tests` is empty. The caller always passes at least one test.
 fn all_of(tests: Vec<Expr>) -> Expr {
     tests
         .into_iter()

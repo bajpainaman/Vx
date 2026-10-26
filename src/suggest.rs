@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 /// Compute Levenshtein edit distance between two strings.
+#[must_use]
 pub fn levenshtein(a: &str, b: &str) -> usize {
     let a_len = a.len();
     let b_len = b.len();
@@ -29,7 +30,7 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     for (i, a_char) in a.chars().enumerate() {
         curr_row[0] = i + 1;
         for (j, b_char) in b.chars().enumerate() {
-            let cost = if a_char == b_char { 0 } else { 1 };
+            let cost = usize::from(a_char != b_char);
             curr_row[j + 1] = (prev_row[j + 1] + 1)
                 .min(curr_row[j] + 1)
                 .min(prev_row[j] + cost);
@@ -42,6 +43,7 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
 
 /// Find the closest match to `target` from a list of `candidates`.
 /// Returns `None` if no candidate is within `max_dist` edits.
+#[must_use]
 pub fn closest_match<'a>(target: &str, candidates: &[&'a str], max_dist: usize) -> Option<&'a str> {
     candidates
         .iter()
@@ -59,6 +61,7 @@ pub fn closest_match<'a>(target: &str, candidates: &[&'a str], max_dist: usize) 
 
 /// Suggest a correction for a name, using a dynamic max distance based on name length.
 /// Short names (1-3 chars) allow 1 edit, medium names (4-7) allow 2, longer allow 3.
+#[must_use]
 pub fn suggest_name<'a>(target: &str, candidates: &[&'a str]) -> Option<&'a str> {
     let max_dist = match target.len() {
         0 => return None,
@@ -70,6 +73,11 @@ pub fn suggest_name<'a>(target: &str, candidates: &[&'a str]) -> Option<&'a str>
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 

@@ -14,7 +14,13 @@ use crate::hir::check_state::{
 };
 use crate::hir::env::Value;
 use crate::symbol::Symbol;
-use crate::syntax::*;
+use crate::syntax::{
+    ArrayExpr, AsCastExpr, BinaryOp, BinaryOpExpr, BorrowExpr, DereferenceExpr, ElementType, Expr,
+    ForLoopStmt, Function, FunctionCallExpr, IdentifierExpr, IfExpr, IndexAccessExpr,
+    IndirectCallExpr, InlineMlirExpr, LogicalOp, LogicalOpExpr, LoopStmt, MatchArm, MatchExpr,
+    MemberAccessExpr, NumberExpr, Pattern, RelationalOp, RelationalOpExpr, SpawnOnExpr, Statement,
+    StringLiteralExpr, StructInitExpr, Topology, TransferPredicateExpr, Type, UnaryOp, UnaryOpExpr,
+};
 
 /// Recursive comptime calls clone enough lexical state that the compiler worker's ordinary stack
 /// can run out before the language-level 256-call limit. Each comptime block runs on one larger
@@ -84,6 +90,10 @@ impl<'bodies> ComptimeFunctionBodies<'bodies> {
 
     /// For each parameter of the body `get` returns for `name`, whether it can carry a mutable
     /// reference out of the call.
+    ///
+    /// # Panics
+    /// When no body is known for `name`. Callers ask only about a function `get` or `contains`
+    /// has found.
     fn mutable_reference_params(&self, name: &Symbol) -> Vec<bool> {
         let function = self
             .get(name)
@@ -135,6 +145,18 @@ enum ComptimeWritePlace {
         projections: Vec<ComptimePlaceProjection>,
     },
     Unknown,
+}
+
+/// The caller's variables, set aside while a called function's body runs in a frame of its own.
+struct SavedCallerFrame {
+    /// The caller's values, by variable name.
+    env: HashMap<Symbol, ComptimeEvalValue>,
+    /// The caller's `reference_places`.
+    reference_places: HashMap<Symbol, ComptimeWritePlace>,
+    /// The caller's `reference_projection_places`.
+    reference_projection_places: HashMap<ComptimeWritePlace, ComptimeWritePlace>,
+    /// The caller's `written_roots`.
+    written_roots: HashSet<Symbol>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -221,13 +243,6 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         }
     }
 
-    fn unsupported_after(
-        &mut self,
-        children: impl IntoIterator<Item = ComptimeEvalOutcome>,
-    ) -> ComptimeEvalOutcome {
-        Self::unsupported_outcome(children)
-    }
-
     fn unsupported_outcome(
         children: impl IntoIterator<Item = ComptimeEvalOutcome>,
     ) -> ComptimeEvalOutcome {
@@ -248,7 +263,6 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
     /// a live, fixture-backed refusal policy. Other transition-only unsupported results stay
     /// observations until the old/new comparator can classify them.
     fn refusal_after(
-        &mut self,
         children: impl IntoIterator<Item = ComptimeEvalOutcome>,
     ) -> ComptimeEvalOutcome {
         let mut outcome = ComptimeEvalOutcome::refusal();
@@ -266,7 +280,6 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
     /// Sequence children in evaluation order. Their values need not agree, but their may-facts
     /// and unsupported status must survive even when the enclosing value becomes unknown.
     fn unknown_after(
-        &mut self,
         children: impl IntoIterator<Item = ComptimeEvalOutcome>,
     ) -> ComptimeEvalOutcome {
         let mut outcome = ComptimeEvalOutcome::unknown();
@@ -510,12 +523,18 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         };
         let stored = match (place, &value.value.concrete) {
             (Some((block, at)), Some(Value::Int(v))) => {
-                self.heap[block][at] = *v as u8;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a byte store keeps the low 8 bits, so `-1` is stored as `0xFF`"
+                )]
+                let byte = *v as u8;
+                self.heap[block][at] = byte;
                 true
             }
             _ => false,
         };
-        let mut outcome = self.unknown_after([index, value]);
+        let mut outcome = Self::unknown_after([index, value]);
         if !stored {
             outcome.mark_unsupported();
         }
@@ -567,7 +586,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         let right = self.expr(rhs);
         let stored = self.store_place(lhs, place, right.value.clone());
         self.update_reference_binding(lhs, rhs);
-        let mut outcome = self.unknown_after([left, right]);
+        let mut outcome = Self::unknown_after([left, right]);
         if !stored {
             outcome.mark_unsupported();
         }
@@ -577,7 +596,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
     fn compound_assign(&mut self, lhs: &Expr, op: &BinaryOp, rhs: &Expr) -> ComptimeEvalOutcome {
         let (left, place) = self.write_place(lhs);
         let right = self.expr(rhs);
-        let mut updated = self.binary(left.clone(), right.clone(), op);
+        let mut updated = Self::binary(left.clone(), right.clone(), op);
         if !self.store_place(lhs, place, updated.value.clone()) {
             updated.mark_unsupported();
         }
@@ -638,7 +657,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         let mut probe = self.clone();
         let value = probe.expr(expr).value.concrete?;
         match value {
-            Value::Int(index) if index >= 0 => Some(index as usize),
+            Value::Int(index) => usize::try_from(index).ok(),
             _ => None,
         }
     }
@@ -1090,7 +1109,6 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
     }
 
     fn binary(
-        &mut self,
         lhs: ComptimeEvalOutcome,
         rhs: ComptimeEvalOutcome,
         op: &BinaryOp,
@@ -1114,7 +1132,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             },
             _ => None,
         };
-        let mut outcome = self.unknown_after([lhs, rhs]);
+        let mut outcome = Self::unknown_after([lhs, rhs]);
         outcome.value.concrete = concrete;
         outcome
     }
@@ -1136,8 +1154,8 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             _ if lhs.as_f64().is_some() && rhs.as_f64().is_some() => {
                 let (left, right) = (lhs.as_f64()?, rhs.as_f64()?);
                 match op {
-                    RelationalOp::Eq => left == right,
-                    RelationalOp::NotEq => left != right,
+                    RelationalOp::Eq => floats_equal(left, right),
+                    RelationalOp::NotEq => !floats_equal(left, right),
                     RelationalOp::Lt => left < right,
                     RelationalOp::Gt => left > right,
                     RelationalOp::Le => left <= right,
@@ -1201,7 +1219,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         }
     }
 
-    fn array(&mut self, elements: Vec<ComptimeEvalOutcome>) -> ComptimeEvalOutcome {
+    fn array(elements: Vec<ComptimeEvalOutcome>) -> ComptimeEvalOutcome {
         let concrete = elements
             .iter()
             .map(|outcome| outcome.value.concrete.clone())
@@ -1213,7 +1231,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                 .map(|outcome| outcome.value.clone())
                 .collect(),
         );
-        let mut outcome = self.unknown_after(elements);
+        let mut outcome = Self::unknown_after(elements);
         outcome.value.concrete = concrete;
         outcome.value.aggregate = Some(aggregate);
         outcome
@@ -1222,12 +1240,12 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
     /// Select one component without inheriting may-facts from its unrelated siblings. The base
     /// still contributes support, refusal, flow, and already-recorded effects through
     /// `unknown_after`; only the selected *value* is precise.
-    fn member_access(&mut self, base: ComptimeEvalOutcome, member: &Symbol) -> ComptimeEvalOutcome {
+    fn member_access(base: ComptimeEvalOutcome, member: &Symbol) -> ComptimeEvalOutcome {
         let selected = match &base.value.aggregate {
             Some(ComptimeAggregateValue::Struct(fields)) => fields.get(member).cloned(),
             _ => None,
         };
-        let mut outcome = self.unknown_after([base]);
+        let mut outcome = Self::unknown_after([base]);
         if let Some(selected) = selected {
             outcome.value = selected;
         }
@@ -1240,24 +1258,28 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         index: ComptimeEvalOutcome,
     ) -> ComptimeEvalOutcome {
         let selected = match (&base.value.aggregate, &index.value.concrete) {
-            (Some(ComptimeAggregateValue::Array(items)), Some(Value::Int(index)))
-                if *index >= 0 =>
-            {
-                items.get(*index as usize).cloned()
+            (Some(ComptimeAggregateValue::Array(items)), Some(Value::Int(index))) => {
+                usize::try_from(*index)
+                    .ok()
+                    .and_then(|index| items.get(index))
+                    .cloned()
             }
             _ => None,
         };
         let concrete = match (&base.value.concrete, &index.value.concrete) {
-            (Some(Value::Array(items)), Some(Value::Int(index))) if *index >= 0 => {
-                items.get(*index as usize).cloned()
-            }
+            (Some(Value::Array(items)), Some(Value::Int(index))) => usize::try_from(*index)
+                .ok()
+                .and_then(|index| items.get(index))
+                .cloned(),
             // A byte reads as the `i8` it is.
-            (Some(ptr @ Value::Ptr { .. }), Some(Value::Int(index))) => self
-                .heap_place(ptr, *index)
-                .map(|(block, at)| Value::Int(self.heap[block][at] as i8 as i64)),
+            (Some(ptr @ Value::Ptr { .. }), Some(Value::Int(index))) => {
+                self.heap_place(ptr, *index).map(|(block, at)| {
+                    Value::Int(i64::from(i8::from_ne_bytes([self.heap[block][at]])))
+                })
+            }
             _ => None,
         };
-        let mut outcome = self.unknown_after([base, index]);
+        let mut outcome = Self::unknown_after([base, index]);
         if let Some(selected) = selected {
             outcome.value = selected;
         } else {
@@ -1298,56 +1320,20 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         writebacks: Vec<Option<ComptimeWritePlace>>,
     ) -> ComptimeEvalOutcome {
         let Some(function) = self.function_bodies.get(target).cloned() else {
-            return self.unsupported_after(args);
+            return Self::unsupported_outcome(args);
         };
         let mutable_reference_params = self.function_bodies.mutable_reference_params(target);
         if function.params.len() != args.len()
             || (!writebacks.is_empty() && writebacks.len() != args.len())
             || mutable_reference_params.len() != function.params.len()
         {
-            return self.unsupported_after(args);
+            return Self::unsupported_outcome(args);
         }
         if !self.context.push_call() {
-            return self.unsupported_after(args);
+            return Self::unsupported_outcome(args);
         }
 
-        let saved_env = std::mem::take(&mut self.env);
-        let saved_reference_places = std::mem::take(&mut self.reference_places);
-        let saved_reference_projection_places =
-            std::mem::take(&mut self.reference_projection_places);
-        let saved_written_roots = std::mem::take(&mut self.written_roots);
-        self.reference_projection_places = saved_reference_projection_places
-            .iter()
-            .filter(|(place, _)| {
-                Self::place_root(place).is_some_and(|root| {
-                    function
-                        .params
-                        .iter()
-                        .any(|(parameter, _)| parameter == root)
-                })
-            })
-            .map(|(place, target)| (place.clone(), target.clone()))
-            .collect();
-        self.context.push_scope();
-        for ((((parameter, _), parameter_can_carry_mut_reference), argument), writeback) in function
-            .params
-            .iter()
-            .zip(&mutable_reference_params)
-            .zip(&args)
-            .zip(writebacks.iter().chain(std::iter::repeat(&None)))
-        {
-            self.context
-                .declare(parameter.clone(), argument.value.facts.clone());
-            self.env.insert(parameter.clone(), argument.value.clone());
-            if *parameter_can_carry_mut_reference && writeback.is_some() {
-                // The parameter's private binding is its lvalue inside this call. When the call
-                // returns, its final value is copied to the caller's tracked place below.
-                self.reference_places.insert(
-                    parameter.clone(),
-                    ComptimeWritePlace::Binding(parameter.clone()),
-                );
-            }
-        }
+        let saved = self.enter_call_frame(&function, &mutable_reference_params, &args, &writebacks);
         let body = self.block(&function.body);
         let caller_updates = function
             .params
@@ -1364,11 +1350,11 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             )
             .collect::<Vec<_>>();
         self.context.pop_scope();
-        self.env = saved_env;
-        self.reference_places = saved_reference_places;
-        self.reference_projection_places = saved_reference_projection_places;
+        self.env = saved.env;
+        self.reference_places = saved.reference_places;
+        self.reference_projection_places = saved.reference_projection_places;
         // The write-backs below are writes in the caller's frame, so they are recorded there.
-        self.written_roots = saved_written_roots;
+        self.written_roots = saved.written_roots;
         let mut writebacks_supported = true;
         for (caller, value) in caller_updates {
             match value {
@@ -1382,6 +1368,68 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         }
         self.context.pop_call();
 
+        Self::call_outcome(body, args, writebacks_supported)
+    }
+
+    /// Sets the caller's variables aside and gives the called function a frame of its own, with
+    /// each parameter bound to its argument. Returns what was set aside, to put back after the
+    /// body has run.
+    fn enter_call_frame(
+        &mut self,
+        function: &Function,
+        mutable_reference_params: &[bool],
+        args: &[ComptimeEvalOutcome],
+        writebacks: &[Option<ComptimeWritePlace>],
+    ) -> SavedCallerFrame {
+        let saved = SavedCallerFrame {
+            env: std::mem::take(&mut self.env),
+            reference_places: std::mem::take(&mut self.reference_places),
+            reference_projection_places: std::mem::take(&mut self.reference_projection_places),
+            written_roots: std::mem::take(&mut self.written_roots),
+        };
+        self.reference_projection_places = saved
+            .reference_projection_places
+            .iter()
+            .filter(|(place, _)| {
+                Self::place_root(place).is_some_and(|root| {
+                    function
+                        .params
+                        .iter()
+                        .any(|(parameter, _)| parameter == root)
+                })
+            })
+            .map(|(place, target)| (place.clone(), target.clone()))
+            .collect();
+        self.context.push_scope();
+        for ((((parameter, _), parameter_can_carry_mut_reference), argument), writeback) in function
+            .params
+            .iter()
+            .zip(mutable_reference_params)
+            .zip(args)
+            .zip(writebacks.iter().chain(std::iter::repeat(&None)))
+        {
+            self.context
+                .declare(parameter.clone(), argument.value.facts.clone());
+            self.env.insert(parameter.clone(), argument.value.clone());
+            if *parameter_can_carry_mut_reference && writeback.is_some() {
+                // The parameter's private binding is its lvalue inside this call. When the call
+                // returns, its final value is copied to the caller's tracked place.
+                self.reference_places.insert(
+                    parameter.clone(),
+                    ComptimeWritePlace::Binding(parameter.clone()),
+                );
+            }
+        }
+        saved
+    }
+
+    /// The result of a call whose body gave `body`, with the support and refusal state of the
+    /// call's arguments carried in.
+    fn call_outcome(
+        body: ComptimeEvalOutcome,
+        args: Vec<ComptimeEvalOutcome>,
+        writebacks_supported: bool,
+    ) -> ComptimeEvalOutcome {
         let mut outcome = match body.flow {
             ComptimeEvalFlow::Return => ComptimeEvalOutcome {
                 flow: ComptimeEvalFlow::Normal,
@@ -1410,20 +1458,19 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         }
         outcome
     }
-
     fn callable_call(
         &mut self,
-        facts: ComptimeValueFacts,
+        facts: &ComptimeValueFacts,
         args: Vec<ComptimeEvalOutcome>,
     ) -> ComptimeEvalOutcome {
-        self.note_opaque_callable(&facts, &args);
+        self.note_opaque_callable(facts, &args);
         let mut targets = facts.callable_targets.iter();
         let Some(first_target) = targets.next() else {
             // A bodyless direct call (for example FFI), an outer callable, or an otherwise
             // unresolved callable cannot be discarded. Legacy evaluation can otherwise ignore
             // its statement and fold a later tail. `note_opaque_callable` may already have
             // found a concrete outer write; otherwise this remains a generic refusal.
-            return self.refusal_after(args);
+            return Self::refusal_after(args);
         };
 
         let mut merged = self.clone();
@@ -1510,12 +1557,15 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         });
         if writes_through_argument {
             self.note_opaque_callable(&facts, &args);
-            return self.refusal_after(args);
+            return Self::refusal_after(args);
         }
-        self.callable_call(facts, args)
+        self.callable_call(&facts, args)
     }
 
     /// A call to the function `name`, whose body is known, with `&mut` arguments written back.
+    ///
+    /// # Panics
+    /// When no body is known for `name`. Callers check `contains(name)` first.
     fn direct_call(
         &mut self,
         name: &Symbol,
@@ -1550,7 +1600,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             .flatten()
             .any(|place| matches!(place, ComptimeWritePlace::Unknown))
         {
-            return self.refusal_after(args);
+            return Self::refusal_after(args);
         }
         // Each parameter gets its own copy of what it points to, so two arguments reaching
         // the same variable, as in `f(p, p)` or `f(&mut h, &mut h.n)`, would not see each
@@ -1561,7 +1611,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             .enumerate()
             .any(|(i, a)| places[i + 1..].iter().any(|b| Self::places_overlap(a, b)));
         if overlapping {
-            return self.unsupported_after(args);
+            return Self::unsupported_outcome(args);
         }
         // The borrow outcome deliberately has no scalar `Value`: `comptime { &mut x }`
         // cannot replace itself with `x`. A known direct callee, however, needs the current
@@ -1573,11 +1623,11 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                 continue;
             };
             if let Some(value) = self.read_place(place) {
-                argument.value.concrete = value.concrete.clone();
-                argument.value.aggregate = value.aggregate.clone();
+                argument.value.concrete.clone_from(&value.concrete);
+                argument.value.aggregate.clone_from(&value.aggregate);
                 argument.value.facts.merge_from(&value.facts);
             } else if !Self::place_root(place).is_some_and(|root| self.root_write_escapes(root)) {
-                return self.refusal_after(args);
+                return Self::refusal_after(args);
             }
         }
         let temporary_projection_places = self.forward_projection_reference_places(
@@ -1704,11 +1754,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         match condition.value.concrete {
             Some(Value::Bool(true)) => {
                 let mut outcome = self.block(&if_expr.then_block);
-                outcome.support.merge_from(condition.support);
-                outcome
-                    .unsupported_reason
-                    .merge_from(condition.unsupported_reason);
-                outcome.requires_refusal |= condition.requires_refusal;
+                Self::carry_status(&mut outcome, &condition);
                 return outcome;
             }
             Some(Value::Bool(false)) => {
@@ -1717,11 +1763,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                     .as_ref()
                     .map(|branch| self.block(branch))
                     .unwrap_or_default();
-                outcome.support.merge_from(condition.support);
-                outcome
-                    .unsupported_reason
-                    .merge_from(condition.unsupported_reason);
-                outcome.requires_refusal |= condition.requires_refusal;
+                Self::carry_status(&mut outcome, &condition);
                 return outcome;
             }
             _ => {}
@@ -1764,11 +1806,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         if !heaps_agree {
             outcome.mark_unsupported();
         }
-        outcome.support.merge_from(condition.support);
-        outcome
-            .unsupported_reason
-            .merge_from(condition.unsupported_reason);
-        outcome.requires_refusal |= condition.requires_refusal;
+        Self::carry_status(&mut outcome, &condition);
         outcome
     }
 
@@ -1783,9 +1821,9 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             }
             Pattern::Literal(Expr::Number(number)) => match (value, Self::number_literal(number)) {
                 (Value::Int(value), Some(Value::Int(other))) => Some(value == &other),
-                (Value::Number(value), Some(Value::Number(other))) => Some(value == &other),
-                (Value::Int(_), Some(Value::Number(_)))
-                | (Value::Number(_), Some(Value::Int(_))) => Some(false),
+                (Value::Number(value), Some(Value::Number(other))) => {
+                    Some(floats_equal(*value, other))
+                }
                 (_, None) => None,
                 _ => Some(false),
             },
@@ -1867,33 +1905,19 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         let outcome = self.block(&arm.body);
         self.context.pop_scope();
         for (name, (value, reference_place)) in shadowed {
-            match value {
-                Some(value) => {
-                    self.env.insert(name.clone(), value);
-                }
-                None => {
-                    self.env.remove(&name);
-                }
-            }
-            match reference_place {
-                Some(place) => {
-                    self.reference_places.insert(name, place);
-                }
-                None => {
-                    self.reference_places.remove(&name);
-                }
-            }
+            self.restore_shadowed_binding(name, value, reference_place);
         }
         outcome
     }
 
-    fn match_expr(&mut self, match_expr: &MatchExpr) -> ComptimeEvalOutcome {
-        let scrutinee = self.expr(&match_expr.expr);
-        if scrutinee.flow != ComptimeEvalFlow::Normal {
-            return scrutinee;
-        }
-
-        let candidates: Vec<&MatchArm> = if let Some(value) = scrutinee.value.concrete.as_ref() {
+    /// The arms a `match` can take: the first arm that matches when the value is known, and
+    /// otherwise every arm up to the first one that matches anything. `None` when a pattern
+    /// cannot be compared with the known value.
+    fn candidate_arms<'m>(
+        match_expr: &'m MatchExpr,
+        scrutinee: Option<&Value>,
+    ) -> Option<Vec<&'m MatchArm>> {
+        if let Some(value) = scrutinee {
             let mut matching = Vec::new();
             for arm in &match_expr.arms {
                 match Self::pattern_matches(&arm.pattern, value) {
@@ -1902,10 +1926,10 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                         break;
                     }
                     Some(false) => {}
-                    None => return ComptimeEvalOutcome::unsupported(),
+                    None => return None,
                 }
             }
-            matching
+            Some(matching)
         } else {
             let mut viable = Vec::new();
             for arm in &match_expr.arms {
@@ -1914,7 +1938,18 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                     break;
                 }
             }
-            viable
+            Some(viable)
+        }
+    }
+    fn match_expr(&mut self, match_expr: &MatchExpr) -> ComptimeEvalOutcome {
+        let scrutinee = self.expr(&match_expr.expr);
+        if scrutinee.flow != ComptimeEvalFlow::Normal {
+            return scrutinee;
+        }
+
+        let Some(candidates) = Self::candidate_arms(match_expr, scrutinee.value.concrete.as_ref())
+        else {
+            return ComptimeEvalOutcome::unsupported();
         };
         let Some((first, rest)) = candidates.split_first() else {
             return ComptimeEvalOutcome::unsupported();
@@ -1973,77 +2008,79 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             if let (Some(Value::Int(start_index)), Some(Value::Int(end_index))) =
                 (&start.value.concrete, &end.value.concrete)
             {
-                let iterator: Symbol = loop_stmt.iter.clone().into();
-                let shadowed = self.env.get(&iterator).cloned();
-                let shadowed_reference = self.reference_places.remove(&iterator);
-                self.context.push_scope();
-                self.context
-                    .declare(iterator.clone(), ComptimeValueFacts::default());
-
-                let mut index = *start_index;
-                let end_index = *end_index;
-                let mut outcome = self.unknown_after([start, end]);
-                while index < end_index {
-                    if !self.context.take_loop_step() {
-                        outcome.mark_unsupported();
-                        break;
-                    }
-                    self.env.insert(
-                        iterator.clone(),
-                        ComptimeEvalValue::known(Value::Int(index)),
-                    );
-                    self.reference_places.remove(&iterator);
-                    let body = self.block(&loop_stmt.body);
-                    outcome.support.merge_from(body.support);
-                    outcome
-                        .unsupported_reason
-                        .merge_from(body.unsupported_reason);
-                    outcome.requires_refusal |= body.requires_refusal;
-                    match body.flow {
-                        ComptimeEvalFlow::Normal | ComptimeEvalFlow::Continue => {}
-                        ComptimeEvalFlow::Break => break,
-                        ComptimeEvalFlow::Return => {
-                            outcome.flow = ComptimeEvalFlow::Return;
-                            outcome.value = body.value;
-                            break;
-                        }
-                        ComptimeEvalFlow::Indeterminate => {
-                            outcome.flow = ComptimeEvalFlow::Indeterminate;
-                            outcome.mark_unsupported();
-                            break;
-                        }
-                    }
-                    index += 1;
-                }
-                self.context.pop_scope();
-                match shadowed {
-                    Some(value) => {
-                        self.env.insert(iterator.clone(), value);
-                    }
-                    None => {
-                        self.env.remove(&iterator);
-                    }
-                }
-                match shadowed_reference {
-                    Some(place) => {
-                        self.reference_places.insert(iterator, place);
-                    }
-                    None => {
-                        self.reference_places.remove(&iterator);
-                    }
-                }
-                return outcome;
+                let indices = *start_index..*end_index;
+                return self.for_range(loop_stmt, [start, end], indices);
             }
             // Keep the already-evaluated bounds when the recurrence is abstract, so an
             // effectful bound is not visited twice.
-            self.unknown_after([start, end])
+            Self::unknown_after([start, end])
         } else {
             self.expr(&loop_stmt.iterable)
         };
         if iterable.flow != ComptimeEvalFlow::Normal {
             return iterable;
         }
+        self.for_unknown_iterable(loop_stmt, &iterable)
+    }
 
+    /// Runs a `for` loop over the integer range `indices` one turn at a time, so that what one
+    /// turn assigns is there for the next. `bounds` are the two evaluated ends of the range.
+    fn for_range(
+        &mut self,
+        loop_stmt: &ForLoopStmt,
+        bounds: [ComptimeEvalOutcome; 2],
+        indices: std::ops::Range<i64>,
+    ) -> ComptimeEvalOutcome {
+        let iterator: Symbol = loop_stmt.iter.clone().into();
+        let shadowed = self.env.get(&iterator).cloned();
+        let shadowed_reference = self.reference_places.remove(&iterator);
+        self.context.push_scope();
+        self.context
+            .declare(iterator.clone(), ComptimeValueFacts::default());
+
+        let mut index = indices.start;
+        let end_index = indices.end;
+        let mut outcome = Self::unknown_after(bounds);
+        while index < end_index {
+            if !self.context.take_loop_step() {
+                outcome.mark_unsupported();
+                break;
+            }
+            self.env.insert(
+                iterator.clone(),
+                ComptimeEvalValue::known(Value::Int(index)),
+            );
+            self.reference_places.remove(&iterator);
+            let body = self.block(&loop_stmt.body);
+            Self::carry_status(&mut outcome, &body);
+            match body.flow {
+                ComptimeEvalFlow::Normal | ComptimeEvalFlow::Continue => {}
+                ComptimeEvalFlow::Break => break,
+                ComptimeEvalFlow::Return => {
+                    outcome.flow = ComptimeEvalFlow::Return;
+                    outcome.value = body.value;
+                    break;
+                }
+                ComptimeEvalFlow::Indeterminate => {
+                    outcome.flow = ComptimeEvalFlow::Indeterminate;
+                    outcome.mark_unsupported();
+                    break;
+                }
+            }
+            index += 1;
+        }
+        self.context.pop_scope();
+        self.restore_shadowed_binding(iterator, shadowed, shadowed_reference);
+        outcome
+    }
+
+    /// A `for` loop whose turns cannot be run one by one. Its result is not known, so the loop
+    /// is reported as unsupported, but what its body may write is kept.
+    fn for_unknown_iterable(
+        &mut self,
+        loop_stmt: &ForLoopStmt,
+        iterable: &ComptimeEvalOutcome,
+    ) -> ComptimeEvalOutcome {
         // The iterable may be empty, so join the state after zero iterations with the state after
         // one abstract iteration. That retains writes through outer references while preventing
         // the loop variable and body-local declarations from escaping the loop.
@@ -2075,6 +2112,41 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         outcome
     }
 
+    /// Puts back what `name` was bound to before a scope that shadowed it, or removes the name
+    /// when it was not bound before.
+    fn restore_shadowed_binding(
+        &mut self,
+        name: Symbol,
+        value: Option<ComptimeEvalValue>,
+        reference_place: Option<ComptimeWritePlace>,
+    ) {
+        match value {
+            Some(value) => {
+                self.env.insert(name.clone(), value);
+            }
+            None => {
+                self.env.remove(&name);
+            }
+        }
+        match reference_place {
+            Some(place) => {
+                self.reference_places.insert(name, place);
+            }
+            None => {
+                self.reference_places.remove(&name);
+            }
+        }
+    }
+
+    /// Copies into `outcome` whether evaluating `child` was supported, and whether it asked for
+    /// the block to be refused.
+    fn carry_status(outcome: &mut ComptimeEvalOutcome, child: &ComptimeEvalOutcome) {
+        outcome.support.merge_from(child.support);
+        outcome
+            .unsupported_reason
+            .merge_from(child.unsupported_reason);
+        outcome.requires_refusal |= child.requires_refusal;
+    }
     fn loop_stmt(&mut self, loop_stmt: &LoopStmt) -> ComptimeEvalOutcome {
         // Unlike a `for`, a plain loop has no empty path. Execute until an explicit `break` or
         // `return`; the shared budget gives an unproven recurrence the same fail-closed outcome
@@ -2115,409 +2187,420 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             Expr::Identifier(id) if id.name.as_ref() == "false" => {
                 ComptimeEvalOutcome::known(Value::Bool(false))
             }
-            Expr::Identifier(id) => {
-                let mut value = self.env.get(&id.name).cloned().unwrap_or_default();
-                value.facts.merge_from(&self.value_facts(expr));
-                ComptimeEvalOutcome {
-                    value,
-                    ..Default::default()
-                }
-            }
+            Expr::Identifier(id) => self.identifier_expr(id),
             Expr::Number(number) => Self::number_literal(number)
-                .map(ComptimeEvalOutcome::known)
-                .unwrap_or_else(ComptimeEvalOutcome::unsupported),
-            Expr::EnumVariant(variant) => {
-                let values = variant
-                    .payload
-                    .iter()
-                    .flatten()
-                    .map(|value| self.expr(value))
-                    .collect::<Vec<_>>();
-                // Enum constants have no concrete representation in the transition value
-                // model. Do not let an enum-driven match and its local writes vanish merely
-                // because the legacy evaluator happens to continue to a later tail.
-                self.refusal_after(values)
-            }
+                .map_or_else(ComptimeEvalOutcome::unsupported, ComptimeEvalOutcome::known),
+            // Enum constants have no concrete representation in the transition value
+            // model. Do not let an enum-driven match and its local writes vanish merely
+            // because the legacy evaluator happens to continue to a later tail.
+            Expr::EnumVariant(variant) => self.refuse_exprs(variant.payload.iter().flatten()),
             Expr::SizeOf(size) => comptime_sizeof_bytes(&size.target_ty)
                 .map(Value::Int)
-                .map(ComptimeEvalOutcome::known)
-                .unwrap_or_else(ComptimeEvalOutcome::refusal),
+                .map_or_else(ComptimeEvalOutcome::refusal, ComptimeEvalOutcome::known),
             // Each evaluation is a fresh buffer holding the text and its NUL.
-            Expr::StringLiteral(literal) => {
-                let mut bytes = literal.value.as_bytes().to_vec();
-                bytes.push(0);
-                match self.heap_alloc(bytes) {
-                    Some(ptr) => ComptimeEvalOutcome::known(ptr),
-                    None => ComptimeEvalOutcome::unknown(),
-                }
-            }
-            Expr::MemorySpace(_) | Expr::MacroCall(_) => {
-                // The transition value model cannot faithfully represent these forms.  A raw
-                // memory-space or macro node also violates an earlier lowering invariant, but
-                // must still be live if it reaches this defensive interpreter boundary.
-                ComptimeEvalOutcome::refusal()
-            }
-            Expr::Transfer(transfer) => {
-                let value = self.expr(&transfer.expr);
-                self.refusal_after([value])
-            }
-            Expr::TransferPredicate(predicate) => {
-                let from = self.topology(&predicate.from);
-                let to = self.topology(&predicate.to);
-                let concrete = match (&from.value.concrete, &to.value.concrete) {
-                    (Some(Value::Topology(from)), Some(Value::Topology(to))) => {
-                        let from_memory = self.transfer_cost_graph.default_memory_for(from);
-                        let to_memory = self.transfer_cost_graph.default_memory_for(to);
-                        Some(Value::Bool(
-                            self.transfer_cost_graph
-                                .transfer_path(&from_memory, &to_memory)
-                                .is_some(),
-                        ))
-                    }
-                    _ => None,
-                };
-                let Some(concrete) = concrete else {
-                    // The transfer graph can answer reachability only for concrete topology
-                    // values. A runtime index must not be collapsed to the device kind and
-                    // silently make a predicate statement disappear before a later folded tail.
-                    // `refusal_after` still visits both operands, so an escaping write wins over
-                    // this generic refusal.
-                    return self.refusal_after([from, to]);
-                };
-                let mut outcome = self.unknown_after([from, to]);
-                outcome.value.concrete = Some(concrete);
-                outcome
-            }
-            Expr::FunctionCall(call) => {
-                let args = call.args.iter().map(|arg| self.expr(arg)).collect();
-                self.function_call(call, args)
-            }
-            Expr::IndirectCall(call) => {
-                let callee = self.expr(&call.callee);
-                let facts = callee.value.facts.clone();
-                let args = call.args.iter().map(|arg| self.expr(arg)).collect();
-                let mut outcome = self.callable_call(facts, args);
-                outcome.support.merge_from(callee.support);
-                outcome
-                    .unsupported_reason
-                    .merge_from(callee.unsupported_reason);
-                outcome.requires_refusal |= callee.requires_refusal;
-                outcome
-            }
-            Expr::Array(array) => {
-                let elements = array
-                    .elements
-                    .iter()
-                    .map(|element| self.expr(element))
-                    .collect();
-                self.array(elements)
-            }
-            Expr::MemberAccess(access) => {
-                let base = self.expr(&access.base);
-                self.member_access(base, &access.member)
-            }
-            Expr::IndexAccess(access) => {
-                let base = self.expr(&access.base);
-                let index = self.expr(&access.index);
-                self.index_access(base, index)
-            }
-            Expr::MethodCall(call) => {
-                let mut children = vec![self.expr(&call.base)];
-                children.extend(call.args.iter().map(|arg| self.expr(arg)));
-                // Semantic checking normally rewrites a method call to the resolved function,
-                // extent access, or intrinsic form. A remaining raw method node has no
-                // transition-model semantics, but its eager receiver and arguments still count.
-                self.refusal_after(children)
-            }
-            Expr::BinaryOp(op) => {
-                let lhs = self.expr(&op.lhs);
-                let rhs = self.expr(&op.rhs);
-                self.binary(lhs, rhs, &op.op)
-            }
-            Expr::RelationalOp(op) => {
-                let lhs = self.expr(&op.lhs);
-                let rhs = self.expr(&op.rhs);
-                let mut outcome = self.unknown_after([lhs.clone(), rhs.clone()]);
-                outcome.value.concrete = lhs
-                    .value
-                    .concrete
-                    .as_ref()
-                    .zip(rhs.value.concrete.as_ref())
-                    .and_then(|(lhs, rhs)| self.relational_value(lhs, rhs, &op.op));
-                if matches!(
-                    (&lhs.value.concrete, &rhs.value.concrete),
-                    (Some(Value::Topology(_)), Some(Value::Topology(_)))
-                ) && outcome.value.concrete.is_none()
-                {
-                    // Neither an unequal topology nor an unresolved slice index may be guessed.
-                    // Preserve the operands' effects, then reject the enclosing fold.
-                    outcome.mark_unsupported();
-                }
-                outcome
-            }
-            Expr::LogicalOp(op) => {
-                let lhs = self.expr(&op.lhs);
-                if lhs.flow != ComptimeEvalFlow::Normal {
-                    return lhs;
-                }
-                match (&lhs.value.concrete, &op.op) {
-                    (Some(Value::Bool(false)), LogicalOp::And) => {
-                        let mut outcome = ComptimeEvalOutcome::known(Value::Bool(false));
-                        outcome.support.merge_from(lhs.support);
-                        outcome
-                            .unsupported_reason
-                            .merge_from(lhs.unsupported_reason);
-                        outcome.requires_refusal |= lhs.requires_refusal;
-                        return outcome;
-                    }
-                    (Some(Value::Bool(true)), LogicalOp::Or) => {
-                        let mut outcome = ComptimeEvalOutcome::known(Value::Bool(true));
-                        outcome.support.merge_from(lhs.support);
-                        outcome
-                            .unsupported_reason
-                            .merge_from(lhs.unsupported_reason);
-                        outcome.requires_refusal |= lhs.requires_refusal;
-                        return outcome;
-                    }
-                    _ => {}
-                }
-                let rhs = self.expr(&op.rhs);
-                let mut outcome = self.unknown_after([lhs.clone(), rhs.clone()]);
-                outcome.value.concrete = match (&lhs.value.concrete, &rhs.value.concrete, &op.op) {
-                    (Some(Value::Bool(a)), Some(Value::Bool(b)), LogicalOp::And) => {
-                        Some(Value::Bool(*a && *b))
-                    }
-                    (Some(Value::Bool(a)), Some(Value::Bool(b)), LogicalOp::Or) => {
-                        Some(Value::Bool(*a || *b))
-                    }
-                    _ => None,
-                };
-                outcome
-            }
-            Expr::UnaryOp(op) => {
-                let inner = self.expr(&op.expr);
-                let mut outcome = self.unknown_after([inner.clone()]);
-                outcome.value.concrete = match (&inner.value.concrete, &op.op) {
-                    (Some(Value::Bool(value)), UnaryOp::Not) => Some(Value::Bool(!value)),
-                    (Some(Value::Int(value)), UnaryOp::Neg) => value.checked_neg().map(Value::Int),
-                    (Some(Value::Number(value)), UnaryOp::Neg) => Some(Value::Number(-value)),
-                    _ => None,
-                };
-                outcome
-            }
-            Expr::Borrow(borrow) => {
-                let inner = self.expr(&borrow.expr);
-                let mut outcome = self.unknown_after([inner.clone()]);
-                outcome.value.facts = inner.value.facts;
-                outcome.value.aggregate = inner.value.aggregate;
-                if borrow.is_mut {
-                    outcome
-                        .value
-                        .facts
-                        .merge_from(&self.place_facts(&borrow.expr));
-                }
-                outcome
-            }
-            Expr::Dereference(deref) => {
-                let inner = self.expr(&deref.expr);
-                let place = if let Expr::Identifier(id) = &*deref.expr {
-                    self.reference_places.get(&id.name)
-                } else {
-                    None
-                };
-                if matches!(place, Some(ComptimeWritePlace::Unknown)) {
-                    return self.refusal_after([inner]);
-                }
-                let referenced = place.and_then(|place| self.read_place(place));
-                let mut outcome = self.unknown_after([inner.clone()]);
-                // Direct calls install the pointee value in their parameter frame. A
-                // dereference is the boundary at which that private representation becomes an
-                // ordinary value again; a borrow expression itself remains non-foldable.
-                if let Some(referenced) = referenced {
-                    outcome.value = referenced;
-                    outcome.value.facts.merge_from(&inner.value.facts);
-                } else {
-                    outcome.value.concrete = inner.value.concrete;
-                    outcome.value.facts = inner.value.facts;
-                    outcome.value.aggregate = inner.value.aggregate;
-                }
-                outcome
-            }
-            Expr::UnsafeBlock(block) => self.block_with_tail(&block.stmts, block.ret.as_deref()),
-            Expr::ComptimeBlock(block) => self.block_with_tail(&block.stmts, block.ret.as_deref()),
-            Expr::StructInit(init) => {
-                let fields = init
-                    .fields
-                    .iter()
-                    .map(|(name, value)| (name.clone(), self.expr(value), self.place_facts(value)))
-                    .collect::<Vec<_>>();
-                let mut outcome = self.unknown_after(
-                    fields
-                        .iter()
-                        .map(|(_, outcome, _)| outcome.clone())
-                        .collect::<Vec<_>>(),
-                );
-                let target: Symbol = format!("{}_call", init.name).into();
-                if !init.name.starts_with("Closure_") {
-                    // This abstract structure is deliberately not a concrete legacy `Value`:
-                    // its components are available for local member/provenance reasoning, but
-                    // an ordinary struct literal cannot itself replace a comptime block until
-                    // the fold-value representation can spell structs back into source.
-                    outcome.value.aggregate = Some(ComptimeAggregateValue::Struct(
-                        fields
-                            .iter()
-                            .map(|(name, outcome, _)| (name.clone(), outcome.value.clone()))
-                            .collect(),
-                    ));
-                }
-                if init.name.starts_with("Closure_") && self.function_bodies.contains(&target) {
-                    let mut environment = ComptimeValueFacts::default();
-                    for (_, field, place) in fields {
-                        environment.merge_from(&field.value.facts);
-                        // A generated closure environment retains the captured place. This is
-                        // deliberately distinct from an ordinary struct literal, whose fields are
-                        // values and do not make every outer scalar into a mutable reference.
-                        environment
-                            .reference_origins
-                            .extend(place.reference_origins.iter().cloned());
-                        environment
-                            .captured_place_origins
-                            .extend(place.reference_origins);
-                    }
-                    outcome.value.facts.callable_targets.insert(target.clone());
-                    outcome
-                        .value
-                        .facts
-                        .callable_environments
-                        .insert(target, environment.clone());
-                    // The closure value itself transports its environment. Preserve that fact
-                    // through a borrow of the closure object so the generated `_env` parameter
-                    // and its captured-field bindings still name the original outer place.
-                    outcome.value.facts.merge_from(&environment);
-                }
-                outcome
-            }
-            Expr::Topology(topology) => self.topology(&topology.top),
-            Expr::If(if_expr) => self.if_expr(if_expr),
-            Expr::Range(range) => {
-                let start = self.expr(&range.start);
-                let end = self.expr(&range.end);
-                // A range used as a value has no spelling in the legacy `Value` model. The
-                // `for` owner handles its integer bounds directly above; every other use must
-                // evaluate both bounds for effects and then refuse rather than silently vanish.
-                self.refusal_after([start, end])
-            }
-            Expr::Match(match_expr) => self.match_expr(match_expr),
-            Expr::Grad(grad) => {
-                let args = grad
-                    .args
-                    .iter()
-                    .map(|arg| self.expr(arg))
-                    .collect::<Vec<_>>();
-                // Differentiation produces a transformed runtime computation, not a value the
-                // transition model can represent. Eager operands still retain their effects.
-                self.refusal_after(args)
-            }
-            Expr::Vjp(vjp) => {
-                let mut children = vjp
-                    .args
-                    .iter()
-                    .map(|arg| self.expr(arg))
-                    .collect::<Vec<_>>();
-                children.push(self.expr(&vjp.cotangent));
-                self.refusal_after(children)
-            }
-            Expr::Jvp(jvp) => {
-                let mut children = jvp
-                    .args
-                    .iter()
-                    .map(|arg| self.expr(arg))
-                    .collect::<Vec<_>>();
-                children.push(self.expr(&jvp.tangent));
-                self.refusal_after(children)
-            }
-            Expr::SpawnOn(spawn) => {
-                let topology = self.topology(&spawn.top);
-                let body = self.block_with_tail(&spawn.stmts, spawn.ret.as_deref());
-                self.refusal_after([topology, body])
-            }
-            Expr::VecMacro(vector) => {
-                let elements = vector
-                    .elements
-                    .iter()
-                    .map(|element| self.expr(element))
-                    .collect::<Vec<_>>();
-                // Checked source normally lowers `vec![..]` into allocation and `push` calls
-                // before this interpreter runs. Preserve the same fail-closed rule for a raw
-                // macro node too, so a changed lowering order cannot make an allocation-backed
-                // vector disappear with a comptime block.
-                self.refusal_after(elements)
-            }
+            Expr::StringLiteral(literal) => self.string_literal_expr(literal),
+            // The transition value model cannot faithfully represent these forms.  A raw
+            // memory-space or macro node also violates an earlier lowering invariant, but
+            // must still be live if it reaches this defensive interpreter boundary.
+            //
             // A closure body is deferred until invocation. Checked closures are normally lowered
             // to a generated `Closure_N` struct before this point. If an unlowered literal
             // reaches this late boundary, it has no concrete callable/environment model, so it
             // must refuse the fold rather than letting a later tail erase it. Deliberately do not
             // interpret the body here: creation alone does not run a closure.
-            Expr::Closure(_) => ComptimeEvalOutcome::refusal(),
-            Expr::AsCast(cast) => {
-                let value = self.expr(&cast.expr);
-                let concrete = match (&cast.source_ty, &cast.target_ty) {
-                    // `*const i8` to `*mut i8` and back: the same buffer. Only a pointer is a
-                    // `Ptr`, so this holds in a body the checker has not seen yet too.
-                    (_, Type::Pointer(..)) => value
-                        .value
-                        .concrete
-                        .clone()
-                        .filter(|v| matches!(v, Value::Ptr { .. })),
-                    (Some(Type::Scalar(from)), Type::Scalar(to)) => value
-                        .value
-                        .concrete
-                        .as_ref()
-                        .and_then(|v| cast_number(v, from, to)),
-                    _ => None,
-                };
-                // A cast the value model cannot answer exactly refuses the whole block, rather
-                // than letting a later tail fold without it.
-                let Some(concrete) = concrete else {
-                    return self.refusal_after([value]);
-                };
-                let mut outcome = self.unknown_after([value]);
-                outcome.value.concrete = Some(concrete);
-                outcome
+            Expr::MemorySpace(_) | Expr::MacroCall(_) | Expr::Closure(_) => {
+                ComptimeEvalOutcome::refusal()
             }
-            Expr::Print(print) => {
-                let args = print
-                    .args
-                    .iter()
-                    .map(|arg| self.expr(arg))
-                    .collect::<Vec<_>>();
-                // Printing is an observable run-time effect. A comptime block disappears, so a
-                // local print cannot be left to the legacy evaluator to drop before folding a
-                // later tail; arguments are still evaluated first for escaping writes.
-                self.refusal_after(args)
+            Expr::Transfer(transfer) => self.refuse_exprs([&*transfer.expr]),
+            Expr::TransferPredicate(predicate) => self.transfer_predicate_expr(predicate),
+            Expr::FunctionCall(call) => self.function_call_expr(call),
+            Expr::IndirectCall(call) => self.indirect_call_expr(call),
+            Expr::Array(array) => self.array_expr(array),
+            Expr::MemberAccess(access) => self.member_access_expr(access),
+            Expr::IndexAccess(access) => self.index_access_expr(access),
+            // Semantic checking normally rewrites a method call to the resolved function,
+            // extent access, or intrinsic form. A remaining raw method node has no
+            // transition-model semantics, but its eager receiver and arguments still count.
+            Expr::MethodCall(call) => {
+                self.refuse_exprs(std::iter::once(&*call.base).chain(&call.args))
             }
-            Expr::Println(print) => {
-                let args = print
-                    .args
-                    .iter()
-                    .map(|arg| self.expr(arg))
-                    .collect::<Vec<_>>();
-                self.refusal_after(args)
-            }
-            Expr::InlineMlir(mlir) => {
-                let mut children = mlir
-                    .inputs
-                    .iter()
-                    .map(|(_, value, _)| self.expr(value))
-                    .collect::<Vec<_>>();
-                for clobber in &mlir.clobbers {
-                    children.push(self.expr(clobber));
-                    self.context
-                        .note_escaping_write(self.place_facts(clobber).reference_origins);
-                }
-                self.refusal_after(children)
-            }
+            Expr::BinaryOp(op) => self.binary_op_expr(op),
+            Expr::RelationalOp(op) => self.relational_op_expr(op),
+            Expr::LogicalOp(op) => self.logical_op_expr(op),
+            Expr::UnaryOp(op) => self.unary_op_expr(op),
+            Expr::Borrow(borrow) => self.borrow_expr(borrow),
+            Expr::Dereference(deref) => self.dereference_expr(deref),
+            Expr::UnsafeBlock(block) => self.block_with_tail(&block.stmts, block.ret.as_deref()),
+            Expr::ComptimeBlock(block) => self.block_with_tail(&block.stmts, block.ret.as_deref()),
+            Expr::StructInit(init) => self.struct_init_expr(init),
+            Expr::Topology(topology) => self.topology(&topology.top),
+            Expr::If(if_expr) => self.if_expr(if_expr),
+            // A range used as a value has no spelling in the legacy `Value` model. The
+            // `for` owner handles its integer bounds directly; every other use must
+            // evaluate both bounds for effects and then refuse rather than silently vanish.
+            Expr::Range(range) => self.refuse_exprs([&*range.start, &*range.end]),
+            Expr::Match(match_expr) => self.match_expr(match_expr),
+            // Differentiation produces a transformed runtime computation, not a value the
+            // transition model can represent. Eager operands still retain their effects.
+            Expr::Grad(grad) => self.refuse_exprs(&grad.args),
+            Expr::Vjp(vjp) => self.refuse_exprs(vjp.args.iter().chain([&*vjp.cotangent])),
+            Expr::Jvp(jvp) => self.refuse_exprs(jvp.args.iter().chain([&*jvp.tangent])),
+            Expr::SpawnOn(spawn) => self.spawn_on_expr(spawn),
+            // Checked source normally lowers `vec![..]` into allocation and `push` calls
+            // before this interpreter runs. Preserve the same fail-closed rule for a raw
+            // macro node too, so a changed lowering order cannot make an allocation-backed
+            // vector disappear with a comptime block.
+            Expr::VecMacro(vector) => self.refuse_exprs(&vector.elements),
+            Expr::AsCast(cast) => self.as_cast_expr(cast),
+            // Printing is an observable run-time effect. A comptime block disappears, so a
+            // local print cannot be left to the legacy evaluator to drop before folding a
+            // later tail; arguments are still evaluated first for escaping writes.
+            Expr::Print(print) => self.refuse_exprs(&print.args),
+            Expr::Println(print) => self.refuse_exprs(&print.args),
+            Expr::InlineMlir(mlir) => self.inline_mlir_expr(mlir),
         }
+    }
+
+    /// Evaluates `children` in order, so that what they write is kept, then refuses to fold the
+    /// block. This is the rule for every expression whose value the interpreter cannot hold.
+    fn refuse_exprs<'e>(
+        &mut self,
+        children: impl IntoIterator<Item = &'e Expr>,
+    ) -> ComptimeEvalOutcome {
+        let children = children
+            .into_iter()
+            .map(|child| self.expr(child))
+            .collect::<Vec<_>>();
+        Self::refusal_after(children)
+    }
+
+    /// A variable: its value when one is known, and what is known about where it came from.
+    fn identifier_expr(&self, id: &IdentifierExpr) -> ComptimeEvalOutcome {
+        let mut value = self.env.get(&id.name).cloned().unwrap_or_default();
+        value.facts.merge_from(&self.identifier_facts(&id.name));
+        ComptimeEvalOutcome {
+            value,
+            ..Default::default()
+        }
+    }
+    /// A string literal: a pointer to a new byte buffer that holds the text and a NUL after it.
+    fn string_literal_expr(&mut self, literal: &StringLiteralExpr) -> ComptimeEvalOutcome {
+        let mut bytes = literal.value.as_bytes().to_vec();
+        bytes.push(0);
+        match self.heap_alloc(bytes) {
+            Some(ptr) => ComptimeEvalOutcome::known(ptr),
+            None => ComptimeEvalOutcome::unknown(),
+        }
+    }
+
+    /// Whether data can be moved from one topology to another. Known only when both are known.
+    fn transfer_predicate_expr(
+        &mut self,
+        predicate: &TransferPredicateExpr,
+    ) -> ComptimeEvalOutcome {
+        let from = self.topology(&predicate.from);
+        let to = self.topology(&predicate.to);
+        let concrete = match (&from.value.concrete, &to.value.concrete) {
+            (Some(Value::Topology(from)), Some(Value::Topology(to))) => {
+                let from_memory = self.transfer_cost_graph.default_memory_for(from);
+                let to_memory = self.transfer_cost_graph.default_memory_for(to);
+                Some(Value::Bool(
+                    self.transfer_cost_graph
+                        .transfer_path(&from_memory, &to_memory)
+                        .is_some(),
+                ))
+            }
+            _ => None,
+        };
+        let Some(concrete) = concrete else {
+            // The transfer graph can answer reachability only for concrete topology
+            // values. A runtime index must not be collapsed to the device kind and
+            // silently make a predicate statement disappear before a later folded tail.
+            // `refusal_after` still visits both operands, so an escaping write wins over
+            // this generic refusal.
+            return Self::refusal_after([from, to]);
+        };
+        let mut outcome = Self::unknown_after([from, to]);
+        outcome.value.concrete = Some(concrete);
+        outcome
+    }
+
+    /// A call by name: evaluates the arguments in order, then makes the call.
+    fn function_call_expr(&mut self, call: &FunctionCallExpr) -> ComptimeEvalOutcome {
+        let args = call.args.iter().map(|arg| self.expr(arg)).collect();
+        self.function_call(call, args)
+    }
+
+    /// A call through a value, such as a closure: evaluates the callee, then the arguments, then
+    /// calls whatever the callee may be.
+    fn indirect_call_expr(&mut self, call: &IndirectCallExpr) -> ComptimeEvalOutcome {
+        let callee = self.expr(&call.callee);
+        let facts = callee.value.facts.clone();
+        let args = call.args.iter().map(|arg| self.expr(arg)).collect();
+        let mut outcome = self.callable_call(&facts, args);
+        outcome.support.merge_from(callee.support);
+        outcome
+            .unsupported_reason
+            .merge_from(callee.unsupported_reason);
+        outcome.requires_refusal |= callee.requires_refusal;
+        outcome
+    }
+
+    /// An array literal: evaluates the elements in order.
+    fn array_expr(&mut self, array: &ArrayExpr) -> ComptimeEvalOutcome {
+        let elements = array
+            .elements
+            .iter()
+            .map(|element| self.expr(element))
+            .collect();
+        Self::array(elements)
+    }
+
+    /// A field read, `base.member`.
+    fn member_access_expr(&mut self, access: &MemberAccessExpr) -> ComptimeEvalOutcome {
+        let base = self.expr(&access.base);
+        Self::member_access(base, &access.member)
+    }
+
+    /// An element read, `base[index]`.
+    fn index_access_expr(&mut self, access: &IndexAccessExpr) -> ComptimeEvalOutcome {
+        let base = self.expr(&access.base);
+        let index = self.expr(&access.index);
+        self.index_access(base, index)
+    }
+
+    /// An arithmetic operator: evaluates the left side, then the right, then applies it.
+    fn binary_op_expr(&mut self, op: &BinaryOpExpr) -> ComptimeEvalOutcome {
+        let lhs = self.expr(&op.lhs);
+        let rhs = self.expr(&op.rhs);
+        Self::binary(lhs, rhs, &op.op)
+    }
+
+    /// A comparison: evaluates the left side, then the right, then compares them.
+    fn relational_op_expr(&mut self, op: &RelationalOpExpr) -> ComptimeEvalOutcome {
+        let lhs = self.expr(&op.lhs);
+        let rhs = self.expr(&op.rhs);
+        let mut outcome = Self::unknown_after([lhs.clone(), rhs.clone()]);
+        outcome.value.concrete = lhs
+            .value
+            .concrete
+            .as_ref()
+            .zip(rhs.value.concrete.as_ref())
+            .and_then(|(lhs, rhs)| self.relational_value(lhs, rhs, &op.op));
+        if matches!(
+            (&lhs.value.concrete, &rhs.value.concrete),
+            (Some(Value::Topology(_)), Some(Value::Topology(_)))
+        ) && outcome.value.concrete.is_none()
+        {
+            // Neither an unequal topology nor an unresolved slice index may be guessed.
+            // Preserve the operands' effects, then reject the enclosing fold.
+            outcome.mark_unsupported();
+        }
+        outcome
+    }
+
+    /// `&&` or `||`. The right side is not evaluated when the left side already decides the
+    /// answer.
+    fn logical_op_expr(&mut self, op: &LogicalOpExpr) -> ComptimeEvalOutcome {
+        let lhs = self.expr(&op.lhs);
+        if lhs.flow != ComptimeEvalFlow::Normal {
+            return lhs;
+        }
+        match (&lhs.value.concrete, &op.op) {
+            (Some(Value::Bool(false)), LogicalOp::And) => {
+                let mut outcome = ComptimeEvalOutcome::known(Value::Bool(false));
+                outcome.support.merge_from(lhs.support);
+                outcome
+                    .unsupported_reason
+                    .merge_from(lhs.unsupported_reason);
+                outcome.requires_refusal |= lhs.requires_refusal;
+                return outcome;
+            }
+            (Some(Value::Bool(true)), LogicalOp::Or) => {
+                let mut outcome = ComptimeEvalOutcome::known(Value::Bool(true));
+                outcome.support.merge_from(lhs.support);
+                outcome
+                    .unsupported_reason
+                    .merge_from(lhs.unsupported_reason);
+                outcome.requires_refusal |= lhs.requires_refusal;
+                return outcome;
+            }
+            _ => {}
+        }
+        let rhs = self.expr(&op.rhs);
+        let mut outcome = Self::unknown_after([lhs.clone(), rhs.clone()]);
+        outcome.value.concrete = match (&lhs.value.concrete, &rhs.value.concrete, &op.op) {
+            (Some(Value::Bool(a)), Some(Value::Bool(b)), LogicalOp::And) => {
+                Some(Value::Bool(*a && *b))
+            }
+            (Some(Value::Bool(a)), Some(Value::Bool(b)), LogicalOp::Or) => {
+                Some(Value::Bool(*a || *b))
+            }
+            _ => None,
+        };
+        outcome
+    }
+
+    /// `!x` or `-x`.
+    fn unary_op_expr(&mut self, op: &UnaryOpExpr) -> ComptimeEvalOutcome {
+        let inner = self.expr(&op.expr);
+        let mut outcome = Self::unknown_after([inner.clone()]);
+        outcome.value.concrete = match (&inner.value.concrete, &op.op) {
+            (Some(Value::Bool(value)), UnaryOp::Not) => Some(Value::Bool(!value)),
+            (Some(Value::Int(value)), UnaryOp::Neg) => value.checked_neg().map(Value::Int),
+            (Some(Value::Number(value)), UnaryOp::Neg) => Some(Value::Number(-value)),
+            _ => None,
+        };
+        outcome
+    }
+
+    /// `&x` or `&mut x`. A borrow has no value of its own here; it carries what is known about
+    /// the place it refers to.
+    fn borrow_expr(&mut self, borrow: &BorrowExpr) -> ComptimeEvalOutcome {
+        let inner = self.expr(&borrow.expr);
+        let mut outcome = Self::unknown_after([inner.clone()]);
+        outcome.value.facts = inner.value.facts;
+        outcome.value.aggregate = inner.value.aggregate;
+        if borrow.is_mut {
+            outcome
+                .value
+                .facts
+                .merge_from(&self.place_facts(&borrow.expr));
+        }
+        outcome
+    }
+
+    /// `*p`: the value of the place `p` refers to, when that place is known.
+    fn dereference_expr(&mut self, deref: &DereferenceExpr) -> ComptimeEvalOutcome {
+        let inner = self.expr(&deref.expr);
+        let place = if let Expr::Identifier(id) = &*deref.expr {
+            self.reference_places.get(&id.name)
+        } else {
+            None
+        };
+        if matches!(place, Some(ComptimeWritePlace::Unknown)) {
+            return Self::refusal_after([inner]);
+        }
+        let referenced = place.and_then(|place| self.read_place(place));
+        let mut outcome = Self::unknown_after([inner.clone()]);
+        // Direct calls install the pointee value in their parameter frame. A
+        // dereference is the boundary at which that private representation becomes an
+        // ordinary value again; a borrow expression itself remains non-foldable.
+        if let Some(referenced) = referenced {
+            outcome.value = referenced;
+            outcome.value.facts.merge_from(&inner.value.facts);
+        } else {
+            outcome.value.concrete = inner.value.concrete;
+            outcome.value.facts = inner.value.facts;
+            outcome.value.aggregate = inner.value.aggregate;
+        }
+        outcome
+    }
+
+    /// A struct literal. A generated `Closure_N` struct also records which function the closure
+    /// calls and what it captured.
+    fn struct_init_expr(&mut self, init: &StructInitExpr) -> ComptimeEvalOutcome {
+        let fields = init
+            .fields
+            .iter()
+            .map(|(name, value)| (name.clone(), self.expr(value), self.place_facts(value)))
+            .collect::<Vec<_>>();
+        let mut outcome = Self::unknown_after(
+            fields
+                .iter()
+                .map(|(_, outcome, _)| outcome.clone())
+                .collect::<Vec<_>>(),
+        );
+        let target: Symbol = format!("{}_call", init.name).into();
+        if !init.name.starts_with("Closure_") {
+            // This abstract structure is deliberately not a concrete legacy `Value`:
+            // its components are available for local member/provenance reasoning, but
+            // an ordinary struct literal cannot itself replace a comptime block until
+            // the fold-value representation can spell structs back into source.
+            outcome.value.aggregate = Some(ComptimeAggregateValue::Struct(
+                fields
+                    .iter()
+                    .map(|(name, outcome, _)| (name.clone(), outcome.value.clone()))
+                    .collect(),
+            ));
+        }
+        if init.name.starts_with("Closure_") && self.function_bodies.contains(&target) {
+            let mut environment = ComptimeValueFacts::default();
+            for (_, field, place) in fields {
+                environment.merge_from(&field.value.facts);
+                // A generated closure environment retains the captured place. This is
+                // deliberately distinct from an ordinary struct literal, whose fields are
+                // values and do not make every outer scalar into a mutable reference.
+                environment
+                    .reference_origins
+                    .extend(place.reference_origins.iter().cloned());
+                environment
+                    .captured_place_origins
+                    .extend(place.reference_origins);
+            }
+            outcome.value.facts.callable_targets.insert(target.clone());
+            outcome
+                .value
+                .facts
+                .callable_environments
+                .insert(target, environment.clone());
+            // The closure value itself transports its environment. Preserve that fact
+            // through a borrow of the closure object so the generated `_env` parameter
+            // and its captured-field bindings still name the original outer place.
+            outcome.value.facts.merge_from(&environment);
+        }
+        outcome
+    }
+
+    /// A `spawn on(...)` block: evaluated for what it writes, then the fold is refused.
+    fn spawn_on_expr(&mut self, spawn: &SpawnOnExpr) -> ComptimeEvalOutcome {
+        let topology = self.topology(&spawn.top);
+        let body = self.block_with_tail(&spawn.stmts, spawn.ret.as_deref());
+        Self::refusal_after([topology, body])
+    }
+
+    /// `value as T`. A cast with no exact answer here refuses the fold.
+    fn as_cast_expr(&mut self, cast: &AsCastExpr) -> ComptimeEvalOutcome {
+        let value = self.expr(&cast.expr);
+        let concrete = match (&cast.source_ty, &cast.target_ty) {
+            // `*const i8` to `*mut i8` and back: the same buffer. Only a pointer is a
+            // `Ptr`, so this holds in a body the checker has not seen yet too.
+            (_, Type::Pointer(..)) => value
+                .value
+                .concrete
+                .clone()
+                .filter(|v| matches!(v, Value::Ptr { .. })),
+            (Some(Type::Scalar(from)), Type::Scalar(to)) => value
+                .value
+                .concrete
+                .as_ref()
+                .and_then(|v| cast_number(v, from, to)),
+            _ => None,
+        };
+        // A cast the value model cannot answer exactly refuses the whole block, rather
+        // than letting a later tail fold without it.
+        let Some(concrete) = concrete else {
+            return Self::refusal_after([value]);
+        };
+        let mut outcome = Self::unknown_after([value]);
+        outcome.value.concrete = Some(concrete);
+        outcome
+    }
+
+    /// Inline MLIR: its inputs and clobbers are evaluated, each clobber counts as a write, and the
+    /// fold is refused.
+    fn inline_mlir_expr(&mut self, mlir: &InlineMlirExpr) -> ComptimeEvalOutcome {
+        let mut children = mlir
+            .inputs
+            .iter()
+            .map(|(_, value, _)| self.expr(value))
+            .collect::<Vec<_>>();
+        for clobber in &mlir.clobbers {
+            children.push(self.expr(clobber));
+            self.context
+                .note_escaping_write(self.place_facts(clobber).reference_origins);
+        }
+        Self::refusal_after(children)
     }
 
     fn topology(&mut self, topology: &Topology) -> ComptimeEvalOutcome {
@@ -2525,7 +2608,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             Topology::NPU(index) | Topology::AccCore(index) | Topology::GPU(index) => {
                 let index = self.expr(index);
                 let index_is_concrete = index.value.concrete.is_some();
-                let mut outcome = self.unknown_after([index]);
+                let mut outcome = Self::unknown_after([index]);
                 if index_is_concrete && outcome.support.is_supported() {
                     outcome.value.concrete = Some(Value::Topology(topology.clone()));
                 }
@@ -2538,7 +2621,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                 let components_are_concrete = base.value.concrete.is_some()
                     && start.value.concrete.is_some()
                     && end.value.concrete.is_some();
-                let mut outcome = self.unknown_after([base, start, end]);
+                let mut outcome = Self::unknown_after([base, start, end]);
                 if components_are_concrete && outcome.support.is_supported() {
                     outcome.value.concrete = Some(Value::Topology(topology.clone()));
                 }
@@ -2563,7 +2646,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
 fn comptime_sizeof_bytes(ty: &Type) -> Option<i64> {
     match ty {
         Type::Scalar(element) => {
-            crate::layout::scalar_size_align(element).map(|(size, _)| size as i64)
+            crate::layout::scalar_size_align(element).and_then(|(size, _)| i64::try_from(size).ok())
         }
         Type::Pointer(..) | Type::Borrow { .. } | Type::Ref(..) => Some(8),
         _ => None,
@@ -2584,22 +2667,32 @@ fn cast_number(value: &Value, from: &ElementType, to: &ElementType) -> Option<Va
             return None;
         };
         let (lo, hi) = int_range(from)?;
-        if (*i as i128) < lo || (*i as i128) > hi {
+        if i128::from(*i) < lo || i128::from(*i) > hi {
             return None;
         }
     }
     if to.is_float() {
         let x = value.as_f64()?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a cast to `f32` rounds to the nearest `f32`, as the generated code does"
+        )]
+        let as_f32 = f64::from(x as f32);
         return Some(Value::Number(if *to == ElementType::F32 {
-            x as f32 as f64
+            as_f32
         } else {
             x
         }));
     }
     let (lo, hi) = int_range(to)?;
     let whole = match value {
-        Value::Int(i) => *i as i128,
+        Value::Int(i) => i128::from(*i),
         Value::Number(n) if n.is_finite() => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "the float is whole already; one too big for an `i128` becomes the \
+                          largest `i128`, which the range check below turns away"
+            )]
             let t = n.trunc() as i128;
             if t < lo || t > hi {
                 return None;
@@ -2610,6 +2703,15 @@ fn cast_number(value: &Value, from: &ElementType, to: &ElementType) -> Option<Va
     };
     let wrapped = (whole - lo).rem_euclid(hi - lo + 1) + lo;
     i64::try_from(wrapped).ok().map(Value::Int)
+}
+
+/// Whether two floats are the same value, the way `==` in a Vx program compares them.
+#[allow(
+    clippy::float_cmp,
+    reason = "this evaluates the program's own `==` on floats, which compares exactly"
+)]
+fn floats_equal(left: f64, right: f64) -> bool {
+    left == right
 }
 
 /// The smallest and largest value of an integer type of at most 64 bits.
@@ -2623,8 +2725,17 @@ fn int_range(ty: &ElementType) -> Option<(i128, i128)> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
+    use crate::syntax::{
+        AssignStmt, ClosureExpr, ComptimeBlockExpr, ExprStmtStmt, LetDeclStmt, MacroCallStmt,
+        MethodCallExpr, Span, TokenTree,
+    };
 
     #[test]
     fn unlowered_closure_refuses_without_executing_its_deferred_body() {

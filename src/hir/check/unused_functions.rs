@@ -125,7 +125,7 @@ fn names_in_expr(e: &Expr, out: &mut Vec<String>) {
 fn names_in_topology(top: &Topology, out: &mut Vec<String>) {
     match top {
         Topology::NPU(e) | Topology::AccCore(e) | Topology::GPU(e) => {
-            visit_expr(e, &mut |e| names_in_expr(e, out))
+            visit_expr(e, &mut |e| names_in_expr(e, out));
         }
         Topology::Slice(base, start, end) => {
             names_in_topology(base, out);

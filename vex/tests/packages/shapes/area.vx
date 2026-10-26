@@ -1,0 +1,14 @@
+//===- area.vx - Vx Package Tool --------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A library package that imports from another package, `numbers`.
+
+import numbers::twice;
+
+fn area_of_two_squares(side : i64) -> i64 {
+  return twice(side * side);
+}

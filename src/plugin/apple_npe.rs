@@ -15,6 +15,7 @@
 use super::hardware_trait::{mlir, PluginError, TensorLayout, TopologyID, VxHardwarePlugin};
 use std::borrow::Cow;
 
+/// The plugin that runs tensor work on the Apple Neural Engine.
 pub struct AppleNPEPlugin;
 
 impl VxHardwarePlugin for AppleNPEPlugin {
@@ -25,7 +26,8 @@ impl VxHardwarePlugin for AppleNPEPlugin {
     fn target_topology(&self) -> TopologyID {
         // The ANE's runtime dispatch id, from the single source of truth in `arch`, so the
         // plugin is keyed by the same number codegen stamps on `vx.spawn topology(N)`.
-        crate::arch::topology_dispatch_id(&crate::syntax::Topology::ANE) as TopologyID
+        // A dispatch id is never negative, so this changes only the type.
+        crate::arch::topology_dispatch_id(&crate::syntax::Topology::ANE).cast_unsigned()
     }
 
     fn preferred_tensor_layout(&self) -> TensorLayout {

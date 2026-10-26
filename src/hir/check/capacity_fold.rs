@@ -31,9 +31,11 @@ use std::collections::{BTreeMap, HashMap};
 /// One resolved call a function makes, as its capacity summary records it.
 #[derive(Debug, Clone)]
 pub struct CallEdge {
+    /// The name of the function being called.
     pub callee: String,
     /// Bytes still resident in each space when control transfers, granule-rounded.
     pub live: BTreeMap<String, u64>,
+    /// Where the call is written in the source.
     pub span: crate::syntax::Span,
 }
 
@@ -41,9 +43,11 @@ pub struct CallEdge {
 /// makes with what stays live across each. The unit the cross-call fold reads.
 #[derive(Debug, Clone)]
 pub struct FnCapacitySummary {
+    /// The name of the function this summary describes.
     pub name: String,
     /// Peak resident bytes per space over this function's own placements.
     pub self_peak: BTreeMap<String, u64>,
+    /// The calls the function makes, in source order.
     pub calls: Vec<CallEdge>,
 }
 
@@ -54,9 +58,11 @@ struct SpaceBudget {
     overcommit: bool,
 }
 
+/// Adds up the memory each function keeps resident while it calls another, along every call
+/// path, and reports a path whose total is over the declared capacity of a memory space.
 pub fn fold_cross_call_capacity(
     summaries: &[FnCapacitySummary],
-    env: &crate::hir::env::GlobalAstEnv,
+    env: &crate::hir::env::GlobalAstEnv<'_>,
     errors: &mut crate::diagnostic::DiagnosticsVec,
 ) {
     // Spaces with a declared capacity. Omission means unconstrained, and an
@@ -77,6 +83,30 @@ pub fn fold_cross_call_capacity(
     fold_with_budgets(summaries, &budgets, errors);
 }
 
+/// The call graph the fold walks, and what the fold has worked out so far.
+struct Fold<'a> {
+    /// One summary per function. A function's position here is its node number.
+    nodes: Vec<&'a FnCapacitySummary>,
+    /// Function name to node number.
+    index: HashMap<&'a str, usize>,
+    /// Per node and space: the folded total.
+    total: Vec<BTreeMap<String, u64>>,
+    /// Per node and space: the call edge the total peaks through (for the path in the
+    /// diagnostic).
+    peak_edge: Vec<BTreeMap<String, usize>>,
+    /// Per node and space: whether a refusal was already emitted at or below it (so one
+    /// overflow reports once, at the smallest function that exhibits it, rather than once
+    /// more per caller).
+    reported: Vec<BTreeMap<String, bool>>,
+    /// Where refusals and warnings go.
+    errors: &'a mut crate::diagnostic::DiagnosticsVec,
+}
+
+/// The nodes on the path a total peaks through, and for each call along it, the calling node
+/// with the bytes it holds across that call.
+type PeakPath = (Vec<usize>, Vec<(usize, u64)>);
+
+/// The fold itself, given the spaces that declare a capacity.
 fn fold_with_budgets(
     summaries: &[FnCapacitySummary],
     budgets: &BTreeMap<String, SpaceBudget>,
@@ -99,250 +129,240 @@ fn fold_with_budgets(
 
     let sccs = tarjan_sccs(&nodes, &index);
 
-    // Per node and space: the folded total, the call edge it peaks through (for
-    // the path in the diagnostic), and whether a refusal was already emitted at
-    // or below it (so one overflow reports once, at the smallest function that
-    // exhibits it, rather than once more per caller).
-    let mut total: Vec<BTreeMap<String, u64>> = vec![BTreeMap::new(); nodes.len()];
-    let mut peak_edge: Vec<BTreeMap<String, usize>> = vec![BTreeMap::new(); nodes.len()];
-    let mut reported: Vec<BTreeMap<String, bool>> = vec![BTreeMap::new(); nodes.len()];
+    let mut fold = Fold {
+        total: vec![BTreeMap::new(); nodes.len()],
+        peak_edge: vec![BTreeMap::new(); nodes.len()],
+        reported: vec![BTreeMap::new(); nodes.len()],
+        nodes,
+        index,
+        errors,
+    };
 
     // Tarjan emits SCCs in reverse topological order: every callee's component
     // before its callers'. Fold in that order, so `total` of a callee is final
     // by the time a caller reads it.
     for scc in &sccs {
         let cyclic = scc.len() > 1
-            || nodes[scc[0]]
+            || fold.nodes[scc[0]]
                 .calls
                 .iter()
-                .any(|c| index.get(c.callee.as_str()) == Some(&scc[0]));
+                .any(|c| fold.index.get(c.callee.as_str()) == Some(&scc[0]));
         if cyclic {
-            fold_cycle(
-                scc,
-                &nodes,
-                &index,
-                budgets,
-                &mut total,
-                &mut peak_edge,
-                &mut reported,
-                errors,
-            );
+            fold.fold_cycle(scc, budgets);
             continue;
         }
-        let n = scc[0];
+        fold.fold_node(scc[0], budgets);
+    }
+}
+
+impl Fold<'_> {
+    /// Folds node `n`, which is in no cycle: its total in each space is the larger of its own
+    /// peak and the most it reaches through any one call.
+    fn fold_node(&mut self, n: usize, budgets: &BTreeMap<String, SpaceBudget>) {
         for (space, budget) in budgets {
             let space = space.as_str();
-            let mut best = nodes[n].self_peak.get(space).copied().unwrap_or(0);
+            let mut best = self.nodes[n].self_peak.get(space).copied().unwrap_or(0);
             let mut best_edge = None;
-            for (ei, call) in nodes[n].calls.iter().enumerate() {
-                let Some(&callee) = index.get(call.callee.as_str()) else {
+            for (ei, call) in self.nodes[n].calls.iter().enumerate() {
+                let Some(&callee) = self.index.get(call.callee.as_str()) else {
                     // No summary: an extern or registry-imported callee. Its body
                     // was checked (or will be) in its own compilation; from here
                     // it contributes no known placements.
                     continue;
                 };
                 let held = call.live.get(space).copied().unwrap_or(0);
-                let reach = held + total[callee].get(space).copied().unwrap_or(0);
+                let reach = held + self.total[callee].get(space).copied().unwrap_or(0);
                 if reach > best {
                     best = reach;
                     best_edge = Some(ei);
                 }
             }
-            total[n].insert(space.to_string(), best);
+            self.total[n].insert(space.to_string(), best);
             if let Some(ei) = best_edge {
-                peak_edge[n].insert(space.to_string(), ei);
+                self.peak_edge[n].insert(space.to_string(), ei);
             }
-            report_overflow(
-                n,
-                space,
-                best,
-                budget,
-                &nodes,
-                &index,
-                &peak_edge,
-                &mut reported,
-                errors,
-            );
+            self.report_overflow(n, space, best, budget);
         }
     }
-}
 
-/// Refuse a call path whose folded peak exceeds a space's capacity, unless the
-/// overflow was already reported at this node or somewhere along the path.
-#[allow(clippy::too_many_arguments)]
-fn report_overflow(
-    n: usize,
-    space: &str,
-    peak: u64,
-    budget: &SpaceBudget,
-    nodes: &[&FnCapacitySummary],
-    index: &HashMap<&str, usize>,
-    peak_edge: &[BTreeMap<String, usize>],
-    reported: &mut [BTreeMap<String, bool>],
-    errors: &mut crate::diagnostic::DiagnosticsVec,
-) {
-    if peak <= budget.cap {
-        return;
-    }
-    // The per-function checks own the intra-function overflow: if this
-    // function's own peak is already over, E6009/E6010 said so.
-    if nodes[n].self_peak.get(space).copied().unwrap_or(0) > budget.cap {
-        reported[n].insert(space.to_string(), true);
-        return;
-    }
-    // Walk the peak path; a flagged node below means this is the same overflow
-    // seen from one caller further up.
-    let mut path: Vec<usize> = vec![n];
-    let mut hops: Vec<(usize, u64)> = Vec::new(); // (node, bytes held across its call)
-    let mut cur = n;
-    while let Some(&ei) = peak_edge[cur].get(space) {
-        let call = &nodes[cur].calls[ei];
-        let Some(&next) = index.get(call.callee.as_str()) else {
-            break;
-        };
-        if reported[next].get(space).copied().unwrap_or(false) {
-            reported[n].insert(space.to_string(), true);
+    /// Refuse a call path whose folded peak exceeds a space's capacity, unless the
+    /// overflow was already reported at this node or somewhere along the path.
+    fn report_overflow(&mut self, n: usize, space: &str, peak: u64, budget: &SpaceBudget) {
+        if peak <= budget.cap {
             return;
         }
-        hops.push((cur, call.live.get(space).copied().unwrap_or(0)));
-        path.push(next);
-        cur = next;
-    }
-    reported[n].insert(space.to_string(), true);
-
-    let names: Vec<&str> = path.iter().map(|&i| nodes[i].name.as_str()).collect();
-    let terminal = *path.last().unwrap();
-    let mut held: Vec<String> = hops
-        .iter()
-        .filter(|(_, bytes)| *bytes > 0)
-        .map(|(i, bytes)| format!("'{}' holds {} bytes across its call", nodes[*i].name, bytes))
-        .collect();
-    held.push(format!(
-        "'{}' itself peaks at {} bytes",
-        nodes[terminal].name,
-        nodes[terminal].self_peak.get(space).copied().unwrap_or(0)
-    ));
-    let msg = format!(
-        "the working set along call path '{}' in memory space '{}' peaks at {} bytes, over its {} \
-         byte capacity: {}",
-        names.join(" -> "),
-        space,
-        peak,
-        budget.cap,
-        held.join(", ")
-    );
-    let span = peak_edge[n]
-        .get(space)
-        .map(|&ei| crate::diagnostic::SourceSpan::from_ast_span(&nodes[n].calls[ei].span));
-    let facts = crate::diagnostic::DiagnosticFacts::Capacity {
-        space: space.to_string(),
-        required_bytes: peak,
-        available_bytes: budget.cap,
-        tiles: None,
-    };
-    if budget.overcommit {
-        errors
-            .warn(
-                crate::diagnostic::DiagnosticCode::W1028,
-                format!("{msg}; allowed because '{space}' is `overcommit`"),
-                span,
-            )
-            .facts = Some(facts);
-    } else {
-        errors
-            .error_with_code(crate::diagnostic::DiagnosticCode::E6027, msg, span)
-            .facts = Some(facts);
-    }
-}
-
-/// A cycle in the call graph. Depth is unknown at compile time, so any residency
-/// per activation makes the true peak unbounded: refuse (or warn, for an
-/// `overcommit` space) naming the cycle. A cycle with no residency in any
-/// budgeted space folds to its outgoing calls alone -- plain recursion that never
-/// touches a bounded space needs no annotation.
-#[allow(clippy::too_many_arguments)]
-fn fold_cycle(
-    scc: &[usize],
-    nodes: &[&FnCapacitySummary],
-    index: &HashMap<&str, usize>,
-    budgets: &BTreeMap<String, SpaceBudget>,
-    total: &mut [BTreeMap<String, u64>],
-    peak_edge: &mut [BTreeMap<String, usize>],
-    reported: &mut [BTreeMap<String, bool>],
-    errors: &mut crate::diagnostic::DiagnosticsVec,
-) {
-    let in_scc = |name: &str| index.get(name).is_some_and(|i| scc.contains(i));
-    for (space, budget) in budgets {
-        let space = space.as_str();
-        let per_activation: u64 = scc
-            .iter()
-            .map(|&i| nodes[i].self_peak.get(space).copied().unwrap_or(0))
-            .max()
-            .unwrap_or(0);
-        // Conservative stand-in so callers above still fold: one activation plus
-        // whatever the cycle reaches outside itself (those callees were folded
-        // before it, in reverse topological order). The refusal below is what
-        // carries the unboundedness.
-        for &i in scc {
-            let mut best = nodes[i].self_peak.get(space).copied().unwrap_or(0);
-            for (ei, call) in nodes[i].calls.iter().enumerate() {
-                if in_scc(&call.callee) {
-                    continue;
-                }
-                let Some(&callee) = index.get(call.callee.as_str()) else {
-                    continue;
-                };
-                let held = call.live.get(space).copied().unwrap_or(0);
-                let reach = held + total[callee].get(space).copied().unwrap_or(0);
-                if reach > best {
-                    best = reach;
-                    peak_edge[i].insert(space.to_string(), ei);
-                }
-            }
-            total[i].insert(space.to_string(), best);
+        // The per-function checks own the intra-function overflow: if this
+        // function's own peak is already over, E6009/E6010 said so.
+        if self.nodes[n].self_peak.get(space).copied().unwrap_or(0) > budget.cap {
+            self.reported[n].insert(space.to_string(), true);
+            return;
         }
-        if per_activation == 0 {
-            continue;
-        }
-        for &i in scc {
-            reported[i].insert(space.to_string(), true);
-        }
-        let mut names: Vec<&str> = scc.iter().map(|&i| nodes[i].name.as_str()).collect();
-        names.sort_unstable();
-        let cycle = if names.len() == 1 {
-            format!("'{}' calls itself", names[0])
-        } else {
-            format!("the cycle '{}' recurses", names.join(" -> "))
+        let Some((path, hops)) = self.peak_path(n, space) else {
+            return;
         };
+        let nodes = &self.nodes;
+
+        let names: Vec<&str> = path.iter().map(|&i| nodes[i].name.as_str()).collect();
+        // The walk starts at `n`, so the path always has a last node.
+        let terminal = path[path.len() - 1];
+        let mut held: Vec<String> = hops
+            .iter()
+            .filter(|(_, bytes)| *bytes > 0)
+            .map(|(i, bytes)| format!("'{}' holds {} bytes across its call", nodes[*i].name, bytes))
+            .collect();
+        held.push(format!(
+            "'{}' itself peaks at {} bytes",
+            nodes[terminal].name,
+            nodes[terminal].self_peak.get(space).copied().unwrap_or(0)
+        ));
         let msg = format!(
-            "{} and places up to {} bytes in memory space '{}' per activation; the recursion \
-             depth is not known at compile time, so its working set is unbounded",
-            cycle, per_activation, space
+            "the working set along call path '{}' in memory space '{}' peaks at {} bytes, over its {} \
+             byte capacity: {}",
+            names.join(" -> "),
+            space,
+            peak,
+            budget.cap,
+            held.join(", ")
         );
+        let span = self.peak_edge[n]
+            .get(space)
+            .map(|&ei| crate::diagnostic::SourceSpan::from_ast_span(&nodes[n].calls[ei].span));
         let facts = crate::diagnostic::DiagnosticFacts::Capacity {
             space: space.to_string(),
-            required_bytes: per_activation,
+            required_bytes: peak,
             available_bytes: budget.cap,
             tiles: None,
         };
         if budget.overcommit {
-            errors
+            self.errors
                 .warn(
                     crate::diagnostic::DiagnosticCode::W1028,
                     format!("{msg}; allowed because '{space}' is `overcommit`"),
-                    None,
+                    span,
                 )
                 .facts = Some(facts);
         } else {
-            errors
-                .error_with_code(crate::diagnostic::DiagnosticCode::E6028, msg, None)
+            self.errors
+                .error_with_code(crate::diagnostic::DiagnosticCode::E6027, msg, span)
                 .facts = Some(facts);
         }
+    }
+
+    /// Walks the path the total of node `n` peaks through in `space`, and marks `n` as
+    /// reported. Returns the nodes on the path and, for each call along it, the calling node
+    /// with the bytes it holds across that call. Returns `None` when a node below `n` was
+    /// already reported: this is then the same overflow seen from one caller further up.
+    fn peak_path(&mut self, n: usize, space: &str) -> Option<PeakPath> {
+        let mut path: Vec<usize> = vec![n];
+        let mut hops: Vec<(usize, u64)> = Vec::new(); // (node, bytes held across its call)
+        let mut cur = n;
+        while let Some(&ei) = self.peak_edge[cur].get(space) {
+            let call = &self.nodes[cur].calls[ei];
+            let Some(&next) = self.index.get(call.callee.as_str()) else {
+                break;
+            };
+            if self.reported[next].get(space).copied().unwrap_or(false) {
+                self.reported[n].insert(space.to_string(), true);
+                return None;
+            }
+            hops.push((cur, call.live.get(space).copied().unwrap_or(0)));
+            path.push(next);
+            cur = next;
+        }
+        self.reported[n].insert(space.to_string(), true);
+        Some((path, hops))
+    }
+
+    /// A cycle in the call graph. Depth is unknown at compile time, so any residency
+    /// per activation makes the true peak unbounded: refuse (or warn, for an
+    /// `overcommit` space) naming the cycle. A cycle with no residency in any
+    /// budgeted space folds to its outgoing calls alone -- plain recursion that never
+    /// touches a bounded space needs no annotation.
+    fn fold_cycle(&mut self, scc: &[usize], budgets: &BTreeMap<String, SpaceBudget>) {
+        for (space, budget) in budgets {
+            let space = space.as_str();
+            let per_activation: u64 = scc
+                .iter()
+                .map(|&i| self.nodes[i].self_peak.get(space).copied().unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            // Conservative stand-in so callers above still fold: one activation plus
+            // whatever the cycle reaches outside itself (those callees were folded
+            // before it, in reverse topological order). The refusal below is what
+            // carries the unboundedness.
+            for &i in scc {
+                self.fold_cycle_node(i, scc, space);
+            }
+            if per_activation == 0 {
+                continue;
+            }
+            for &i in scc {
+                self.reported[i].insert(space.to_string(), true);
+            }
+            let mut names: Vec<&str> = scc.iter().map(|&i| self.nodes[i].name.as_str()).collect();
+            names.sort_unstable();
+            let cycle = if names.len() == 1 {
+                format!("'{}' calls itself", names[0])
+            } else {
+                format!("the cycle '{}' recurses", names.join(" -> "))
+            };
+            let msg = format!(
+                "{cycle} and places up to {per_activation} bytes in memory space '{space}' per activation; the recursion \
+                 depth is not known at compile time, so its working set is unbounded"
+            );
+            let facts = crate::diagnostic::DiagnosticFacts::Capacity {
+                space: space.to_string(),
+                required_bytes: per_activation,
+                available_bytes: budget.cap,
+                tiles: None,
+            };
+            if budget.overcommit {
+                self.errors
+                    .warn(
+                        crate::diagnostic::DiagnosticCode::W1028,
+                        format!("{msg}; allowed because '{space}' is `overcommit`"),
+                        None,
+                    )
+                    .facts = Some(facts);
+            } else {
+                self.errors
+                    .error_with_code(crate::diagnostic::DiagnosticCode::E6028, msg, None)
+                    .facts = Some(facts);
+            }
+        }
+    }
+
+    /// Sets the total of node `i`, a member of the cycle `scc`, in `space`: its own peak, or
+    /// the most it reaches through a call that leaves the cycle.
+    fn fold_cycle_node(&mut self, i: usize, scc: &[usize], space: &str) {
+        let index = &self.index;
+        let in_scc = |name: &str| index.get(name).is_some_and(|i| scc.contains(i));
+        let mut best = self.nodes[i].self_peak.get(space).copied().unwrap_or(0);
+        for (ei, call) in self.nodes[i].calls.iter().enumerate() {
+            if in_scc(&call.callee) {
+                continue;
+            }
+            let Some(&callee) = self.index.get(call.callee.as_str()) else {
+                continue;
+            };
+            let held = call.live.get(space).copied().unwrap_or(0);
+            let reach = held + self.total[callee].get(space).copied().unwrap_or(0);
+            if reach > best {
+                best = reach;
+                self.peak_edge[i].insert(space.to_string(), ei);
+            }
+        }
+        self.total[i].insert(space.to_string(), best);
     }
 }
 
 /// Tarjan's strongly-connected components, iteratively (call graphs recurse; the
 /// compiler should not). Emits components in reverse topological order.
+///
+/// # Panics
+///
+/// Panics if the stack of visited nodes is empty before the first node of a component is
+/// popped from it. Every node is pushed when it is first visited, so that would be a bug here.
 fn tarjan_sccs(nodes: &[&FnCapacitySummary], index: &HashMap<&str, usize>) -> Vec<Vec<usize>> {
     let n = nodes.len();
     let succ: Vec<Vec<usize>> = nodes
@@ -408,14 +428,18 @@ fn tarjan_sccs(nodes: &[&FnCapacitySummary], index: &HashMap<&str, usize>) -> Ve
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 
-    fn summary(
-        name: &str,
-        peaks: &[(&str, u64)],
-        calls: &[(&str, &[(&str, u64)])],
-    ) -> FnCapacitySummary {
+    /// The bytes a call keeps resident, as (space name, bytes) pairs.
+    type Live<'a> = &'a [(&'a str, u64)];
+
+    fn summary(name: &str, peaks: Live<'_>, calls: &[(&str, Live<'_>)]) -> FnCapacitySummary {
         FnCapacitySummary {
             name: name.to_string(),
             self_peak: peaks.iter().map(|(s, b)| (s.to_string(), *b)).collect(),
@@ -447,7 +471,7 @@ mod tests {
     fn run(summaries: &[FnCapacitySummary], caps: &[(&str, u64, bool)]) -> Vec<String> {
         let mut errors = crate::diagnostic::DiagnosticsVec::new();
         fold_with_budgets(summaries, &budgets(caps), &mut errors);
-        errors.iter().map(|d| format!("{}", d)).collect()
+        errors.iter().map(ToString::to_string).collect()
     }
 
     /// Sequential calls compose by max: two callees of 3 each under a cap of 4

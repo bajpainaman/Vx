@@ -3,7 +3,7 @@
 //! borrow records only through this module.
 //!
 //! The point of the module boundary is that `active_borrows` is **private** — no code outside this file
-//! can read it. The only conflict-check read path is [`BorrowCx::live_borrows`], which sweeps dead
+//! can read it. The only conflict-check read path is `BorrowCx::live_borrows`, which sweeps dead
 //! borrows first, so a *new* access path physically cannot forget the sweep the way `check_borrow_expr`
 //! once did (#276): "remember to sweep" is now a type-system guarantee, not a convention. Save/restore
 //! and scope bookkeeping go through the other methods.
@@ -88,7 +88,7 @@ impl Default for BorrowCx {
             loop_exits: Vec::new(),
             views: HashMap::new(),
             borrowers_ever: HashMap::new(),
-            drops: Default::default(),
+            drops: crate::hir::check::drops::DropFrames::default(),
         }
     }
 }
@@ -160,10 +160,7 @@ impl BorrowCx {
     /// an unsound accept (the #269/#276 safety argument).
     pub(crate) fn live_borrows(&mut self, base: &str) -> &[BorrowRecord] {
         self.sweep(base);
-        self.active_borrows
-            .get(base)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.active_borrows.get(base).map_or(&[][..], Vec::as_slice)
     }
 
     /// NLL dead-borrow cleanup for `base`. Private — folded into `live_borrows` so it is never skipped.
@@ -310,7 +307,7 @@ impl BorrowCx {
     ) -> Vec<(Symbol, BorrowRecord)> {
         let mut added = Vec::new();
         for (base, list) in &self.active_borrows {
-            let old = before.get(base).map(Vec::as_slice).unwrap_or(&[]);
+            let old = before.get(base).map_or(&[][..], Vec::as_slice);
             for r in list.iter().filter(|r| !old.contains(r)) {
                 added.push((base.clone(), r.clone()));
             }

@@ -14,11 +14,15 @@
 //===----------------------------------------------------------------------===//
 use std::slice;
 
+/// Writes `a + b` into `out`, one element at a time. Every pointer must point to four
+/// `f32` values. Returns 0, or -1 when a pointer is null.
 #[no_mangle]
 pub extern "C" fn vx_simd_add_f32x4(a: *const f32, b: *const f32, out: *mut f32) -> i32 {
     if a.is_null() || b.is_null() || out.is_null() {
         return -1;
     }
+    // SAFETY: no pointer is null, and the caller promises each one points to four `f32`
+    // values, with `out` not overlapping the inputs.
     unsafe {
         let a_slice = slice::from_raw_parts(a, 4);
         let b_slice = slice::from_raw_parts(b, 4);
@@ -30,11 +34,15 @@ pub extern "C" fn vx_simd_add_f32x4(a: *const f32, b: *const f32, out: *mut f32)
     0
 }
 
+/// Writes `a - b` into `out`, one element at a time. Every pointer must point to four
+/// `f32` values. Returns 0, or -1 when a pointer is null.
 #[no_mangle]
 pub extern "C" fn vx_simd_sub_f32x4(a: *const f32, b: *const f32, out: *mut f32) -> i32 {
     if a.is_null() || b.is_null() || out.is_null() {
         return -1;
     }
+    // SAFETY: no pointer is null, and the caller promises each one points to four `f32`
+    // values, with `out` not overlapping the inputs.
     unsafe {
         let a_slice = slice::from_raw_parts(a, 4);
         let b_slice = slice::from_raw_parts(b, 4);
@@ -46,11 +54,15 @@ pub extern "C" fn vx_simd_sub_f32x4(a: *const f32, b: *const f32, out: *mut f32)
     0
 }
 
+/// Writes `a * b` into `out`, one element at a time. Every pointer must point to four
+/// `f32` values. Returns 0, or -1 when a pointer is null.
 #[no_mangle]
 pub extern "C" fn vx_simd_mul_f32x4(a: *const f32, b: *const f32, out: *mut f32) -> i32 {
     if a.is_null() || b.is_null() || out.is_null() {
         return -1;
     }
+    // SAFETY: no pointer is null, and the caller promises each one points to four `f32`
+    // values, with `out` not overlapping the inputs.
     unsafe {
         let a_slice = slice::from_raw_parts(a, 4);
         let b_slice = slice::from_raw_parts(b, 4);
@@ -62,6 +74,8 @@ pub extern "C" fn vx_simd_mul_f32x4(a: *const f32, b: *const f32, out: *mut f32)
     0
 }
 
+/// Writes `a * b + c` into `out`, one element at a time. Every pointer must point to four
+/// `f32` values. Returns 0, or -1 when a pointer is null.
 #[no_mangle]
 pub extern "C" fn vx_simd_fma_f32x4(
     a: *const f32,
@@ -72,6 +86,8 @@ pub extern "C" fn vx_simd_fma_f32x4(
     if a.is_null() || b.is_null() || c.is_null() || out.is_null() {
         return -1;
     }
+    // SAFETY: no pointer is null, and the caller promises each one points to four `f32`
+    // values, with `out` not overlapping the inputs.
     unsafe {
         let a_slice = slice::from_raw_parts(a, 4);
         let b_slice = slice::from_raw_parts(b, 4);
@@ -84,11 +100,15 @@ pub extern "C" fn vx_simd_fma_f32x4(
     0
 }
 
+/// Writes `a / b` into `out`, one element at a time. Every pointer must point to four
+/// `f32` values. Returns 0, or -1 when a pointer is null.
 #[no_mangle]
 pub extern "C" fn vx_simd_div_f32x4(a: *const f32, b: *const f32, out: *mut f32) -> i32 {
     if a.is_null() || b.is_null() || out.is_null() {
         return -1;
     }
+    // SAFETY: no pointer is null, and the caller promises each one points to four `f32`
+    // values, with `out` not overlapping the inputs.
     unsafe {
         let a_slice = slice::from_raw_parts(a, 4);
         let b_slice = slice::from_raw_parts(b, 4);

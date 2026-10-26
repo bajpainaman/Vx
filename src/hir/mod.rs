@@ -10,30 +10,60 @@
 //
 //===----------------------------------------------------------------------===//
 
-use crate::syntax::*;
+use crate::syntax::{
+    decl, ArrayExpr, AsCastExpr, AssertStmt, AssignStmt, BinaryOp, BinaryOpExpr, BorrowExpr,
+    CompoundAssignStmt, ComptimeBlockExpr, DereferenceExpr, Dim, DropStmt, ElementType, EnumDecl,
+    EnumVariantExpr, Expr, ExprStmtStmt, ForLoopStmt, Function, FunctionCallExpr, GradExpr,
+    IdentifierExpr, IfExpr, IndexAccessExpr, IndirectCallExpr, JvpExpr, LetDeclStmt, LogicalOp,
+    LogicalOpExpr, LoopStmt, Mangle, MatchArm, MatchExpr, MemberAccessExpr, MemorySpace,
+    MemorySpaceExpr, MethodCallExpr, NumberExpr, Pattern, Placement, RangeExpr, RelationalOp,
+    RelationalOpExpr, ReturnStmt, Span, SpawnOnExpr, Statement, StringLiteralExpr, StructDecl,
+    StructInitExpr, Topology, TopologyExpr, TransferExpr, Type, UnaryOp, UnaryOpExpr,
+    UnsafeBlockExpr, VecMacroExpr, VjpExpr,
+};
 
 pub mod borrow_cx;
+/// The type checks for expressions, one file for each family of expressions.
 pub mod check;
 pub mod check_state;
 mod comptime_interpreter;
+/// The checks that are about the whole program, not about one function.
 pub mod decl_check;
+/// The type checker, and the table of everything the program declares.
 pub mod env;
+/// Type checking of expressions: the dispatch, and the helpers the checks share.
 pub mod expr;
+/// Turns the checked body of a function from a tree into the flat list of instructions that
+/// code generation reads.
 pub mod flatten;
+/// The memory spaces the program declares, and how they contain one another.
 pub mod memory;
 pub mod places;
+/// For each function that returns a reference, which parameters the reference can come from.
 pub mod provenance;
+/// Proves integer facts about a program by asking the `z3` solver.
 pub mod prover;
+/// Checks that a contract on a buffer still holds after the buffer moves between devices.
 pub mod seam;
+/// What the compiler says and does when the `z3` solver is not installed.
 pub mod solver;
+/// Type checking of statements.
 pub mod stmt;
 
 pub use env::*;
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
+    use crate::syntax::{
+        ClosureExpr, InlineMlirExpr, PrintExpr, PrintlnExpr, TransferPredicateExpr,
+    };
 
     /// The type checker attaches the initialized struct's resolved GID to the `StructInit`
     /// expression (#199), so the flat-HIR lowerer can reach its registry layout without
@@ -42,12 +72,12 @@ mod tests {
     /// freezes a real registry and takes the same registry lookup as its oracle.
     #[test]
     fn structinit_is_annotated_with_struct_gid() {
-        let input = r#"
+        let input = r"
 struct Point { x: i32, y: i32 }
 fn make() -> Point {
     return Point { x: 1, y: 2 };
 }
-"#;
+";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -171,7 +201,7 @@ fn make() -> Point {
 
     #[test]
     fn test_sema_distributed_matmul() {
-        let input = r#"
+        let input = r"
 fn custom_matmul(a: Tensor<f32, [?, ?]>, b: Tensor<f32, [?, ?]>) -> Tensor<f32, [?, ?]> {
     return a;
 }
@@ -186,7 +216,7 @@ fn distributed_matmul(a: Tensor<f32, [?, ?]>, b: Tensor<f32, [?, ?]>) -> Tensor<
     }
     return a;
 }
-        "#;
+        ";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -206,19 +236,19 @@ fn distributed_matmul(a: Tensor<f32, [?, ?]>, b: Tensor<f32, [?, ?]>) -> Tensor<
         };
 
         for err in &checker.errors {
-            println!("Error: {}", err);
+            println!("Error: {err}");
         }
         assert!(success);
-        assert!(checker.errors.error_count() == 0);
+        assert_eq!(checker.errors.error_count(), 0);
     }
 
     #[test]
     fn test_sema_type_mismatch() {
-        let input = r#"
+        let input = r"
 fn bad_matmul() -> Tensor<f32, [?, ?]> {
     return undefined_variable;
 }
-        "#;
+        ";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -242,7 +272,7 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
 
     #[test]
     fn test_sema_struct_and_pointers() {
-        let input = r#"
+        let input = r"
         struct Config {
             value: Tensor<f32, [?, ?]>
         }
@@ -254,7 +284,7 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
             }
             return c.value < 20.0f32;
         }
-        "#;
+        ";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -323,14 +353,14 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
         // `as_ptr()` on a tensor is a pointer to its first element, in the tensor's memory.
         // `len()` answers the outermost extent as an i32, like `extent`, and the checker
         // rewrites it to the `$extent` read both backends lower.
-        let input = r#"
+        let input = r"
         fn test_methods(t: Tensor<f32, [?, ?]>) -> i32 {
             let ptr: *const f32 = t.as_ptr();
             let mut_ptr: *mut f32 = t.as_mut_ptr();
             let length: i32 = t.len();
             return length;
         }
-        "#;
+        ";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -373,7 +403,7 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
 
     #[test]
     fn test_sema_liveness_analysis() {
-        let input = r#"
+        let input = r"
         fn test_liveness() -> i32 {
             let a = 1;
             let b = a + 2;
@@ -382,7 +412,7 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
             let c = 3;
             return c;
         }
-        "#;
+        ";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -420,13 +450,13 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
 
     #[test]
     fn liveness_includes_a_use_in_a_comptime_block_result() {
-        let input = r#"
+        let input = r"
         fn f() -> i32 {
             let value = 1;
             let result = comptime { value };
             return result;
         }
-        "#;
+        ";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -443,13 +473,13 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
 
     #[test]
     fn liveness_includes_a_use_in_an_unsafe_block_result() {
-        let input = r#"
+        let input = r"
         fn f() -> i32 {
             let value = 1;
             let result = unsafe { value };
             return result;
         }
-        "#;
+        ";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -466,10 +496,10 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
 
     #[test]
     fn liveness_includes_an_autodiff_argument() {
-        let input = r#"
+        let input = r"
         fn cube(v: f32) -> f32 { return v * v * v; }
         fn f(x: f32) -> f32 { return grad(cube, x); }
-        "#;
+        ";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -487,14 +517,14 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
     #[test]
     fn test_sema_linear_move_consumed() {
         // A Tensor<f32, [?, ?]> is linear: using it once consumes it, second use is an error.
-        let input = r#"
+        let input = r"
         fn test() -> i32 {
             let a : Tensor<f32, []> = 1.0;
             let b = a;
             let c = a;
             return 0;
         }
-        "#;
+        ";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -525,14 +555,14 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
     #[test]
     fn test_sema_scalar_not_consumed() {
         // Scalars (i32) are NOT linear — they can be reused freely.
-        let input = r#"
+        let input = r"
         fn test() -> i32 {
             let x = 42;
             let y = x + 1;
             let z = x + 2;
             return z;
         }
-        "#;
+        ";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -560,7 +590,7 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
         // (Without that later use `y` would be a dead borrow under NLL — #276 — and `let z = x` would
         // correctly compile; `use_ref(y)` is what makes this a genuine conflict, as in the companion
         // fixture `borrow_use_after_mut.vx`.)
-        let input = r#"
+        let input = r"
         fn use_ref(r : &mut Tensor<f32, [?, ?]>) -> i32 {
             return 0;
         }
@@ -571,7 +601,7 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
             use_ref(y);
             return 0;
         }
-        "#;
+        ";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, input);
@@ -600,7 +630,7 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
     }
 
     // A relaxed cross-device transfer whose consumer asserts a value on the buffer.
-    const SEAM_ASSERT_PROGRAM: &str = r#"
+    const SEAM_ASSERT_PROGRAM: &str = r"
 fn k(x: Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]>)
      on Topology::NPU[0] -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> { return x; }
 fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
@@ -611,7 +641,7 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
         r
     }
 }
-"#;
+";
 
     fn equality_condition(name: &str, value: &str) -> Expr {
         let span = Span::default();
@@ -644,10 +674,11 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
         ))
     }
 
-    #[test]
-    fn seam_assert_prescan_scans_eager_expression_children() {
-        let span = Span::default();
-        let cases = vec![
+    /// Expressions for `seam_assert_prescan_scans_eager_expression_children`:
+    /// call arguments, an indirect callee, an array element, a member base and an index.
+    /// Each has an assert on the variable it is named after, inside one child.
+    fn call_array_member_and_index_cases(span: Span) -> Vec<(&'static str, Expr)> {
+        vec![
             (
                 "function_argument",
                 Expr::FunctionCall(FunctionCallExpr::new(
@@ -696,6 +727,14 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                     span,
                 )),
             ),
+        ]
+    }
+
+    /// Expressions for `seam_assert_prescan_scans_eager_expression_children`:
+    /// an index base, a method call's receiver and argument, and the right side of `+`.
+    /// Each has an assert on the variable it is named after, inside one child.
+    fn index_base_method_and_binary_cases(span: Span) -> Vec<(&'static str, Expr)> {
+        vec![
             (
                 "index_base",
                 Expr::IndexAccess(IndexAccessExpr::new(
@@ -736,6 +775,14 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                     span,
                 )),
             ),
+        ]
+    }
+
+    /// Expressions for `seam_assert_prescan_scans_eager_expression_children`:
+    /// a comparison, `!`, a borrow, a dereference, a transfer and an enum payload.
+    /// Each has an assert on the variable it is named after, inside one child.
+    fn operator_transfer_and_enum_cases(span: Span) -> Vec<(&'static str, Expr)> {
+        vec![
             (
                 "relational_rhs",
                 Expr::RelationalOp(RelationalOpExpr::new(
@@ -785,6 +832,14 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                     span,
                 )),
             ),
+        ]
+    }
+
+    /// Expressions for `seam_assert_prescan_scans_eager_expression_children`:
+    /// a struct field, a range end, and the arguments of `grad`, `vjp` and `jvp`.
+    /// Each has an assert on the variable it is named after, inside one child.
+    fn struct_range_and_autodiff_cases(span: Span) -> Vec<(&'static str, Expr)> {
+        vec![
             (
                 "struct_field",
                 Expr::StructInit(StructInitExpr::new(
@@ -836,6 +891,14 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                     span,
                 )),
             ),
+        ]
+    }
+
+    /// Expressions for `seam_assert_prescan_scans_eager_expression_children`:
+    /// a `jvp` argument, a `vec!` element, a cast and the arguments of `print` and `println`.
+    /// Each has an assert on the variable it is named after, inside one child.
+    fn jvp_vec_cast_and_print_cases(span: Span) -> Vec<(&'static str, Expr)> {
+        vec![
             (
                 "jvp_argument",
                 Expr::Jvp(JvpExpr::new(
@@ -875,6 +938,14 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                     span,
                 )),
             ),
+        ]
+    }
+
+    /// Expressions for `seam_assert_prescan_scans_eager_expression_children`:
+    /// inline MLIR inputs and clobbers, and the device index of a topology.
+    /// Each has an assert on the variable it is named after, inside one child.
+    fn inline_mlir_and_topology_cases(span: Span) -> Vec<(&'static str, Expr)> {
+        vec![
             (
                 "inline_mlir_input",
                 Expr::InlineMlir(InlineMlirExpr {
@@ -918,6 +989,14 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                     span,
                 }),
             ),
+        ]
+    }
+
+    /// Expressions for `seam_assert_prescan_scans_eager_expression_children`:
+    /// an `unsafe` block, a `comptime` block and a `spawn on` block.
+    /// Each has an assert on the variable it is named after, inside one child.
+    fn block_and_spawn_cases(span: Span) -> Vec<(&'static str, Expr)> {
+        vec![
             ("unsafe_block", nested_consumer_assert("unsafe_block")),
             (
                 "comptime_block",
@@ -945,7 +1024,19 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                     span,
                 )),
             ),
-        ];
+        ]
+    }
+
+    #[test]
+    fn seam_assert_prescan_scans_eager_expression_children() {
+        let span = Span::default();
+        let mut cases = call_array_member_and_index_cases(span);
+        cases.extend(index_base_method_and_binary_cases(span));
+        cases.extend(operator_transfer_and_enum_cases(span));
+        cases.extend(struct_range_and_autodiff_cases(span));
+        cases.extend(jvp_vec_cast_and_print_cases(span));
+        cases.extend(inline_mlir_and_topology_cases(span));
+        cases.extend(block_and_spawn_cases(span));
 
         for (name, expr) in cases {
             let mut contracts = std::collections::HashMap::new();
@@ -1000,10 +1091,10 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
         }
     }
 
-    #[test]
-    fn seam_assert_prescan_scans_eager_statement_children() {
-        let span = Span::default();
-        let cases = vec![
+    /// Statements for `seam_assert_prescan_scans_eager_statement_children`: a `let`, an
+    /// expression statement, a `return` and both sides of an assignment. Each has an assert on the variable it is named after, inside one child.
+    fn let_return_and_assign_cases(span: Span) -> Vec<(&'static str, Statement)> {
+        vec![
             (
                 "let_initializer",
                 Statement::LetDecl(LetDeclStmt::new(
@@ -1045,6 +1136,13 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                     span,
                 )),
             ),
+        ]
+    }
+
+    /// More statements for the same test: both sides of a compound assignment and what a `for`
+    /// loop iterates over. Each has an assert on the variable it is named after, inside one child.
+    fn compound_assign_and_for_cases(span: Span) -> Vec<(&'static str, Statement)> {
+        vec![
             (
                 "compound_assignment_rhs",
                 Statement::CompoundAssign(CompoundAssignStmt::new(
@@ -1073,7 +1171,14 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                     span,
                 )),
             ),
-        ];
+        ]
+    }
+
+    #[test]
+    fn seam_assert_prescan_scans_eager_statement_children() {
+        let span = Span::default();
+        let mut cases = let_return_and_assign_cases(span);
+        cases.extend(compound_assign_and_for_cases(span));
 
         for (name, statement) in cases {
             let mut contracts = std::collections::HashMap::new();
@@ -1086,15 +1191,15 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
         }
     }
 
-    #[test]
-    fn seam_assert_prescan_keeps_only_unconditional_branch_and_loop_contracts() {
-        let span = Span::default();
+    /// `if` expressions with an assert in their branches, and the value the scanner must keep
+    /// for the variable each is named after: `None` when the branches do not agree.
+    fn if_cases(span: Span) -> Vec<(&'static str, Expr, Option<u64>)> {
         let condition = Box::new(Expr::Identifier(IdentifierExpr::new(
             "condition".into(),
             span,
         )));
 
-        let cases = vec![
+        vec![
             (
                 "if_disagrees",
                 Expr::If(IfExpr::new(
@@ -1128,7 +1233,13 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                 )),
                 Some(42),
             ),
-        ];
+        ]
+    }
+
+    #[test]
+    fn seam_assert_prescan_keeps_only_unconditional_branch_and_loop_contracts() {
+        let span = Span::default();
+        let cases = if_cases(span);
 
         for (name, expr, expected) in cases {
             let mut contracts = std::collections::HashMap::new();
@@ -1248,14 +1359,13 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
         assert_eq!(
             contracts.get("local_a"),
             Some(&42u64),
-            "pre-scan should extract local_a == 42 from the spawn body, got {:?}",
-            contracts
+            "pre-scan should extract local_a == 42 from the spawn body, got {contracts:?}"
         );
     }
 
     #[test]
     fn seam_assert_prescan_collects_an_assert_nested_in_a_binary_expression() {
-        let source = r#"
+        let source = r"
 fn f(value: i32) -> i32 {
     let result = 1 + if 1 == 1 {
         assert(value == 42);
@@ -1266,7 +1376,7 @@ fn f(value: i32) -> i32 {
     };
     return result;
 }
-        "#;
+        ";
         let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, source);
@@ -1289,12 +1399,12 @@ fn f(value: i32) -> i32 {
 
     #[test]
     fn seam_assert_prescan_collects_each_conjunct_of_an_assert() {
-        let source = r#"
+        let source = r"
 fn f(left: i32, right: i32) -> i32 {
     assert(left == 42 && right == 7);
     return 0;
 }
-        "#;
+        ";
         let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, source);
@@ -1322,7 +1432,7 @@ fn f(left: i32, right: i32) -> i32 {
 
     #[test]
     fn seam_assert_prescan_collects_an_assert_nested_in_an_assert_condition() {
-        let source = r#"
+        let source = r"
 fn f(value: i32) -> i32 {
     assert(if 1 == 1 {
         assert(value == 42);
@@ -1333,7 +1443,7 @@ fn f(value: i32) -> i32 {
     });
     return 0;
 }
-        "#;
+        ";
         let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, source);
@@ -1356,14 +1466,14 @@ fn f(value: i32) -> i32 {
 
     #[test]
     fn seam_assert_prescan_collects_for_loop_invariant_contracts() {
-        let source = r#"
+        let source = r"
 fn f(value: i32) -> i32 {
     for i in 0..4 invariant value == 42 {
         let copy = i;
     }
     return 0;
 }
-        "#;
+        ";
         let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, source);
@@ -1386,14 +1496,14 @@ fn f(value: i32) -> i32 {
 
     #[test]
     fn seam_assert_prescan_collects_loop_invariant_contracts() {
-        let source = r#"
+        let source = r"
 fn f(value: i32) -> i32 {
     loop invariant value == 42 {
         break;
     }
     return 0;
 }
-        "#;
+        ";
         let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, source);
@@ -1416,7 +1526,7 @@ fn f(value: i32) -> i32 {
 
     #[test]
     fn seam_assert_prescan_discards_contracts_that_differ_between_match_arms() {
-        let source = r#"
+        let source = r"
 fn f(selector: i32, value: i32) -> i32 {
     match selector {
         0 => { assert(value == 42); }
@@ -1424,7 +1534,7 @@ fn f(selector: i32, value: i32) -> i32 {
     }
     return 0;
 }
-        "#;
+        ";
         let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, source);
@@ -1446,7 +1556,7 @@ fn f(selector: i32, value: i32) -> i32 {
 
     #[test]
     fn seam_assert_prescan_keeps_contracts_shared_by_every_match_arm() {
-        let source = r#"
+        let source = r"
 fn f(selector: i32, value: i32) -> i32 {
     match selector {
         0 => { assert(value == 42); }
@@ -1454,7 +1564,7 @@ fn f(selector: i32, value: i32) -> i32 {
     }
     return 0;
 }
-        "#;
+        ";
         let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, source);
@@ -1477,7 +1587,7 @@ fn f(selector: i32, value: i32) -> i32 {
 
     #[test]
     fn seam_assert_prescan_skips_short_circuited_and_rhs() {
-        let source = r#"
+        let source = r"
 fn f(predicate: bool, value: i32) -> i32 {
     let result = predicate && if 1 == 1 {
         assert(value == 42);
@@ -1487,7 +1597,7 @@ fn f(predicate: bool, value: i32) -> i32 {
     };
     return 0;
 }
-        "#;
+        ";
         let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, source);
@@ -1509,7 +1619,7 @@ fn f(predicate: bool, value: i32) -> i32 {
 
     #[test]
     fn seam_assert_prescan_skips_short_circuited_or_rhs() {
-        let source = r#"
+        let source = r"
 fn f(predicate: bool, value: i32) -> i32 {
     let result = predicate || if 1 == 1 {
         assert(value == 42);
@@ -1519,7 +1629,7 @@ fn f(predicate: bool, value: i32) -> i32 {
     };
     return 0;
 }
-        "#;
+        ";
         let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, source);

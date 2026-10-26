@@ -27,11 +27,15 @@
 /// difference is the iterator.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Schedule {
+    /// Iterate with rayon (`par_iter()`).
     Parallel,
+    /// Iterate with a plain `iter()`; rayon is not used at all.
     Sequential,
 }
 
 impl Schedule {
+    /// Whether this is [`Schedule::Sequential`].
+    #[must_use]
     pub fn is_seq(self) -> bool {
         self == Schedule::Sequential
     }

@@ -3,37 +3,56 @@
 //! One `impl` block on the per-function emitter; the dispatch that reaches these
 //! lives in `step`, next to the struct.
 
-use super::super::*;
+use super::super::{
+    elem_of_gid, mlir_scalar, sym_ref, tensor_memref_ty, Callee, Decline, FnEmit, HirInstruction,
+    Lowered, DYN_DIM,
+};
+use std::fmt::Write as _;
+
+/// The argument count an instruction carries in `imm`. A count too large for `usize` becomes
+/// `usize::MAX`: no list of pending arguments is that long, so the caller declines.
+fn arg_count(imm: u64) -> usize {
+    usize::try_from(imm).unwrap_or(usize::MAX)
+}
 
 impl FnEmit<'_> {
     /// Whether register `r` is passed as a bare `!llvm.ptr`: a pointer value, a pointer local's
     /// slot handed out by `&mut p` (the slot's address is the pointer the callee wants), or an
     /// aggregate slot passed by reference.
+    ///
+    /// # Errors
+    ///
+    /// Declines when register `r` is not one this function has.
     fn is_pointer_value(&self, r: usize) -> Lowered<bool> {
         Ok(*self.ptr_of.get(r).ok_or(crate::emitter_gap!())?
             || self.pslot_of.get(r).copied().unwrap_or(false)
             || self.agg_of.get(r).copied().flatten().is_some())
     }
 
-    // One argument of the following `Call`: record its value register (no op emitted).
+    /// One argument of the following `Call`: record its value register (no op emitted).
+    ///
+    /// # Errors
+    ///
+    /// Never fails. It returns `Lowered` so the dispatch calls every instruction the same way.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the caller is the dispatch in another file, where every arm returns `Lowered`"
+    )]
     pub(crate) fn op_arg(&mut self, _idx: usize, ins: &HirInstruction) -> Lowered<()> {
         self.pending_args.push(ins.operand1.0);
         Ok(())
     }
 
-    // A fixed-arity call. `type_idx` is the callee's GID (resolved to name + return type via
-    // `ctx.callees`); `imm` is the arg count, taken from the tail of `pending_args`. Emit
-    // `%r = func.call @name(%a, %b) : (Ta, Tb) -> Tret`.
-    pub(crate) fn op_call(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
-        let gid = *self
-            .types
-            .get(ins.type_idx.0 as usize)
-            .ok_or(crate::emitter_gap!())?;
-        let callee = self.ctx.callees.get(&gid).ok_or(crate::emitter_gap!())?;
-        // Return type: a scalar, an `!llvm.struct` by value for a struct-returning callee
-        // (#215), a pointer, or `()` for a void callee (a `&mut` mutator called in statement
-        // position, #230).
-        let rt = if let Some(e) = &callee.ret {
+    /// The MLIR spelling of what `callee` returns: a scalar, an `!llvm.struct` by value for a
+    /// struct-returning callee (#215), a pointer, or `()` for a void callee (a `&mut` mutator
+    /// called in statement position, #230).
+    ///
+    /// # Errors
+    ///
+    /// Declines when the return type has no MLIR spelling, or names a struct the module does not
+    /// have a layout for.
+    fn call_return_type(&self, callee: &Callee) -> Lowered<String> {
+        Ok(if let Some(e) = &callee.ret {
             mlir_scalar(e).ok_or(crate::emitter_gap!())?.to_string()
         } else if let Some(agg_gid) = callee.ret_agg {
             self.ctx
@@ -52,8 +71,16 @@ impl FnEmit<'_> {
             return Err(Decline::TypeNotModelled {
                 what: "a callee whose return type has no MLIR spelling",
             });
-        };
-        let n = ins.imm as usize;
+        })
+    }
+
+    /// Takes the last `n` pending arguments, and gives the name and the MLIR type of each.
+    ///
+    /// # Errors
+    ///
+    /// Declines when fewer than `n` arguments are pending, or when an argument has no name or
+    /// no type on record.
+    fn take_call_args(&mut self, n: usize) -> Lowered<(Vec<String>, Vec<String>)> {
         if self.pending_args.len() < n {
             return Err(crate::emitter_gap!());
         }
@@ -92,10 +119,25 @@ impl FnEmit<'_> {
             };
             arg_types.push(at);
         }
-        // A row is a strided view, and the callee takes a plain memref: pass the same memory
-        // under the callee's spelling.
-        let param_tensors = callee.param_tensors.clone();
-        for (k, declared) in param_tensors.iter().enumerate().take(n) {
+        Ok((arg_names, arg_types))
+    }
+
+    /// Casts each tensor argument whose memref spelling differs from the one the callee
+    /// declares. A row is a strided view, and the callee takes a plain memref: pass the same
+    /// memory under the callee's spelling. `declared` is the callee's `param_tensors`.
+    ///
+    /// # Errors
+    ///
+    /// Declines when a cast between the two memref types cannot be written.
+    fn cast_args_to_declared(
+        &mut self,
+        idx: usize,
+        declared: &[Option<String>],
+        arg_names: &mut [String],
+        arg_types: &mut [String],
+    ) -> Lowered<()> {
+        let n = arg_names.len();
+        for (k, declared) in declared.iter().enumerate().take(n) {
             if let Some(declared) = declared {
                 if arg_types[k].starts_with("memref<") && arg_types[k] != *declared {
                     arg_names[k] = self.cast_memref_value(
@@ -104,10 +146,50 @@ impl FnEmit<'_> {
                         &arg_types[k],
                         declared,
                     )?;
-                    arg_types[k] = declared.clone();
+                    arg_types[k].clone_from(declared);
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Records what kind of value the call at `idx` returned, so later instructions can use it.
+    fn record_call_result(&mut self, idx: usize, callee: &Callee) {
+        if let Some(e) = &callee.ret {
+            self.etypes[idx] = Some(e.clone());
+        } else if callee.ret_ptr {
+            self.ptr_of[idx] = true; // the call result is a pointer value (#235)
+            if let Some(pointee) = callee.ret_pointee {
+                self.agg_of[idx] = Some(pointee);
+            }
+        } else if let Some(agg_gid) = callee.ret_agg {
+            // A struct-returning call result is a struct *value*; tracked so it can be
+            // spilled to a slot (`Store`), returned (`Ret`), or passed by value to another
+            // call (#242).
+            self.agg_val_of[idx] = Some(agg_gid);
+        } else if let Some(mt) = &callee.ret_tensor {
+            self.mem_of[idx] = Some(mt.clone()); // a tensor result: downstream ops index it
+        }
+    }
+
+    /// A fixed-arity call. `type_idx` is the callee's GID (resolved to name + return type via
+    /// `ctx.callees`); `imm` is the arg count, taken from the tail of `pending_args`. Emit
+    /// `%r = func.call @name(%a, %b) : (Ta, Tb) -> Tret`.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the callee is not known, when its return type or an argument's type has no
+    /// MLIR spelling, or when fewer arguments are pending than the call takes.
+    pub(crate) fn op_call(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
+        let gid = *self
+            .types
+            .get(ins.type_idx.0 as usize)
+            .ok_or(crate::emitter_gap!())?;
+        let callee = self.ctx.callees.get(&gid).ok_or(crate::emitter_gap!())?;
+        let rt = self.call_return_type(callee)?;
+        let (mut arg_names, mut arg_types) = self.take_call_args(arg_count(ins.imm))?;
+        let param_tensors = callee.param_tensors.clone();
+        self.cast_args_to_declared(idx, &param_tensors, &mut arg_names, &mut arg_types)?;
         // A callee returning a statically shaped tensor writes into a buffer we hand it, so
         // allocate one and pass it as the first argument (#643). The slot goes in our entry block:
         // a call in a loop then reuses one buffer rather than taking a fresh one per iteration,
@@ -129,8 +211,9 @@ impl FnEmit<'_> {
             // A void call binds no result register (MLIR forbids `%v = func.call ... -> ()`);
             // the call is a pure effect (mutation through a `&mut` arg). The private extern decl
             // records an empty return (no `->`) so a void `extern` declares as `(args)`. (#230)
-            self.body += &format!(
-                "  func.call {}({}) : ({}) -> ()\n",
+            let _ = writeln!(
+                self.body,
+                "  func.call {}({}) : ({}) -> ()",
                 sym_ref(&callee.name),
                 arg_names.join(", "),
                 arg_types.join(", "),
@@ -139,8 +222,9 @@ impl FnEmit<'_> {
                 .push((callee.name.clone(), arg_types.clone(), String::new()));
         } else {
             let nm = format!("%v{idx}");
-            self.body += &format!(
-                "  {nm} = func.call {}({}) : ({}) -> {rt}\n",
+            let _ = writeln!(
+                self.body,
+                "  {nm} = func.call {}({}) : ({}) -> {rt}",
                 sym_ref(&callee.name),
                 arg_names.join(", "),
                 arg_types.join(", "),
@@ -151,35 +235,24 @@ impl FnEmit<'_> {
             self.calls
                 .push((callee.name.clone(), arg_types.clone(), rt.clone()));
             self.names[idx] = nm;
-            if let Some(e) = &callee.ret {
-                self.etypes[idx] = Some(e.clone());
-            } else if callee.ret_ptr {
-                self.ptr_of[idx] = true; // the call result is a pointer value (#235)
-                if let Some(pointee) = callee.ret_pointee {
-                    self.agg_of[idx] = Some(pointee);
-                }
-            } else if let Some(agg_gid) = callee.ret_agg {
-                // A struct-returning call result is a struct *value*; tracked so it can be
-                // spilled to a slot (`Store`), returned (`Ret`), or passed by value to another
-                // call (#242).
-                self.agg_val_of[idx] = Some(agg_gid);
-            } else if let Some(mt) = &callee.ret_tensor {
-                self.mem_of[idx] = Some(mt.clone()); // a tensor result: downstream ops index it
-            }
+            self.record_call_result(idx, callee);
         }
         Ok(())
     }
 
-    // An inline `mlir!` block: a call to a private wrapper whose parameters are the block's
-    // named inputs and whose body is its text, the way the oracle wraps one. The wrapper goes
-    // after this function's text. A memref input is cast to the declared type when the
-    // spellings differ (a `?` extent against a static one, a strided row against a plain one).
-    pub(crate) fn op_inline_mlir(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
-        let blk = self
-            .inline_blocks
-            .get(ins.imm as usize)
-            .ok_or(crate::emitter_gap!())?
-            .clone();
+    /// The operands of the call to an inline `mlir!` block's wrapper: the last pending arguments,
+    /// one for each of the block's inputs. A memref input is cast to the declared type when the
+    /// spellings differ.
+    ///
+    /// # Errors
+    ///
+    /// Declines when fewer arguments are pending than the block has inputs, or when an argument
+    /// has no name or no type on record.
+    fn inline_mlir_operands(
+        &mut self,
+        idx: usize,
+        blk: &crate::hir::flatten::InlineBlock,
+    ) -> Lowered<Vec<String>> {
         let n = blk.inputs.len();
         if self.pending_args.len() < n {
             return Err(crate::emitter_gap!());
@@ -207,7 +280,57 @@ impl FnEmit<'_> {
                 operands.push(name);
             }
         }
-        let fname = format!("vx_flat_mlir_{}", self.inline_base + ins.imm as usize);
+        Ok(operands)
+    }
+
+    /// The MLIR type of the value an inline `mlir!` block returns, taken from the instruction's
+    /// `type_idx`. Also records what kind of value register `idx` now holds.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the type is not a scalar, a tensor or a struct that the emitter models.
+    fn inline_mlir_result_type(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<String> {
+        let gid = *self
+            .types
+            .get(ins.type_idx.0 as usize)
+            .ok_or(crate::emitter_gap!())?;
+        if let Some(e) = elem_of_gid(gid) {
+            let t = mlir_scalar(&e).ok_or(crate::emitter_gap!())?.to_string();
+            self.etypes[idx] = Some(e);
+            Ok(t)
+        } else if let Some((e, shape)) = self.ctx.tensors.get(&gid) {
+            let t = tensor_memref_ty(e, shape).ok_or(crate::emitter_gap!())?;
+            self.mem_of[idx] = Some(t.clone());
+            Ok(t)
+        } else if let Some(agg) = self.ctx.aggs.get(&gid) {
+            self.agg_val_of[idx] = Some(gid);
+            Ok(agg.struct_ty.clone())
+        } else {
+            Err(crate::emitter_gap!())
+        }
+    }
+
+    /// An inline `mlir!` block: a call to a private wrapper whose parameters are the block's
+    /// named inputs and whose body is its text, the way the oracle wraps one. The wrapper goes
+    /// after this function's text. A memref input is cast to the declared type when the
+    /// spellings differ (a `?` extent against a static one, a strided row against a plain one).
+    ///
+    /// # Errors
+    ///
+    /// Declines when the instruction names a block the function does not have, when fewer
+    /// arguments are pending than the block has inputs, or when an input or the result has a
+    /// type the emitter does not model.
+    pub(crate) fn op_inline_mlir(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
+        let Ok(block_idx) = usize::try_from(ins.imm) else {
+            return Err(crate::emitter_gap!());
+        };
+        let blk = self
+            .inline_blocks
+            .get(block_idx)
+            .ok_or(crate::emitter_gap!())?
+            .clone();
+        let operands = self.inline_mlir_operands(idx, &blk)?;
+        let fname = format!("vx_flat_mlir_{}", self.inline_base + block_idx);
         let tys: Vec<&str> = blk.inputs.iter().map(|(_, t)| t.as_str()).collect();
         let params: Vec<String> = blk
             .inputs
@@ -217,56 +340,46 @@ impl FnEmit<'_> {
         let ret = if blk.void {
             None
         } else {
-            let gid = *self
-                .types
-                .get(ins.type_idx.0 as usize)
-                .ok_or(crate::emitter_gap!())?;
-            if let Some(e) = elem_of_gid(gid) {
-                let t = mlir_scalar(&e).ok_or(crate::emitter_gap!())?.to_string();
-                self.etypes[idx] = Some(e);
-                Some(t)
-            } else if let Some((e, shape)) = self.ctx.tensors.get(&gid) {
-                let t = tensor_memref_ty(e, shape).ok_or(crate::emitter_gap!())?;
-                self.mem_of[idx] = Some(t.clone());
-                Some(t)
-            } else if let Some(agg) = self.ctx.aggs.get(&gid) {
-                self.agg_val_of[idx] = Some(gid);
-                Some(agg.struct_ty.clone())
-            } else {
-                return Err(crate::emitter_gap!());
-            }
+            Some(self.inline_mlir_result_type(idx, ins)?)
         };
         match &ret {
             Some(rt) => {
                 let nm = format!("%v{idx}");
-                self.body += &format!(
-                    "  {nm} = func.call @{fname}({}) : ({}) -> {rt}\n",
+                let _ = writeln!(
+                    self.body,
+                    "  {nm} = func.call @{fname}({}) : ({}) -> {rt}",
                     operands.join(", "),
                     tys.join(", ")
                 );
                 self.names[idx] = nm;
             }
             None => {
-                self.body += &format!(
-                    "  func.call @{fname}({}) : ({}) -> ()\n",
+                let _ = writeln!(
+                    self.body,
+                    "  func.call @{fname}({}) : ({}) -> ()",
                     operands.join(", "),
                     tys.join(", ")
                 );
             }
         }
         let ret_sig = ret.map(|rt| format!(" -> {rt}")).unwrap_or_default();
-        self.wrappers += &format!(
-            "func.func private @{fname}({}){ret_sig} {{\n{}\n}}\n",
+        let _ = writeln!(
+            self.wrappers,
+            "func.func private @{fname}({}){ret_sig} {{\n{}\n}}",
             params.join(", "),
             blk.body.replace("macro.yield", "return")
         );
         Ok(())
     }
 
-    // Materialize a function pointer for a named function: `type_idx` is the target's GID
-    // (name via `ctx.callees`, signature via `ctx.func_sigs`). Emit `func.constant @name : sig`
-    // then cast the `FunctionType` value to an opaque `!llvm.ptr` (the ABI of a fn pointer),
-    // tracked in `ptr_of`. (#242)
+    /// Materialize a function pointer for a named function: `type_idx` is the target's GID
+    /// (name via `ctx.callees`, signature via `ctx.func_sigs`). Emit `func.constant @name : sig`
+    /// then cast the `FunctionType` value to an opaque `!llvm.ptr` (the ABI of a fn pointer),
+    /// tracked in `ptr_of`. (#242)
+    ///
+    /// # Errors
+    ///
+    /// Declines when the function or its signature is not known.
     pub(crate) fn op_func_const(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let gid = *self
             .types
@@ -277,21 +390,30 @@ impl FnEmit<'_> {
         let fnty = format!("({}) -> {}", params.join(", "), ret);
         let fc = format!("%fc{idx}");
         let nm = format!("%v{idx}");
-        self.body += &format!(
-            "  {fc} = func.constant {} : {fnty}\n",
+        let _ = writeln!(
+            self.body,
+            "  {fc} = func.constant {} : {fnty}",
             sym_ref(&callee.name)
         );
-        self.body +=
-            &format!("  {nm} = builtin.unrealized_conversion_cast {fc} : {fnty} to !llvm.ptr\n");
+        let _ = writeln!(
+            self.body,
+            "  {nm} = builtin.unrealized_conversion_cast {fc} : {fnty} to !llvm.ptr"
+        );
         self.names[idx] = nm;
         self.ptr_of[idx] = true;
         Ok(())
     }
 
-    // A differentiated call (`grad`/`vjp`/`jvp`). `type_idx` is the TARGET's GID, not a callee's:
-    // the target is materialized as a function constant and handed to Enzyme's wrapper as its
-    // first argument, which is the shape Enzyme recognizes. `imm` packs the argument count with
-    // the mode. The wrapper itself is never defined, so it declares like any other extern.
+    /// A differentiated call (`grad`/`vjp`/`jvp`). `type_idx` is the TARGET's GID, not a callee's:
+    /// the target is materialized as a function constant and handed to Enzyme's wrapper as its
+    /// first argument, which is the shape Enzyme recognizes. `imm` packs the argument count with
+    /// the mode. The wrapper itself is never defined, so it declares like any other extern.
+    ///
+    /// # Errors
+    ///
+    /// Declines when the target or its signature is not known, when the target does not return a
+    /// scalar, when an argument is not a scalar, or when fewer arguments are pending than `imm`
+    /// counts.
     pub(crate) fn op_autodiff(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let gid = *self
             .types
@@ -327,12 +449,14 @@ impl FnEmit<'_> {
         }
         let wrapper = crate::codegen::enzyme_wrapper_name(forward, &target.name);
         let nm = format!("%v{idx}");
-        self.body += &format!(
-            "  %fc{idx} = func.constant {} : {fnty}\n",
+        let _ = writeln!(
+            self.body,
+            "  %fc{idx} = func.constant {} : {fnty}",
             sym_ref(&target.name)
         );
-        self.body += &format!(
-            "  {nm} = func.call {}({}) : ({}) -> {ret}\n",
+        let _ = writeln!(
+            self.body,
+            "  {nm} = func.call {}({}) : ({}) -> {ret}",
             sym_ref(&wrapper),
             arg_names.join(", "),
             arg_types.join(", "),
@@ -343,10 +467,16 @@ impl FnEmit<'_> {
         Ok(())
     }
 
-    // An indirect call through a function pointer. `operand1` is the callee `!llvm.ptr`, `imm`
-    // the arg count (the tail of `pending_args`, like `Call`), and this instruction's `type_idx`
-    // the scalar return type. Reconstruct the function type `(arg types)->ret` from the actual
-    // args, cast the pointer to it, and `func.call_indirect`. (#242)
+    /// An indirect call through a function pointer. `operand1` is the callee `!llvm.ptr`, `imm`
+    /// the arg count (the tail of `pending_args`, like `Call`), and this instruction's `type_idx`
+    /// the scalar return type. Reconstruct the function type `(arg types)->ret` from the actual
+    /// args, cast the pointer to it, and `func.call_indirect`. (#242)
+    ///
+    /// # Errors
+    ///
+    /// Declines when the return type is neither a scalar nor a pointer, when fewer arguments are
+    /// pending than the call takes, or when the callee or an argument has no name or no type on
+    /// record.
     pub(crate) fn op_call_indirect(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         // The result is a scalar, or a pointer when the type is the pointer GID.
         let ret_gid = *self
@@ -364,40 +494,7 @@ impl FnEmit<'_> {
             None if ret_ptr => "!llvm.ptr".to_string(),
             None => return Err(crate::emitter_gap!()),
         };
-        let n = ins.imm as usize;
-        if self.pending_args.len() < n {
-            return Err(crate::emitter_gap!());
-        }
-        let args = self.pending_args.split_off(self.pending_args.len() - n);
-        let mut arg_names = Vec::with_capacity(n);
-        let mut arg_types: Vec<String> = Vec::with_capacity(n);
-        for a in &args {
-            arg_names.push(
-                self.names
-                    .get(*a as usize)
-                    .ok_or(crate::emitter_gap!())?
-                    .clone(),
-            );
-            let at = if let Some(e) = self.elem_at(*a) {
-                mlir_scalar(&e).ok_or(crate::emitter_gap!())?.to_string()
-            } else if let Some(agg_gid) = self.agg_val_of.get(*a as usize).copied().flatten() {
-                self.ctx
-                    .aggs
-                    .get(&agg_gid)
-                    .ok_or(crate::emitter_gap!())?
-                    .struct_ty
-                    .clone()
-            } else if self.is_pointer_value(*a as usize)? {
-                "!llvm.ptr".to_string()
-            } else {
-                self.mem_of
-                    .get(*a as usize)
-                    .ok_or(crate::emitter_gap!())?
-                    .clone()
-                    .ok_or(crate::emitter_gap!())?
-            };
-            arg_types.push(at);
-        }
+        let (arg_names, arg_types) = self.take_call_args(arg_count(ins.imm))?;
         let fnty = format!("({}) -> {rt}", arg_types.join(", "));
         let fnptr = self
             .names
@@ -406,10 +503,13 @@ impl FnEmit<'_> {
             .clone();
         let fc = format!("%fc{idx}");
         let nm = format!("%v{idx}");
-        self.body +=
-            &format!("  {fc} = builtin.unrealized_conversion_cast {fnptr} : !llvm.ptr to {fnty}\n");
-        self.body += &format!(
-            "  {nm} = func.call_indirect {fc}({}) : {fnty}\n",
+        let _ = writeln!(
+            self.body,
+            "  {fc} = builtin.unrealized_conversion_cast {fnptr} : !llvm.ptr to {fnty}"
+        );
+        let _ = writeln!(
+            self.body,
+            "  {nm} = func.call_indirect {fc}({}) : {fnty}",
             arg_names.join(", ")
         );
         self.names[idx] = nm;

@@ -1,3 +1,10 @@
+//! Integration tests that run the whole Vx compiler on real programs.
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
+
 mod integration_test {
     // The whole module is macOS-only: it drives CoreML through a Python
     // interpreter that only exists there. Gating the test alone leaves its

@@ -10,18 +10,26 @@
 //
 //===----------------------------------------------------------------------===//
 
-use super::*;
+use super::{BinaryOp, Expr, IdentifierExpr, IfExpr, Span, TokenTree, Type, UnaryOp, UnaryOpExpr};
 use crate::symbol::Symbol;
 
+/// `let name = expr;`: declares a variable and gives it its first value.
 #[derive(Debug, PartialEq, Clone)]
 pub struct LetDeclStmt {
+    /// The name of the variable.
     pub name: Symbol,
+    /// Whether the variable is declared `let mut`, so it can be assigned again.
     pub is_mut: bool,
+    /// The type written after the name, if any.
     pub ty_ann: Option<Type>,
+    /// The first value of the variable.
     pub expr: Expr,
+    /// Where the statement is in the source file.
     pub span: Span,
 }
 impl LetDeclStmt {
+    /// Builds a `let` statement.
+    #[must_use]
     pub fn new(name: String, is_mut: bool, ty_ann: Option<Type>, expr: Expr, span: Span) -> Self {
         Self {
             name: name.into(),
@@ -33,27 +41,38 @@ impl LetDeclStmt {
     }
 }
 
+/// `return expr;` or a bare `return;`.
 #[derive(Debug, PartialEq, Clone)]
 pub struct ReturnStmt {
     /// `None` for a bare `return;`, which only a `void` function may write. Modelled as an
     /// absence rather than a synthesized zero: a `void` function has no value to return, and
     /// inventing one would have to be typed as something.
     pub expr: Option<Expr>,
+    /// Where the statement is in the source file.
     pub span: Span,
 }
 impl ReturnStmt {
+    /// Builds a `return` statement.
+    #[must_use]
     pub fn new(expr: Option<Expr>, span: Span) -> Self {
         Self { expr, span }
     }
 }
 
+/// An expression used as a statement, such as a call.
 #[derive(Debug, PartialEq, Clone)]
 pub struct ExprStmtStmt {
+    /// The expression.
     pub expr: Expr,
+    /// Whether a `;` follows the expression. The last expression of a block with no `;` is the
+    /// value of the block.
     pub has_semi: bool,
+    /// Where the statement is in the source file.
     pub span: Span,
 }
 impl ExprStmtStmt {
+    /// Builds an expression statement.
+    #[must_use]
     pub fn new(expr: Expr, has_semi: bool, span: Span) -> Self {
         Self {
             expr,
@@ -63,18 +82,26 @@ impl ExprStmtStmt {
     }
 }
 
+/// `for iter in iterable { body }`.
 #[derive(Debug, PartialEq, Clone)]
 pub struct ForLoopStmt {
+    /// The name of the loop variable.
     pub iter: String,
+    /// The value the loop goes over, such as a range.
     pub iterable: Box<Expr>,
+    /// The conditions the programmer says hold at the start of every pass.
     pub invariants: Vec<Expr>,
+    /// The statements that run on every pass.
     pub body: Vec<Statement>,
+    /// Where the statement is in the source file.
     pub span: Span,
     /// The `next` the checker resolved for this loop's iterator, by its instance name. Two
     /// instances of one generic iterator have two `next`s, and only the checker knows which.
     pub next_fn: Option<crate::symbol::Symbol>,
 }
 impl ForLoopStmt {
+    /// Builds a `for` loop. The checker fills in `next_fn` later.
+    #[must_use]
     pub fn new(
         iter: String,
         iterable: Box<Expr>,
@@ -93,29 +120,42 @@ impl ForLoopStmt {
     }
 }
 
+/// `lhs = rhs;`.
 #[derive(Debug, PartialEq, Clone)]
 pub struct AssignStmt {
+    /// The place that is assigned to.
     pub lhs: Expr,
+    /// The value that is assigned.
     pub rhs: Expr,
+    /// Where the statement is in the source file.
     pub span: Span,
 }
 impl AssignStmt {
+    /// Builds an assignment.
+    #[must_use]
     pub fn new(lhs: Expr, rhs: Expr, span: Span) -> Self {
         Self { lhs, rhs, span }
     }
 }
 
+/// An assignment with an operator, such as `lhs += rhs;`.
 #[derive(Debug, PartialEq, Clone)]
 pub struct CompoundAssignStmt {
+    /// The place that is read and then assigned to.
     pub lhs: Expr,
+    /// The operator: `Add` for `+=`.
     pub op: BinaryOp,
+    /// The right operand.
     pub rhs: Expr,
+    /// Where the statement is in the source file.
     pub span: Span,
     /// The accumulator's element type, filled in by the checker, for the same reason
     /// `BinaryOpExpr` carries one: `/=`, `%=` and `>>=` need the sign.
     pub operand_ty: Option<crate::syntax::ElementType>,
 }
 impl CompoundAssignStmt {
+    /// Builds an assignment with an operator. The checker fills in `operand_ty` later.
+    #[must_use]
     pub fn new(lhs: Expr, op: BinaryOp, rhs: Expr, span: Span) -> Self {
         Self {
             lhs,
@@ -127,25 +167,37 @@ impl CompoundAssignStmt {
     }
 }
 
+/// `assert(expr);` or `assert(expr, "message");`.
 #[derive(Debug, PartialEq, Clone)]
 pub struct AssertStmt {
+    /// The condition that must be true.
     pub expr: Box<Expr>,
+    /// The message to show when the condition is false, if one was written.
     pub msg: Option<String>,
+    /// Where the statement is in the source file.
     pub span: Span,
 }
 impl AssertStmt {
+    /// Builds an `assert` statement.
+    #[must_use]
     pub fn new(expr: Box<Expr>, msg: Option<String>, span: Span) -> Self {
         Self { expr, msg, span }
     }
 }
 
+/// `loop { body }`: runs until a `break` or a `return`.
 #[derive(Debug, PartialEq, Clone)]
 pub struct LoopStmt {
+    /// The conditions the programmer says hold at the start of every pass.
     pub invariants: Vec<Expr>,
+    /// The statements that run on every pass.
     pub body: Vec<Statement>,
+    /// Where the statement is in the source file.
     pub span: Span,
 }
 impl LoopStmt {
+    /// Builds a `loop` statement.
+    #[must_use]
     pub fn new(invariants: Vec<Expr>, body: Vec<Statement>, span: Span) -> Self {
         Self {
             invariants,
@@ -155,35 +207,51 @@ impl LoopStmt {
     }
 }
 
+/// `break;`: leaves the nearest loop.
 #[derive(Debug, PartialEq, Clone)]
 pub struct BreakStmt {
+    /// Where the statement is in the source file.
     pub span: Span,
 }
 impl BreakStmt {
+    /// Builds a `break` statement.
+    #[must_use]
     pub fn new(span: Span) -> Self {
         Self { span }
     }
 }
 
+/// `continue;`: starts the next pass of the nearest loop.
 #[derive(Debug, PartialEq, Clone)]
 pub struct ContinueStmt {
+    /// Where the statement is in the source file.
     pub span: Span,
 }
 impl ContinueStmt {
+    /// Builds a `continue` statement.
+    #[must_use]
     pub fn new(span: Span) -> Self {
         Self { span }
     }
 }
 
+/// A macro call used as a statement, such as `name!(tokens);`, before the macro is expanded.
 #[derive(Debug, PartialEq, Clone)]
 pub struct MacroCallStmt {
+    /// The name of the macro.
     pub name: Symbol,
+    /// The tokens between the delimiters of the call.
     pub token_tree: TokenTree,
+    /// The tokens of a block written after the call, if there is one.
     pub block_tree: Option<TokenTree>,
+    /// Whether a `;` follows the call.
     pub has_semi: bool,
+    /// Where the statement is in the source file.
     pub span: Span,
 }
 impl MacroCallStmt {
+    /// Builds a macro call statement.
+    #[must_use]
     pub fn new(
         name: String,
         token_tree: TokenTree,
@@ -204,6 +272,7 @@ impl MacroCallStmt {
 /// `Statement::Drop`: the tensor named here is freed at this point.
 #[derive(Debug, PartialEq, Clone)]
 pub struct DropStmt {
+    /// The variable that owns what is freed.
     pub name: Symbol,
     /// The fields to follow from `name` to the tensor freed: `["inner", "t"]` for
     /// `name.inner.t`. Empty when `name` is the tensor.
@@ -219,12 +288,19 @@ pub struct DropStmt {
     /// Freed only once the next statement has computed its value: a `return`'s, a block's last
     /// expression, or an assignment's right-hand side, which may still read the tensor.
     pub after_value: bool,
+    /// Where the statement is in the source file.
     pub span: Span,
 }
 
 impl DropStmt {
     /// For a drop that calls a `Drop` impl, or drops an enum's payload: the statement that
     /// does it, inside `if !moved { .. }` when the value may have been moved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this drop calls a `Drop` impl but `expr` is `None`. The checker fills in `expr`
+    /// for every such drop.
+    #[must_use]
     pub fn call_statement(&self) -> Option<Statement> {
         let payload = matches!(self.expr.as_deref(), Some(Expr::Match(_)));
         if self.call.is_none() && !payload {
@@ -261,22 +337,35 @@ impl DropStmt {
     }
 }
 
+/// One statement of a function body or a block.
 #[derive(Debug, PartialEq, Clone)]
 pub enum Statement {
+    /// `let name = expr;`
     LetDecl(LetDeclStmt),
+    /// `return expr;`
     Return(ReturnStmt),
+    /// An expression used as a statement.
     ExprStmt(ExprStmtStmt),
+    /// `for iter in iterable { .. }`
     ForLoop(ForLoopStmt),
+    /// `lhs = rhs;`
     Assign(AssignStmt),
+    /// An assignment with an operator, such as `lhs += rhs;`
     CompoundAssign(CompoundAssignStmt),
+    /// `assert(expr);`
     Assert(AssertStmt),
+    /// `loop { .. }`
     Loop(LoopStmt),
+    /// `break;`
     Break(BreakStmt),
+    /// `continue;`
     Continue(ContinueStmt),
+    /// A macro call that is not expanded yet.
     MacroCall(MacroCallStmt),
     /// Free what the tensor `name` owns. Never written by a programmer: the checker puts it
     /// where the tensor's drop point is.
     Drop(DropStmt),
+    /// A statement the parser could not read. It holds where the bad text is.
     Error(Span),
 }
 
@@ -300,7 +389,45 @@ macro_rules! delegate_stmt {
     };
 }
 
+impl ForLoopStmt {
+    /// A copy of the loop with each type name in `mapping` replaced by its type.
+    fn substitute(&self, mapping: &std::collections::HashMap<crate::symbol::Symbol, Type>) -> Self {
+        let e = self;
+        ForLoopStmt {
+            iter: e.iter.clone(),
+            iterable: Box::new(e.iterable.substitute(mapping)),
+            invariants: e
+                .invariants
+                .iter()
+                .map(|expr| expr.substitute(mapping))
+                .collect(),
+            body: e.body.iter().map(|s| s.substitute(mapping)).collect(),
+            span: e.span,
+            next_fn: e.next_fn.clone(),
+        }
+    }
+}
+
+impl LoopStmt {
+    /// A copy of the loop with each type name in `mapping` replaced by its type.
+    fn substitute(&self, mapping: &std::collections::HashMap<crate::symbol::Symbol, Type>) -> Self {
+        let e = self;
+        LoopStmt {
+            invariants: e
+                .invariants
+                .iter()
+                .map(|expr| expr.substitute(mapping))
+                .collect(),
+            body: e.body.iter().map(|s| s.substitute(mapping)).collect(),
+            span: e.span,
+        }
+    }
+}
+
 impl Statement {
+    /// A copy of the statement with each type name in `mapping` replaced by its type. This is
+    /// how the body of a generic function gets its type arguments.
+    #[must_use]
     pub fn substitute(
         &self,
         mapping: &std::collections::HashMap<crate::symbol::Symbol, Type>,
@@ -322,18 +449,7 @@ impl Statement {
                 has_semi: e.has_semi,
                 span: e.span,
             }),
-            Statement::ForLoop(e) => Statement::ForLoop(ForLoopStmt {
-                iter: e.iter.clone(),
-                iterable: Box::new(e.iterable.substitute(mapping)),
-                invariants: e
-                    .invariants
-                    .iter()
-                    .map(|expr| expr.substitute(mapping))
-                    .collect(),
-                body: e.body.iter().map(|s| s.substitute(mapping)).collect(),
-                span: e.span,
-                next_fn: e.next_fn.clone(),
-            }),
+            Statement::ForLoop(e) => Statement::ForLoop(e.substitute(mapping)),
             Statement::Assign(e) => Statement::Assign(AssignStmt {
                 lhs: e.lhs.substitute(mapping),
                 rhs: e.rhs.substitute(mapping),
@@ -351,15 +467,7 @@ impl Statement {
                 msg: e.msg.clone(),
                 span: e.span,
             }),
-            Statement::Loop(e) => Statement::Loop(LoopStmt {
-                invariants: e
-                    .invariants
-                    .iter()
-                    .map(|expr| expr.substitute(mapping))
-                    .collect(),
-                body: e.body.iter().map(|s| s.substitute(mapping)).collect(),
-                span: e.span,
-            }),
+            Statement::Loop(e) => Statement::Loop(e.substitute(mapping)),
             Statement::Break(e) => Statement::Break(e.clone()),
             Statement::Continue(e) => Statement::Continue(e.clone()),
             Statement::MacroCall(e) => Statement::MacroCall(MacroCallStmt {
@@ -374,6 +482,8 @@ impl Statement {
         }
     }
 
+    /// Where the statement is in the source file. Not for `Statement::Error`.
+    #[must_use]
     pub fn span(&self) -> Span {
         delegate_stmt!(self, s => s.span)
     }

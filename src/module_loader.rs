@@ -22,19 +22,24 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Why loading a module failed.
 #[derive(Debug)]
 pub enum ModuleError {
+    /// A file could not be read: its name, and the error from the operating system.
     IO(String, std::io::Error),
+    /// A file did not parse: its name, and the parse error.
     Parse(String, crate::error::Error),
+    /// An import led to no file, or a module declares a name that only the standard library may
+    /// declare, such as `Option`.
     Resolution(String),
 }
 
 impl std::fmt::Display for ModuleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ModuleError::IO(file, err) => write!(f, "Failed to open file '{}': {}", file, err),
-            ModuleError::Parse(file, err) => write!(f, "Parse failed in '{}': {}", file, err),
-            ModuleError::Resolution(err) => write!(f, "Resolution error: {}", err),
+            ModuleError::IO(file, err) => write!(f, "Failed to open file '{file}': {err}"),
+            ModuleError::Parse(file, err) => write!(f, "Parse failed in '{file}': {err}"),
+            ModuleError::Resolution(err) => write!(f, "Resolution error: {err}"),
         }
     }
 }
@@ -47,10 +52,13 @@ enum Resolved {
     Interface(Vec<u8>),
 }
 
+/// Finds, reads and parses the modules of a program, following `import` lines.
 pub struct ModuleLoader {
+    /// The directories an import path is looked up in, in order.
     search_paths: Vec<PathBuf>,
     /// `--package name=dir`: an import that starts with `name` is read from `dir` and nowhere else.
     packages: Vec<(String, PathBuf)>,
+    /// The modules `load_main` parsed, by module name.
     pub loaded_modules: HashMap<crate::symbol::Symbol, Program>,
     /// Imports resolved to a precompiled `.vxlib` **interface** instead of `.vx` source (#219): the
     /// module's source is never parsed, and its serialized module-interface bytes are collected here
@@ -68,6 +76,10 @@ pub struct ModuleLoader {
 }
 
 impl ModuleLoader {
+    /// Makes a loader that has loaded nothing, with the standard library directories and the
+    /// working directory as its search paths. `VX_STD_PATH` replaces the standard library
+    /// directories when it is set.
+    #[must_use]
     pub fn new() -> Self {
         let mut search_paths = Vec::new();
         if let Ok(env_path) = std::env::var("VX_STD_PATH") {
@@ -113,6 +125,12 @@ impl ModuleLoader {
         self.packages.push((name.to_string(), dir.to_path_buf()));
     }
 
+    /// Load the file `filename` and every module it imports, transitively, one after another,
+    /// and keep them in `loaded_modules`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a file cannot be read or parsed, or an import leads to no file.
     pub fn load_main(&mut self, filename: &str) -> Result<(), ModuleError> {
         let main_program = Self::parse_file(Path::new(filename), filename.into())?;
         self.paths.insert(filename.into(), PathBuf::from(filename));
@@ -141,6 +159,11 @@ impl ModuleLoader {
     ///
     /// A root is known by its file name and an import by its import path, as in `load_main`. An
     /// import that resolves to a `.vxlib` interface lands in `loaded_interfaces` and is not parsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a file cannot be read or parsed, an import leads to no file, or
+    /// a module declares a name that only the standard library may declare.
     pub fn load_all(
         &mut self,
         roots: &[String],
@@ -202,6 +225,16 @@ impl ModuleLoader {
 
     /// Parse again each module that declares or sees a name another module also declares, with
     /// that name renamed where it is not the declaration the whole compile keeps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a module declares a name that only the standard library may
+    /// declare, or a module cannot be read or parsed the second time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a module to rename was not loaded by this loader, or if renaming changed one
+    /// of its import paths.
     fn rename_clashes(&self, programs: &mut [Program]) -> Result<(), ModuleError> {
         let plan =
             crate::name_clashes::plan(programs, &self.roots).map_err(ModuleError::Resolution)?;
@@ -210,13 +243,13 @@ impl ModuleLoader {
                 continue;
             };
             let path = &self.paths[&program.module_path];
-            let renamed = Self::parse_file_renaming(path, program.module_path.clone(), renames)?;
+            let reparsed = Self::parse_file_renaming(path, program.module_path.clone(), renames)?;
             // The imports were already followed as first parsed.
             assert_eq!(
-                renamed.imports, program.imports,
+                reparsed.imports, program.imports,
                 "renaming a clashing name changed an import path"
             );
-            *program = renamed;
+            *program = reparsed;
         }
         Ok(())
     }
@@ -224,6 +257,10 @@ impl ModuleLoader {
     /// Where an import leads: a source file to parse, or a precompiled interface, which is
     /// preferred when both sit where the source would and is read here so nothing about
     /// resolution is left for the caller to do serially.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the interface file cannot be read, or no source file is found.
     fn resolve_import(&self, path: &[Symbol]) -> Result<Resolved, ModuleError> {
         if let Some(artifact) = self.resolve_artifact_path(path) {
             let buf = fs::read(&artifact)
@@ -246,6 +283,14 @@ impl ModuleLoader {
     /// leaves nothing here. Calling this after it used to return an empty `Vec`, and a caller
     /// following the older shape -- `load_all(..)?; let programs = loader.into_programs();` --
     /// compiled nothing at all, with no error anywhere to say so.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a module declares a name that only the standard library may declare.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `load_all` was called on this loader, because it then kept no modules.
     pub fn into_programs(self) -> Result<Vec<Program>, ModuleError> {
         assert!(
             !self.returned_modules_directly,
@@ -260,7 +305,7 @@ impl ModuleLoader {
     /// The name a module is known by: its import path joined with `::`.
     fn module_name(path: &[Symbol]) -> Symbol {
         path.iter()
-            .map(|s| s.as_ref())
+            .map(std::convert::AsRef::as_ref)
             .collect::<Vec<_>>()
             .join("::")
             .as_str()
@@ -268,10 +313,21 @@ impl ModuleLoader {
     }
 
     /// Read and parse one file as the module `module_path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read or does not parse.
     fn parse_file(path: &Path, module_path: Symbol) -> Result<Program, ModuleError> {
         Self::parse_file_renaming(path, module_path, &HashMap::new())
     }
 
+    /// Read and parse one file as the module `module_path`, with the names in `renames` renamed
+    /// before parsing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read, a rename cannot be applied, or the file
+    /// does not parse.
     fn parse_file_renaming(
         path: &Path,
         module_path: Symbol,
@@ -338,6 +394,12 @@ impl ModuleLoader {
         self.resolve_with_ext(path, "vxlib")
     }
 
+    /// Load the module at import path `path` and everything it imports, unless it is loaded
+    /// already.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a file cannot be read or parsed, or an import leads to no file.
     fn load_import(&mut self, path: &[Symbol]) -> Result<(), ModuleError> {
         let module_name = Self::module_name(path);
         if self.loaded_modules.contains_key(&module_name)
@@ -382,6 +444,11 @@ impl Default for ModuleLoader {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "a test reports a failure by panicking"
+)]
 mod tests {
     use super::*;
 

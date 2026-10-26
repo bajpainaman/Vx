@@ -37,6 +37,7 @@ pub use crate::registry::ImmutableGlobalRegistry;
 ///    prefetcher can stream through the dense `slow_path_arena` at maximum bandwidth
 ///    during the critical lifetime subtyping pass, without stalling on scattered `Vec` pointers.
 pub struct GlobalSession {
+    /// A number that identifies this session among the sessions of one compile.
     pub epoch: u64,
     /// How this compilation forms a generic instantiation's identity.
     ///
@@ -46,6 +47,7 @@ pub struct GlobalSession {
     /// process-global until Vx#381 -- set from `--intern-mode` on one thread and read by every
     /// worker from inside the parallel type-check.
     pub intern_mode: crate::intern_mode::InternMode,
+    /// The frozen table of type definitions, shared by all worker threads.
     pub registry: Arc<ImmutableGlobalRegistry>,
 
     /// The dense, homogeneous arena for complex parameter and lifetime evaluation.
@@ -55,12 +57,19 @@ pub struct GlobalSession {
     /// The heterogeneous arena for structural generic instantiations.
     /// Separated to prevent cache fragmentation in the `slow_path_arena`.
     pub generics_arena: Arc<Vec<TypeId>>,
+    /// For each generic instantiation, where its type arguments are in `generics_arena`: the start
+    /// and the length.
     pub generics_offsets: Arc<Vec<(usize, usize)>>,
 }
 
 impl GlobalSession {
     /// A session with an *empty* frozen registry — for callers that don't build one (the
     /// sequential driver, unit tests). The parallel pipeline uses [`Self::with_registry`].
+    ///
+    /// # Panics
+    ///
+    /// Only if building a registry from no definitions fails, which would be a bug in the registry.
+    #[must_use]
     pub fn new(epoch: u64) -> Self {
         Self::with_registry(
             epoch,
@@ -70,6 +79,7 @@ impl GlobalSession {
     }
 
     /// A session holding the frozen registry built at the Phase 2 freeze point.
+    #[must_use]
     pub fn with_registry(epoch: u64, registry: ImmutableGlobalRegistry) -> Self {
         Self {
             epoch,
@@ -84,6 +94,7 @@ impl GlobalSession {
     /// The same session with a chosen interning strategy. Consuming rather than a setter, because
     /// the session is frozen once it is shared: every worker holds an `Arc` of it and reads it by
     /// `&`, so it must be settled before it is wrapped.
+    #[must_use]
     pub fn in_intern_mode(mut self, mode: crate::intern_mode::InternMode) -> Self {
         self.intern_mode = mode;
         self
@@ -92,15 +103,21 @@ impl GlobalSession {
 
 /// Represents the mutable present of a single worker thread during Phase 1.
 pub struct LocalWorkerState {
+    /// The frozen session this worker reads from.
     pub global: Arc<GlobalSession>,
 
     // Completely lock-free, thread-local mutation
+    /// Parameter and lifetime metadata that this worker added.
     pub local_slow_path_arena: Vec<UnboundedFunctionMetadata>,
+    /// The type arguments of the generic instantiations that this worker added.
     pub local_generics_arena: Vec<TypeId>,
+    /// For each of those instantiations, its start and its length in `local_generics_arena`.
     pub local_generics_offsets: Vec<(usize, usize)>,
 
     // The flat arrays replacing the AST
+    /// The types that the instructions refer to. A `TypeIdx` is an index into this list.
     pub local_type_stream: Vec<TypeId>, // array of 256-bit GIDs
+    /// The bytecode of the function this worker is compiling.
     pub local_hir_stream: Vec<HirInstruction>,
 
     /// Tensor-type side table: `GID -> (element, shape)` for every tensor type this function's stream
@@ -139,6 +156,8 @@ pub struct LocalWorkerState {
 use crate::gid::LifetimeSignature;
 
 impl LocalWorkerState {
+    /// A worker state with nothing recorded yet.
+    #[must_use]
     pub fn new(global: Arc<GlobalSession>) -> Self {
         Self {
             global,
@@ -155,29 +174,34 @@ impl LocalWorkerState {
         }
     }
 
+    /// Finds the lifetime information of a type from its id.
+    ///
+    /// # Panics
+    ///
+    /// If the id holds an arena index that does not fit in `usize`. An index into a list that is
+    /// held in memory always fits.
     #[inline(always)]
+    #[must_use]
     pub fn resolve_lifetime<'a>(&'a self, type_id: &TypeId) -> LifetimeSignature<'a> {
         use crate::gid::{Word2, Word2Arena, Word2Scope};
         match type_id.classify_word2() {
             Word2::FastLifetime(bits) => LifetimeSignature::FastPath(bits),
             // A *pure* generic instantiation carries no lifetime metadata (its arena holds only type
-            // arguments), so it is lifetime-unconstrained ('static). A type that is both generic and
-            // borrowed lives in the SlowMeta arena, which carries the lifetimes.
+            // arguments), so it is lifetime-unconstrained ('static), whether its identity is an
+            // arena index or a content digest. A type that is both generic and borrowed lives in
+            // the SlowMeta arena, which is untouched by content addressing and carries the
+            // lifetimes.
             Word2::Index {
                 arena: Word2Arena::Generics,
                 ..
-            } => LifetimeSignature::FastPath(0),
-            // Same reasoning as the generics-arena case above, and for the same reason: a *pure*
-            // generic instantiation carries no lifetime metadata, whether its identity is an arena
-            // index or a content digest. A type that is both generic and borrowed lives in the
-            // SlowMeta arena, which is untouched by content addressing and still carries lifetimes.
-            Word2::GenericDigest(_) => LifetimeSignature::FastPath(0),
+            }
+            | Word2::GenericDigest(_) => LifetimeSignature::FastPath(0),
             Word2::Index {
                 index,
                 arena: Word2Arena::SlowMeta,
                 scope,
             } => {
-                let i = index as usize;
+                let i = usize::try_from(index).expect("an arena index fits in usize");
                 match scope {
                     Word2Scope::Local => {
                         LifetimeSignature::SlowPath(&self.local_slow_path_arena[i])

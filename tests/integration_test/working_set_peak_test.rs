@@ -270,7 +270,10 @@ fn resident(log: &str) -> Option<(u64, usize)> {
         let end = rest.find(|c: char| !c.is_ascii_digit())?;
         rest[..end].parse().ok()
     };
-    Some((field("total_bytes")?, field("tiles")? as usize))
+    Some((
+        field("total_bytes")?,
+        usize::try_from(field("tiles")?).ok()?,
+    ))
 }
 
 #[test]
@@ -305,7 +308,7 @@ fn the_working_set_is_the_peak_of_what_coexists() {
                 wrong.push(format!(
                     "{}: expected {} bytes over {} tile(s), got {} over {}\n{program}",
                     case.what, expected, case.tiles, bytes, tiles
-                ))
+                ));
             }
             Some(_) => {}
         }

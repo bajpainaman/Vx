@@ -15,12 +15,15 @@
 
 use std::ffi::{c_char, CStr};
 use std::ptr;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // ============================================================================
 // Math & Core Functions
 // ============================================================================
 
+/// The handler for a bad memory access: prints which signal arrived and a backtrace,
+/// then stops the program.
 #[no_mangle]
 pub extern "C" fn vx_sigsegv_handler(sig: libc::c_int) {
     // A wild memory access can surface as either SIGSEGV (unmapped page) or
@@ -43,6 +46,8 @@ pub extern "C" fn vx_sigsegv_handler(sig: libc::c_int) {
 /// buffered when it is a pipe, and `abort` does not flush it, so the message was lost. Flush,
 /// then let the abort go on.
 extern "C" fn vx_sigabrt_handler(_sig: libc::c_int) {
+    // SAFETY: these are plain libc calls with valid arguments: a null stream flushes
+    // every open stream, and `SIG_DFL` is a valid handler for `SIGABRT`.
     unsafe {
         libc::fflush(ptr::null_mut());
         libc::signal(libc::SIGABRT, libc::SIG_DFL);
@@ -50,8 +55,12 @@ extern "C" fn vx_sigabrt_handler(_sig: libc::c_int) {
     }
 }
 
+/// Installs the handlers that report an abort or a bad memory access before the
+/// program stops.
 #[no_mangle]
 pub extern "C" fn vx_init_signals() {
+    // SAFETY: both handlers are `extern "C"` functions that take the signal number,
+    // which is the shape `signal` expects.
     unsafe {
         libc::signal(
             libc::SIGABRT,
@@ -68,27 +77,37 @@ pub extern "C" fn vx_init_signals() {
     }
 }
 
+/// The square root of `x`.
 #[no_mangle]
 pub extern "C" fn vx_sqrtf(x: f32) -> f32 {
     x.sqrt()
 }
 
+/// The number e raised to the power `x`.
 #[no_mangle]
 pub extern "C" fn vx_expf(x: f32) -> f32 {
     x.exp()
 }
 
+/// The cosine of `x`, where `x` is in radians.
 #[no_mangle]
 pub extern "C" fn vx_cosf(x: f32) -> f32 {
     x.cos()
 }
 
+/// The sine of `x`, where `x` is in radians.
 #[no_mangle]
 pub extern "C" fn vx_sinf(x: f32) -> f32 {
     x.sin()
 }
 
+/// The rotation angle that rotary position embedding (`RoPE`) uses for token position
+/// `pos` and pair number `i`, in a head with `head_size` values.
 #[no_mangle]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "positions and head sizes are small numbers, and a rounded angle is fine for a larger one"
+)]
 pub extern "C" fn vx_get_rope_freq(pos: i32, i: i32, head_size: i32) -> f32 {
     let freq = 10000.0f32.powf(-(i as f32) / (head_size as f32));
     (pos as f32) * freq
@@ -98,24 +117,30 @@ pub extern "C" fn vx_get_rope_freq(pos: i32, i: i32, head_size: i32) -> f32 {
 // Timing & Benchmarking
 // ============================================================================
 
-static mut BENCHMARK_START: Option<Instant> = None;
-static mut GLOBAL_START: Option<Instant> = None;
+/// When `start_benchmark` was last called.
+static BENCHMARK_START: Mutex<Option<Instant>> = Mutex::new(None);
+/// When `vx_get_time` was first called.
+static GLOBAL_START: OnceLock<Instant> = OnceLock::new();
 
+/// Starts the benchmark timer, and returns 0.
 #[no_mangle]
 pub extern "C" fn start_benchmark() -> f32 {
-    unsafe {
-        BENCHMARK_START = Some(Instant::now());
-    }
+    *BENCHMARK_START
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
     0.0
 }
 
+/// Prints the seconds since `start_benchmark` was called. Prints nothing when it was
+/// never called.
 #[no_mangle]
 pub extern "C" fn end_benchmark() {
-    unsafe {
-        if let Some(start) = BENCHMARK_START {
-            let elapsed = start.elapsed().as_secs_f32();
-            println!("{}", elapsed);
-        }
+    let start = *BENCHMARK_START
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(start) = start {
+        let elapsed = start.elapsed().as_secs_f32();
+        println!("{elapsed}");
     }
 }
 
@@ -134,7 +159,9 @@ pub extern "C" fn vx_bench_report(name: *const c_char, unit: *const c_char, valu
         eprintln!("vx_bench_report: null name or unit");
         return 1;
     }
+    // SAFETY: the caller passes a NUL-terminated C string that stays alive for this call.
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+    // SAFETY: the caller passes a NUL-terminated C string that stays alive for this call.
     let unit = unsafe { CStr::from_ptr(unit) }.to_string_lossy();
     if name.contains(char::is_whitespace) || unit.contains(char::is_whitespace) {
         eprintln!("vx_bench_report: name and unit must not contain whitespace");
@@ -144,23 +171,26 @@ pub extern "C" fn vx_bench_report(name: *const c_char, unit: *const c_char, valu
     0
 }
 
+/// The seconds since the first call to this function, so the first call returns about 0.
 #[no_mangle]
-#[allow(static_mut_refs)]
 pub extern "C" fn vx_get_time() -> f32 {
-    unsafe {
-        if GLOBAL_START.is_none() {
-            GLOBAL_START = Some(Instant::now());
-        }
-        GLOBAL_START.unwrap().elapsed().as_secs_f32()
-    }
+    GLOBAL_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_secs_f32()
 }
 
+/// Pauses the calling thread for `seconds`, and returns 0.
+///
+/// # Panics
+/// Panics if `seconds` is negative, not a number, or too large for a `Duration`.
 #[no_mangle]
 pub extern "C" fn vx_sleep(seconds: f32) -> i32 {
     thread::sleep(Duration::from_secs_f32(seconds));
     0
 }
 
+/// The seconds since 1 January 1970, or 0 when the system clock is set before that day.
 #[no_mangle]
 pub extern "C" fn vx_unix_timestamp() -> f64 {
     SystemTime::now()
@@ -168,11 +198,13 @@ pub extern "C" fn vx_unix_timestamp() -> f64 {
         .unwrap_or(Duration::ZERO)
         .as_secs_f64()
 }
+/// Prints the line that marks the start of a traced region.
 #[no_mangle]
 pub extern "C" fn trace_start() {
     println!("[TRACE START] Event ID: 100");
 }
 
+/// Prints the line that marks the end of a traced region.
 #[no_mangle]
 pub extern "C" fn trace_end() {
     println!("[TRACE END] Event ID: 100");
@@ -190,66 +222,85 @@ pub extern "C" fn trace_end() {
 /// the pointer-facing paths can be exercised on their own.
 #[no_mangle]
 pub extern "C" fn vx_alloc_f32(n: i32) -> *mut f32 {
-    if n <= 0 {
-        return ptr::null_mut();
-    }
-    let mut buf = vec![0.0f32; n as usize];
-    let p = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    p
+    let len = match usize::try_from(n) {
+        Ok(len) if len > 0 => len,
+        _ => return ptr::null_mut(),
+    };
+    Box::into_raw(vec![0.0f32; len].into_boxed_slice()).cast::<f32>()
 }
 
 /// Free a buffer from `vx_alloc_f32`. The length is required because the
-/// allocation is a `Vec`, and reconstructing one needs the capacity it was
+/// allocation is a boxed slice, and reconstructing one needs the length it was
 /// created with.
 #[no_mangle]
 pub extern "C" fn vx_free_f32(p: *mut f32, n: i32) {
-    if p.is_null() || n <= 0 {
-        return;
-    }
+    let len = match usize::try_from(n) {
+        Ok(len) if len > 0 && !p.is_null() => len,
+        _ => return,
+    };
+    // SAFETY: the caller passes a pointer from `vx_alloc_f32` and the same `n`, so this
+    // rebuilds the boxed slice that was leaked there.
     unsafe {
-        drop(Vec::from_raw_parts(p, n as usize, n as usize));
+        drop(Box::from_raw(ptr::slice_from_raw_parts_mut(p, len)));
     }
 }
 
+/// The address `offset` elements after `p`, or before it when `offset` is negative.
+/// The result must stay inside the buffer that `p` points into.
 #[no_mangle]
 pub extern "C" fn vx_advance_ptr(p: *mut f32, offset: i32) -> *mut f32 {
-    unsafe { p.add(offset as usize) }
+    // SAFETY: the caller promises the result stays inside the same buffer as `p`.
+    unsafe { p.offset(offset as isize) }
 }
 
+/// The same as `vx_advance_ptr`, for a pointer to read-only memory.
 #[no_mangle]
 pub extern "C" fn vx_advance_ptr_const(p: *const f32, offset: i32) -> *const f32 {
-    unsafe { p.add(offset as usize) }
+    // SAFETY: the caller promises the result stays inside the same buffer as `p`.
+    unsafe { p.offset(offset as isize) }
 }
 
+/// The same as `vx_advance_ptr`. Both names are in use by compiled programs.
 #[no_mangle]
 pub extern "C" fn vx_advance_ptr_f32(p: *mut f32, offset: i32) -> *mut f32 {
-    unsafe { p.add(offset as usize) }
+    // SAFETY: the caller promises the result stays inside the same buffer as `p`.
+    unsafe { p.offset(offset as isize) }
 }
 
+/// Copies `num_bytes` bytes from `src` to `dest`, and returns 0. The two buffers must
+/// not overlap and each must be at least `num_bytes` long.
+///
+/// # Panics
+/// Panics if `num_bytes` is negative.
 #[no_mangle]
 pub extern "C" fn vx_memcpy(dest: *mut f32, src: *const f32, num_bytes: i32) -> i32 {
+    let len = usize::try_from(num_bytes).expect("vx_memcpy: negative byte count");
+    // SAFETY: the caller promises both buffers hold `num_bytes` bytes and do not overlap.
     unsafe {
-        ptr::copy_nonoverlapping(src as *const u8, dest as *mut u8, num_bytes as usize);
+        ptr::copy_nonoverlapping(src.cast::<u8>(), dest.cast::<u8>(), len);
     }
     0
 }
 
+/// Prints a message and panics, so that a Vx program can test `vx_catch_unwind`.
+///
+/// # Panics
+/// Always panics. That is its job.
 #[no_mangle]
 pub extern "C-unwind" fn vx_panic() -> i32 {
     println!("Vx runtime panic occurred!");
     panic!("vx_panic");
 }
 
+/// Calls `f` and returns its result. When `f` panics, prints a message and returns 1.
 #[no_mangle]
 pub extern "C-unwind" fn vx_catch_unwind(f: extern "C-unwind" fn() -> i32) -> i32 {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f()));
-    match result {
-        Ok(v) => v,
-        Err(_) => {
-            println!("Caught panic!");
-            1
-        }
+    if let Ok(v) = result {
+        v
+    } else {
+        println!("Caught panic!");
+        1
     }
 }
 
@@ -278,7 +329,7 @@ pub extern "C-unwind" fn vx_catch_unwind(f: extern "C-unwind" fn() -> i32) -> i3
 static VX_RNG_STATE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0x9E37_79B9_7F4A_7C15);
 
-/// One SplitMix64 step: advance the counter, then scramble the value taken.
+/// One `SplitMix64` step: advance the counter, then scramble the value taken.
 fn vx_next_u64() -> u64 {
     use std::sync::atomic::Ordering;
     let z = VX_RNG_STATE
@@ -304,7 +355,7 @@ pub extern "C" fn vx_rand_u64() -> u64 {
 /// A uniform `i32` over the whole range, negatives included.
 #[no_mangle]
 pub extern "C" fn vx_rand_i32() -> i32 {
-    (vx_next_u64() >> 32) as u32 as i32
+    ((vx_next_u64() >> 32) as u32).cast_signed()
 }
 
 /// A uniform `f32` in [0, 1).
@@ -313,12 +364,20 @@ pub extern "C" fn vx_rand_i32() -> i32 {
 /// has 24 bits of mantissa: taking more would round and could return exactly
 /// 1.0, which a caller scaling into a half-open range does not expect.
 #[no_mangle]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the value has 24 bits, which an f32 holds exactly"
+)]
 pub extern "C" fn vx_rand_f32() -> f32 {
     ((vx_next_u64() >> 40) as f32) * (1.0 / 16_777_216.0)
 }
 
 /// A uniform `f64` in [0, 1), on the same terms with 53 bits.
 #[no_mangle]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the value has 53 bits, which an f64 holds exactly"
+)]
 pub extern "C" fn vx_rand_f64() -> f64 {
     ((vx_next_u64() >> 11) as f64) * (1.0 / 9_007_199_254_740_992.0)
 }

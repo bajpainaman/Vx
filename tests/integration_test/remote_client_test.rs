@@ -20,7 +20,7 @@
 //! collide, and the worker is killed on the way out whether the test passed or
 //! not.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 fn repo_root() -> PathBuf {
@@ -165,6 +165,118 @@ fn a_dispatch_reaches_a_worker_process_over_tcp() {
     );
 }
 
+/// Placed operands, a dispatch that leaves the result where it computed it, and then
+/// the way home. `matmul_into` rather than `c = a @ b` because the second publishes
+/// into a slot the worker cannot fill, and the dispatch would decline to route --
+/// making this a test of a program that stayed here.
+const READBACK_PROGRAM: &str = r"Memory CPU_DRAM {}
+Memory GPU_HBM {
+  within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s, managed: cached
+}
+
+fn main() -> i32 {
+  let mut a_h = Tensor<f32>([ 8, 8 ]);
+  let mut b_h = Tensor<f32>([ 8, 8 ]);
+  let mut c_h = Tensor<f32>([ 8, 8 ]);
+  for i in 0..8 {
+    for j in 0..8 {
+      a_h[i][j] = ((i + j) as f32) * 0.25;
+      b_h[i][j] = ((i - j) as f32) * 0.5;
+    }
+  }
+  let a = transfer(a_h, Memory::GPU_HBM);
+  let b = transfer(b_h, Memory::GPU_HBM);
+  let mut c = transfer(c_h, Memory::GPU_HBM);
+  spawn on(Topology::GPU) {
+    matmul_into(&mut c, &a, &b);
+  }
+  let home = transfer(c, Memory::CPU_DRAM);
+  print(home[0][0]);
+  return 0;
+}
+";
+
+/// Two declared memories and two topologies, because a device is both: data lands in a
+/// memory space and work is placed on a topology, and a manifest has to name each.
+/// `Memory::GPU_HBM` cannot express this -- it maps to topology 500 whatever the program
+/// meant -- so a second device's memory has to be declared to be named.
+const HANDOFF_PROGRAM: &str = r"Memory CPU_DRAM {}
+Memory HBM_A {
+  within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s, managed: cached
+}
+Memory HBM_B {
+  within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s, managed: cached
+}
+Topology DevA { memory: Memory::HBM_A, visible: [ Memory::HBM_A ] }
+Topology DevB { memory: Memory::HBM_B, visible: [ Memory::HBM_B ] }
+
+fn main() -> i32 {
+  let mut a_h = Tensor<f32>([ 16, 16 ]);
+  let mut b_h = Tensor<f32>([ 16, 16 ]);
+  let mut c_h = Tensor<f32>([ 16, 16 ]);
+  for i in 0..16 {
+    for j in 0..16 {
+      a_h[i][j] = ((i + j) as f32) * 0.125;
+      b_h[i][j] = ((i - j) as f32) * 0.25;
+    }
+  }
+  let a = transfer(a_h, Memory::HBM_A);
+  let b = transfer(b_h, Memory::HBM_A);
+  let mut c = transfer(c_h, Memory::HBM_A);
+  spawn on(Topology::DevA) {
+    matmul_into(&mut c, &a, &b);
+  }
+  let c_b = transfer(c, Memory::HBM_B);
+  let home = transfer(c_b, Memory::CPU_DRAM);
+  print(home[0][0]);
+  return 0;
+}
+";
+
+/// The last line a program printed, trimmed.
+fn last_line(stdout: &[u8]) -> String {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Runs `prog` with no manifest and returns the last line it printed. This is the
+/// answer a run against workers has to agree with.
+fn local_answer(vxc: &str, prog: &Path) -> String {
+    let local = Command::new(vxc)
+        .args([prog.to_str().unwrap(), "--run"])
+        .output()
+        .expect("failed to run the program locally");
+    assert!(
+        local.status.success(),
+        "the local run failed:\n{}",
+        String::from_utf8_lossy(&local.stderr)
+    );
+    let expected = last_line(&local.stdout);
+    assert!(!expected.is_empty(), "the local run printed nothing");
+    expected
+}
+
+/// Starts a CPU worker (topology 0) listening on `port`, with the given worker id.
+fn start_worker(worker_bin: &Path, port: u16, id: &str) -> Worker {
+    Worker(
+        Command::new(worker_bin)
+            .args([
+                "--port",
+                &port.to_string(),
+                "--topology",
+                "0",
+                "--worker-id",
+                id,
+            ])
+            .spawn()
+            .expect("failed to start a worker"),
+    )
+}
+
 /// A Vx program placing its data on a worker, computing there, and reading the
 /// answer home -- checked against the same program run with no manifest.
 ///
@@ -197,79 +309,18 @@ fn a_placed_tensor_can_be_read_home_from_a_worker() {
         &ffi_flags(),
     );
 
-    // Placed operands, a dispatch that leaves the result where it computed it,
-    // and then the way home. `matmul_into` rather than `c = a @ b` because the
-    // second publishes into a slot the worker cannot fill, and the dispatch
-    // would decline to route -- making this a test of a program that stayed
-    // here.
     let prog = tmp.join("readback.vx");
-    std::fs::write(
-        &prog,
-        r#"Memory CPU_DRAM {}
-Memory GPU_HBM {
-  within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s, managed: cached
-}
-
-fn main() -> i32 {
-  let mut a_h = Tensor<f32>([ 8, 8 ]);
-  let mut b_h = Tensor<f32>([ 8, 8 ]);
-  let mut c_h = Tensor<f32>([ 8, 8 ]);
-  for i in 0..8 {
-    for j in 0..8 {
-      a_h[i][j] = ((i + j) as f32) * 0.25;
-      b_h[i][j] = ((i - j) as f32) * 0.5;
-    }
-  }
-  let a = transfer(a_h, Memory::GPU_HBM);
-  let b = transfer(b_h, Memory::GPU_HBM);
-  let mut c = transfer(c_h, Memory::GPU_HBM);
-  spawn on(Topology::GPU) {
-    matmul_into(&mut c, &a, &b);
-  }
-  let home = transfer(c, Memory::CPU_DRAM);
-  print(home[0][0]);
-  return 0;
-}
-"#,
-    )
-    .expect("failed to write the program");
+    std::fs::write(&prog, READBACK_PROGRAM).expect("failed to write the program");
 
     let vxc = env!("CARGO_BIN_EXE_vxc");
-    let local = Command::new(vxc)
-        .args([prog.to_str().unwrap(), "--run"])
-        .output()
-        .expect("failed to run the program locally");
-    assert!(
-        local.status.success(),
-        "the local run failed:\n{}",
-        String::from_utf8_lossy(&local.stderr)
-    );
-    let expected = String::from_utf8_lossy(&local.stdout)
-        .lines()
-        .last()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    assert!(!expected.is_empty(), "the local run printed nothing");
+    let expected = local_answer(vxc, &prog);
 
     let port = 20000 + ((std::process::id() + 1) % 10000) as u16;
     let manifest = tmp.join("readback-manifest");
     std::fs::write(&manifest, format!("GPU[0]  127.0.0.1  {port}\n"))
         .expect("failed to write the manifest");
 
-    let worker = Worker(
-        Command::new(&worker_bin)
-            .args([
-                "--port",
-                &port.to_string(),
-                "--topology",
-                "0",
-                "--worker-id",
-                "2",
-            ])
-            .spawn()
-            .expect("failed to start the worker"),
-    );
+    let worker = start_worker(&worker_bin, port, "2");
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     // VX_FLEET_STRICT, so a placement the manifest does not name is an error
@@ -289,12 +340,7 @@ fn main() -> i32 {
         String::from_utf8_lossy(&remote.stdout),
         String::from_utf8_lossy(&remote.stderr)
     );
-    let got = String::from_utf8_lossy(&remote.stdout)
-        .lines()
-        .last()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let got = last_line(&remote.stdout);
     assert_eq!(
         got,
         expected,
@@ -345,66 +391,11 @@ fn a_handoff_between_two_workers_moves_the_data() {
         &ffi_flags(),
     );
 
-    // Two declared memories and two topologies, because a device is both: data
-    // lands in a memory space and work is placed on a topology, and a manifest
-    // has to name each. `Memory::GPU_HBM` cannot express this -- it maps to
-    // topology 500 whatever the program meant -- so a second device's memory
-    // has to be declared to be named.
     let prog = tmp.join("handoff.vx");
-    std::fs::write(
-        &prog,
-        r#"Memory CPU_DRAM {}
-Memory HBM_A {
-  within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s, managed: cached
-}
-Memory HBM_B {
-  within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s, managed: cached
-}
-Topology DevA { memory: Memory::HBM_A, visible: [ Memory::HBM_A ] }
-Topology DevB { memory: Memory::HBM_B, visible: [ Memory::HBM_B ] }
-
-fn main() -> i32 {
-  let mut a_h = Tensor<f32>([ 16, 16 ]);
-  let mut b_h = Tensor<f32>([ 16, 16 ]);
-  let mut c_h = Tensor<f32>([ 16, 16 ]);
-  for i in 0..16 {
-    for j in 0..16 {
-      a_h[i][j] = ((i + j) as f32) * 0.125;
-      b_h[i][j] = ((i - j) as f32) * 0.25;
-    }
-  }
-  let a = transfer(a_h, Memory::HBM_A);
-  let b = transfer(b_h, Memory::HBM_A);
-  let mut c = transfer(c_h, Memory::HBM_A);
-  spawn on(Topology::DevA) {
-    matmul_into(&mut c, &a, &b);
-  }
-  let c_b = transfer(c, Memory::HBM_B);
-  let home = transfer(c_b, Memory::CPU_DRAM);
-  print(home[0][0]);
-  return 0;
-}
-"#,
-    )
-    .expect("failed to write the program");
+    std::fs::write(&prog, HANDOFF_PROGRAM).expect("failed to write the program");
 
     let vxc = env!("CARGO_BIN_EXE_vxc");
-    let local = Command::new(vxc)
-        .args([prog.to_str().unwrap(), "--run"])
-        .output()
-        .expect("failed to run the program locally");
-    assert!(
-        local.status.success(),
-        "the local run failed:\n{}",
-        String::from_utf8_lossy(&local.stderr)
-    );
-    let expected = String::from_utf8_lossy(&local.stdout)
-        .lines()
-        .last()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    assert!(!expected.is_empty(), "the local run printed nothing");
+    let expected = local_answer(vxc, &prog);
 
     let port_a = 20000 + ((std::process::id() + 2) % 10000) as u16;
     let port_b = 20000 + ((std::process::id() + 3) % 10000) as u16;
@@ -422,19 +413,7 @@ fn main() -> i32 {
 
     let mut workers = Vec::new();
     for (port, id) in [(port_a, "1"), (port_b, "2")] {
-        workers.push(Worker(
-            Command::new(&worker_bin)
-                .args([
-                    "--port",
-                    &port.to_string(),
-                    "--topology",
-                    "0",
-                    "--worker-id",
-                    id,
-                ])
-                .spawn()
-                .expect("failed to start a worker"),
-        ));
+        workers.push(start_worker(&worker_bin, port, id));
     }
     std::thread::sleep(std::time::Duration::from_millis(400));
 
@@ -453,12 +432,7 @@ fn main() -> i32 {
         String::from_utf8_lossy(&remote.stdout),
         String::from_utf8_lossy(&remote.stderr)
     );
-    let got = String::from_utf8_lossy(&remote.stdout)
-        .lines()
-        .last()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let got = last_line(&remote.stdout);
     assert_eq!(
         got,
         expected,

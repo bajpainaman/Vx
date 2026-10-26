@@ -266,6 +266,11 @@ fn a_count_that_overflows_is_reported_as_absent_not_clamped() {
 /// detect is worse than no figure.
 #[test]
 fn a_sub_byte_element_type_is_refused_rather_than_rounded() {
+    // The fixture's own tensors have to be retyped too -- the substituted body borrows them.
+    // Checked rather than replaced blind: a respelling in the corpus file would otherwise leave
+    // this test measuring f32 while claiming to measure i4, which is exactly what happened when
+    // the constructor syntax changed (Vx#429).
+    const F32_TILE: &str = "Tensor<f32, [2, 2]>";
     let src = with_body(
         "  fn move_tile(src: &Tensor<i4, [2, 2]>, dst: &mut Tensor<i4, [2, 2]>) -> i32 {\n\
          \x20   for i in 0..raw::extent(src) {\n\
@@ -275,11 +280,6 @@ fn a_sub_byte_element_type_is_refused_rather_than_rounded() {
          \x20   return 0;\n\
          \x20 }",
     );
-    // The fixture's own tensors have to be retyped too -- the substituted body borrows them.
-    // Checked rather than replaced blind: a respelling in the corpus file would otherwise leave
-    // this test measuring f32 while claiming to measure i4, which is exactly what happened when
-    // the constructor syntax changed (Vx#429).
-    const F32_TILE: &str = "Tensor<f32, [2, 2]>";
     assert!(
         src.contains(F32_TILE),
         "the fixture no longer spells its tensors `{F32_TILE}`, so this test would measure f32"
@@ -324,24 +324,8 @@ fn a_comptime_branch_is_counted_as_the_arm_that_survives() {
     );
 }
 
-/// Two machines declare the same edge and move it differently. Which lowering
-/// runs is decided by the topology in force at the site -- and the reported
-/// traffic is what says which one ran, because the counter reads the body that
-/// was chosen.
-///
-/// This program was a hard error until the `for Topology::X` clause existed
-/// (Vx#353): a lowering was keyed on the edge pair alone, so the second
-/// `Memory::GPU_HBM -> Memory::SMEM` implementation in a compilation was
-/// refused no matter which part it was written for. That is the shape the
-/// fleet directory is built to describe -- Ampere fills shared memory with
-/// cp.async, Hopper with a different engine -- so it had to become writable.
-///
-/// The two bodies compute a bit-identical answer (x + x halved is exact in
-/// IEEE for any value), so nothing but the byte count distinguishes them. A
-/// selection bug that took the first candidate rather than the active
-/// topology's would report 32 where this asserts 16.
-fn two_machines(active: &str) -> String {
-    let spaces = "\
+/// The memory spaces, the two topologies and the two lowerings `two_machines` builds on.
+const TWO_MACHINE_DECLARATIONS: &str = "\
 Memory CPU_DRAM {}
 Memory GPU_HBM {
   within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s, managed: cached
@@ -383,6 +367,25 @@ impl Transfer<Memory::GPU_HBM, Memory::SMEM> for Topology::Wasteful {
   }
 }
 ";
+
+/// Two machines declare the same edge and move it differently. Which lowering
+/// runs is decided by the topology in force at the site -- and the reported
+/// traffic is what says which one ran, because the counter reads the body that
+/// was chosen.
+///
+/// This program was a hard error until the `for Topology::X` clause existed
+/// (Vx#353): a lowering was keyed on the edge pair alone, so the second
+/// `Memory::GPU_HBM -> Memory::SMEM` implementation in a compilation was
+/// refused no matter which part it was written for. That is the shape the
+/// fleet directory is built to describe -- Ampere fills shared memory with
+/// cp.async, Hopper with a different engine -- so it had to become writable.
+///
+/// The two bodies compute a bit-identical answer (x + x halved is exact in
+/// IEEE for any value), so nothing but the byte count distinguishes them. A
+/// selection bug that took the first candidate rather than the active
+/// topology's would report 32 where this asserts 16.
+fn two_machines(active: &str) -> String {
+    let spaces = TWO_MACHINE_DECLARATIONS;
     format!(
         "{spaces}
 fn main() -> i32 {{
@@ -437,15 +440,15 @@ fn the_active_topology_picks_among_lowerings_for_one_edge() {
 /// A machine that declares an edge but supplies NO lowering for it gets the
 /// builtin copy -- never a peer machine's body.
 ///
-/// HasImpl and NoImpl declare the same edge; only HasImpl implements it, with
+/// `HasImpl` and `NoImpl` declare the same edge; only `HasImpl` implements it, with
 /// a body that reads the source twice. The transfer runs inside
-/// `spawn on(Topology::NoImpl)`. NoImpl chose not to supply a lowering, so the
+/// `spawn on(Topology::NoImpl)`. `NoImpl` chose not to supply a lowering, so the
 /// builtin must move its tile: one read, `builtin_copy`.
 ///
 /// The review found the opposite (Vx#353): the single-candidate fallback --
 /// which exists so a host-driven transfer can find the one machine that owns a
-/// device edge -- also fired when the site WAS on a machine, handing NoImpl
-/// the only lowering in scope. HasImpl's body may use instructions NoImpl
+/// device edge -- also fired when the site WAS on a machine, handing `NoImpl`
+/// the only lowering in scope. `HasImpl`'s body may use instructions `NoImpl`
 /// never declared (that is what `copy_engine` gates), so borrowing it is not a
 /// default, it is a miscompile. The fallback is now conditional on the active
 /// topology not declaring the edge itself.
@@ -631,7 +634,7 @@ fn a_kernel_that_re_reads_reports_more_than_the_tile_holds() {
 /// Scratch declared inside the kernel is not traffic against the device memory
 /// anyone staged. `ts` is an ordinary `Tensor`, never transferred; the placement
 /// rule keys on the TYPE carrying a placement, not on the ambient topology --
-/// which inside `spawn on(Topology::Dev)` would have reported GPU_HBM for it and
+/// which inside `spawn on(Topology::Dev)` would have reported `GPU_HBM` for it and
 /// inflated the figure with kernel-local storage.
 #[test]
 fn kernel_local_scratch_is_not_counted_as_device_traffic() {
@@ -746,11 +749,11 @@ fn a_region_count_that_overflows_is_reported_as_absent() {
 }
 
 /// One region, two spaces. `custom_topology_user_lowering.vx` stages a tile from
-/// GPU_HBM into SMEM inside the kernel and writes its result back out, so the
+/// `GPU_HBM` into SMEM inside the kernel and writes its result back out, so the
 /// same `spawn` touches both spaces and they must not be pooled.
 ///
 /// This is what makes the record answer a locality question. The SMEM reads are
-/// reads of a tile that was staged precisely so they would be cheap; the GPU_HBM
+/// reads of a tile that was staged precisely so they would be cheap; the `GPU_HBM`
 /// writes are not. Summed into one figure the distinction disappears, and the
 /// distinction is the reason anyone stages a tile at all.
 ///

@@ -1547,6 +1547,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vx-build-commit"
+version = "0.1.0"
+
+[[package]]
 name = "vx_std_core"
 version = "0.1.0"
 dependencies = [
@@ -1573,6 +1577,7 @@ dependencies = [
  "rstest",
  "rustc-hash",
  "tempfile",
+ "vx-build-commit",
 ]
 
 [[package]]

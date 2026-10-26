@@ -49,7 +49,7 @@ pub enum Action {
 }
 
 /// What `vxc --version` prints after the name: the package version, then the commit the
-/// compiler was built from when it was built from a git checkout, as `0.0.3 (f1fb0333)`.
+/// compiler was built from when the build set `VX_VERSION_WITH_COMMIT=1`, as `0.0.3 (f1fb0333)`.
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), vx_build_commit::commit_suffix!());
 
 #[derive(Parser, Debug, Clone)]

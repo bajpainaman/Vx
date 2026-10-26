@@ -6,9 +6,10 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// `vxc --version` names the commit that vxc was built from, so two builds of one version can be
-// told apart. The commit must be the one checked out now: Cargo builds vxc again before this test
-// runs, so an older commit means the build did not notice a new one.
+// A build with `VX_VERSION_WITH_COMMIT=1` makes `vxc --version` name the commit that vxc was built
+// from, so two builds of one version can be told apart. The commit must be the one checked out
+// now: Cargo builds vxc again before this test runs, so an older commit means the build did not
+// notice a new one. A build without it prints the version alone.
 //
 //===----------------------------------------------------------------------===//
 
@@ -43,7 +44,9 @@ fn vxc_version_names_the_commit_it_was_built_from() {
         .output()
         .expect("run vxc --version");
     assert!(out.status.success(), "vxc --version failed: {out:?}");
-    let expected = match checked_out_commit() {
+    // Cargo builds this test and vxc in one run, with the same environment.
+    let with_commit = option_env!("VX_VERSION_WITH_COMMIT") == Some("1");
+    let expected = match checked_out_commit().filter(|_| with_commit) {
         Some(commit) => format!("vxc {} ({commit})\n", env!("CARGO_PKG_VERSION")),
         None => format!("vxc {}\n", env!("CARGO_PKG_VERSION")),
     };

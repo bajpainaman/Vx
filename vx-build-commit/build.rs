@@ -10,11 +10,30 @@
 //!
 //! This is a crate of its own so that a commit or a checkout reruns only this script. The
 //! compiler's own build script also compiles the C++ runtime, and a rerun repeats all of it.
+//!
+//! It asks git only when `VX_VERSION_WITH_COMMIT=1`. The release build and CI set it. Without
+//! it a commit changes nothing here, so it does not recompile vxc.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Set to 1 to make `vxc --version` name the commit.
+const WITH_COMMIT: &str = "VX_VERSION_WITH_COMMIT";
+
+/// Whether the build asked for the commit. Any value other than 1 or 0 stops the build.
+fn with_commit() -> bool {
+    match env::var(WITH_COMMIT) {
+        Ok(value) if value == "1" => true,
+        Ok(value) if value == "0" => false,
+        Err(env::VarError::NotPresent) => false,
+        Ok(value) => panic!("{WITH_COMMIT} must be 1 or 0, not '{value}'"),
+        Err(env::VarError::NotUnicode(value)) => {
+            panic!("{WITH_COMMIT} must be 1 or 0, not {value:?}")
+        }
+    }
+}
 
 /// The output of `git <args>` in this crate's directory, or `None` when git is missing or fails.
 fn git(args: &[&str]) -> Option<String> {
@@ -71,7 +90,8 @@ fn main() {
     let vx_root = manifest_dir
         .parent()
         .expect("this crate is a directory of the Vx sources");
-    let suffix = match commit(vx_root) {
+    println!("cargo:rerun-if-env-changed={WITH_COMMIT}");
+    let suffix = match with_commit().then(|| commit(vx_root)).flatten() {
         Some(commit) => {
             for path in files_to_watch() {
                 println!("cargo:rerun-if-changed={}", path.display());

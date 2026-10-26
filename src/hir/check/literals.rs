@@ -314,13 +314,17 @@ impl<'a> TypeChecker<'a> {
             ),
             _ => return,
         };
-        self.errors.error_with_code(
-            crate::diagnostic::DiagnosticCode::E3045,
-            message,
-            // A number literal has no span of its own: spans take part in comparing types,
-            // and a literal is also a tensor dimension.
-            None,
-        );
+        let at = self.literal_position();
+        self.errors
+            .error_with_code(crate::diagnostic::DiagnosticCode::E3045, message, at);
+    }
+
+    /// Where to report a number literal. A literal has no span of its own, because spans take
+    /// part in comparing types and a literal is also a tensor dimension. So point at the
+    /// statement that holds it.
+    fn literal_position(&self) -> Option<crate::diagnostic::SourceSpan> {
+        let statement = self.current_statement_span;
+        (statement.line != 0).then(|| crate::diagnostic::SourceSpan::from_ast_span(&statement))
     }
 
     /// The tensor an operand denotes, seen through the wrappers that do not

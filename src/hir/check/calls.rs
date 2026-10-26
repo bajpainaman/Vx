@@ -244,6 +244,7 @@ impl<'a> TypeChecker<'a> {
         if let Some(n) = crate::hir::expr::numeric_literal_mut(arg) {
             if let Some(elem) = expected_numeric_elem(param_ty, &n.value) {
                 n.ty = Some(elem.clone());
+                self.settle_wide_literal(&n.value);
                 let n = n.clone();
                 self.check_literal_fits(&n, &elem, negated);
                 return Type::Scalar(elem);

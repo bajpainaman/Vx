@@ -580,6 +580,20 @@ macro_rules stamp_signed_int {
         return product.unwrap_or(limit);
       }
 
+      /// The quotient, held at the largest value for the smallest value divided by -1.
+      /// Refused on a zero divisor, as `/` is.
+      pub fn saturating_div(self : $t, rhs : $t) -> $t {
+        if self == self.min_value() && rhs == (-1 as $t) {
+          return self.max_value();
+        }
+        return self / rhs;
+      }
+
+      /// The result of `wrapping_pow`, and whether the power overflowed.
+      pub fn overflowing_pow(self : $t, exp : $t) -> ($t, bool) {
+        return (self.wrapping_pow(exp), self.checked_pow(exp).is_none());
+      }
+
       /// How many set bits the value starts with, counting from the top.
       pub fn leading_ones(self : $t) -> $t {
         return (!self).leading_zeros();
@@ -1070,6 +1084,17 @@ macro_rules stamp_unsigned_int {
         return self.checked_mul(rhs).unwrap_or(self.max_value());
       }
 
+      /// The quotient. An unsigned quotient never overflows. Refused on a zero divisor, as
+      /// `/` is.
+      pub fn saturating_div(self : $t, rhs : $t) -> $t {
+        return self / rhs;
+      }
+
+      /// The result of `wrapping_pow`, and whether the power overflowed.
+      pub fn overflowing_pow(self : $t, exp : $t) -> ($t, bool) {
+        return (self.wrapping_pow(exp), self.checked_pow(exp).is_none());
+      }
+
       /// How many set bits the value starts with, counting from the top.
       pub fn leading_ones(self : $t) -> $t {
         return (!self).leading_zeros();
@@ -1472,6 +1497,16 @@ impl usize {
     return self.checked_mul(rhs).unwrap_or(self.max_value());
   }
 
+  /// The quotient, which never overflows. Refused on a zero divisor, as `/` is.
+  pub fn saturating_div(self : usize, rhs : usize) -> usize {
+    return self / rhs;
+  }
+
+  /// The power modulo 2^63, and whether it passed the largest `usize`.
+  pub fn overflowing_pow(self : usize, exp : usize) -> (usize, bool) {
+    return (self.wrapping_pow(exp), self.checked_pow(exp).is_none());
+  }
+
   /// The sum modulo 2^63: past the largest `usize` it starts again from zero.
   pub fn wrapping_add(self : usize, rhs : usize) -> usize {
     return mlir!( inputs : (%a = self : i64, %b = rhs : i64), returns : usize, dialects : ["arith"]) {
@@ -1537,6 +1572,25 @@ impl usize {
     return (self % rhs, false);
   }
 }
+
+/// Stamps `unsigned_abs` for one signed width `$t`, whose unsigned type of the same width
+/// is `$u`. It is a macro of its own because `stamp_signed_int` has no name for `$u`.
+macro_rules stamp_unsigned_abs {
+  ($t : ident , $u : ident) => {
+    impl $t {
+      /// The absolute value as the unsigned type of the same width. It never overflows: the
+      /// smallest value gives one more than the largest value of `$t`.
+      pub fn unsigned_abs(self : $t) -> $u {
+        return self.wrapping_abs() as $u;
+      }
+    }
+  };
+}
+
+stamp_unsigned_abs!(i8 , u8);
+stamp_unsigned_abs!(i16 , u16);
+stamp_unsigned_abs!(i32 , u32);
+stamp_unsigned_abs!(i64 , u64);
 
 /// "00" to "99" back to back, so the pair for `k` starts at byte `2 * k`.
 pub fn decimal_digit_pairs() -> *const i8 {

@@ -1,0 +1,223 @@
+//===- core_num_unsigned_abs_saturating_div_overflowing_pow.vx - Vx Compiler -*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// `unsigned_abs`, `saturating_div` and `overflowing_pow` of `core::num`. The expected values
+// are what Rust gives for the same inputs, except for `usize`. A Vx `usize` holds 0 to the
+// largest `i64`, so its powers wrap modulo 2^63.
+//
+// `unsigned_abs` of the smallest value is one more than the largest signed value, so it fits
+// only in the unsigned type. `saturating_div` overflows only for the smallest value divided
+// by -1. On each width, `overflowing_pow` is asked once where it overflows and once where
+// it does not.
+//
+// The unsigned answers are compared rather than printed: a value read from a tuple field
+// prints as signed.
+//
+// EXPECT: 128 32768 2147483648 9223372036854775808 0 7 127 | 127 32767 2147483647 9223372036854775807 -2147483647 -3 3 -2147483648 | 1 1 1 0 -128 0 81 0 1 1 1 0 1 1 | 1 1 127 1 0 1 1 1 0 1 1 | 1 1 1 1 1 1 1 1 1 0 1 1 1 0 1 0 1 0 1 1 1 0 1 1 1 0 1 0
+import core::num;
+
+fn show(b : bool) -> i32 {
+  if b {
+    print!("1 ");
+  } else {
+    print!("0 ");
+  }
+  return 0;
+}
+
+fn unsigned_abs() -> i32 {
+  let min8 : i8 = -127 - 1;
+  let min16 : i16 = -32767 - 1;
+  let min32 : i32 = -2147483647 - 1;
+  let min64 : i64 = -9223372036854775807 - 1;
+  let zero : i32 = 0;
+  let minus_seven : i64 = -7;
+  let max8 : i8 = 127;
+  print(min8.unsigned_abs());
+  print!(" ");
+  print(min16.unsigned_abs());
+  print!(" ");
+  print(min32.unsigned_abs());
+  print!(" ");
+  print(min64.unsigned_abs());
+  print!(" ");
+  print(zero.unsigned_abs());
+  print!(" ");
+  print(minus_seven.unsigned_abs());
+  print!(" ");
+  print(max8.unsigned_abs());
+  print!(" ");
+  return 0;
+}
+
+fn saturating_div() -> i32 {
+  let min8 : i8 = -127 - 1;
+  let min16 : i16 = -32767 - 1;
+  let min32 : i32 = -2147483647 - 1;
+  let min64 : i64 = -9223372036854775807 - 1;
+  let max32 : i32 = 2147483647;
+  let minus_seven : i32 = -7;
+  print(min8.saturating_div(-1) as i32);
+  print!(" ");
+  print(min16.saturating_div(-1) as i32);
+  print!(" ");
+  print(min32.saturating_div(-1));
+  print!(" ");
+  print(min64.saturating_div(-1));
+  print!(" ");
+  print(max32.saturating_div(-1));
+  print!(" ");
+  print(minus_seven.saturating_div(2));
+  print!(" ");
+  print(minus_seven.saturating_div(-2));
+  print!(" ");
+  print(min32.saturating_div(1));
+  print!(" ");
+  return 0;
+}
+
+fn overflowing_pow() -> i32 {
+  let two : i32 = 2;
+  let minus_two8 : i8 = -2;
+  let three : i32 = 3;
+  let two8u : u8 = 2;
+  let three8u : u8 = 3;
+  let two64u : u64 = 2;
+  // 2^31 does not fit in an i32 and wraps to the smallest value.
+  let r = two.overflowing_pow(31);
+  show(r._0 == -2147483647 - 1);
+  show(r._1);
+  // 2^30 fits.
+  let r = two.overflowing_pow(30);
+  show(r._0 == 1073741824);
+  show(r._1);
+  // (-2)^7 is -128, the smallest i8, which fits.
+  let r = minus_two8.overflowing_pow(7);
+  print(r._0 as i32);
+  print!(" ");
+  show(r._1);
+  let r = three.overflowing_pow(4);
+  print(r._0);
+  print!(" ");
+  show(r._1);
+  // 2^8 wraps to 0 in a u8. 3^5 is 243, which fits.
+  let r = two8u.overflowing_pow(8);
+  show(r._0 == 0);
+  show(r._1);
+  let r = three8u.overflowing_pow(5);
+  show(r._0 == 243);
+  show(r._1);
+  // 2^64 wraps to 0 in a u64.
+  let r = two64u.overflowing_pow(64);
+  show(r._0 == 0);
+  show(r._1);
+  return 0;
+}
+
+fn widths() -> i32 {
+  // (-2)^8 is 256, which an i8 cannot hold.
+  let minus_two8 : i8 = -2;
+  let r = minus_two8.overflowing_pow(8);
+  show(r._0 == 0);
+  show(r._1);
+  let max8 : i8 = 127;
+  print(max8.saturating_div(1) as i32);
+  print!(" ");
+  let r = max8.overflowing_pow(1);
+  show(r._0 == 127);
+  show(r._1);
+  // A usize wraps modulo 2^63, so 2^63 gives 0.
+  let two_usize : usize = 2;
+  let r = two_usize.overflowing_pow(63);
+  show(r._0 == 0);
+  show(r._1);
+  let r = two_usize.overflowing_pow(62);
+  show(r._0 == 4611686018427387904);
+  show(r._1);
+  let ten_usize : usize = 10;
+  show(ten_usize.saturating_div(3) == 3);
+  let u : u32 = 4294967295;
+  show(u.saturating_div(2) == 2147483647);
+  return 0;
+}
+
+fn more_widths() -> i32 {
+  // An unsigned divisor of the largest value is not -1, so zero divided by it is zero.
+  let zero32u : u32 = 0;
+  show(zero32u.saturating_div(4294967295) == 0);
+  let max8u : u8 = 255;
+  show(max8u.saturating_div(255) == 1);
+  let max16u : u16 = 65535;
+  show(max16u.saturating_div(1) == 65535);
+  let max64u : u64 = 18446744073709551615;
+  show(max64u.saturating_div(18446744073709551615) == 1);
+  let max16 : i16 = 32767;
+  show(max16.unsigned_abs() == 32767);
+  let max64 : i64 = 9223372036854775807;
+  show(max64.unsigned_abs() == 9223372036854775807);
+  // 2^15 does not fit in an i16. 3^9 is 19683, which fits.
+  let two16 : i16 = 2;
+  let r = two16.overflowing_pow(15);
+  show(r._0 == -32767 - 1);
+  show(r._1);
+  let three16 : i16 = 3;
+  let r = three16.overflowing_pow(9);
+  show(r._0 == 19683);
+  show(r._1);
+  // 2^63 does not fit in an i64. 2^62 fits.
+  let two64 : i64 = 2;
+  let r = two64.overflowing_pow(63);
+  show(r._0 == -9223372036854775807 - 1);
+  show(r._1);
+  let r = two64.overflowing_pow(62);
+  show(r._0 == 4611686018427387904);
+  show(r._1);
+  // The smallest i64 to the power 1 is itself, and any value to the power 0 is 1.
+  let min64 : i64 = -9223372036854775807 - 1;
+  let r = min64.overflowing_pow(1);
+  show(r._0 == -9223372036854775807 - 1);
+  show(r._1);
+  let r = min64.overflowing_pow(0);
+  show(r._0 == 1);
+  show(r._1);
+  // 2^16 wraps to 0 in a u16. 255^2 is 65025, which fits.
+  let two16u : u16 = 2;
+  let r = two16u.overflowing_pow(16);
+  show(r._0 == 0);
+  show(r._1);
+  let u16_255 : u16 = 255;
+  let r = u16_255.overflowing_pow(2);
+  show(r._0 == 65025);
+  show(r._1);
+  // 3^21 does not fit in a u32. 3^20 is 3486784401, which fits.
+  let three32u : u32 = 3;
+  let r = three32u.overflowing_pow(21);
+  show(r._0 == 1870418611);
+  show(r._1);
+  let r = three32u.overflowing_pow(20);
+  show(r._0 == 3486784401);
+  show(r._1);
+  // 2^63 fits in a u64.
+  let two64u : u64 = 2;
+  let r = two64u.overflowing_pow(63);
+  show(r._0 == 9223372036854775808);
+  show(r._1);
+  return 0;
+}
+
+fn main() -> i32 {
+  unsigned_abs();
+  print!("| ");
+  saturating_div();
+  print!("| ");
+  overflowing_pow();
+  print!("| ");
+  widths();
+  print!("| ");
+  more_widths();
+  return 0;
+}

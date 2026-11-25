@@ -60,7 +60,8 @@ fn main() -> i32 {
   let mut d = Walk {
     left : 3i64
   }.map(| p : Point | p.x + p.y);
-  print(d.sum());
+  let total : i64 = d.sum();
+  print(total);
   return 0;
 }
 

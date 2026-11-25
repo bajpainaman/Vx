@@ -141,12 +141,14 @@ fn main() -> i32 {
     a : 0, b : 4611686018427387903, c : 4611686018427387904, given : 0i64
   };
   print!("sum=");
-  print(s.sum());
+  let total : usize = s.sum();
+  print(total);
   let mut p = Three {
     a : 49, b : 9271, c : 20303320287433, given : 0i64
   };
   print!("; product=");
-  print(p.product());
+  let product : usize = p.product();
+  print(product);
   print!(";");
   return 0;
 }

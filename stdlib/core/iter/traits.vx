@@ -217,16 +217,16 @@ trait Iterator {
 
   /// Every item added up, consuming the sequence. Zero for one that is already finished.
   ///
-  /// The item type says how, by implementing `Sum`, and the result has the item's type.
-  fn sum(self : &mut Self) -> Self::Item {
-    return Self::Item::sum(self);
+  /// The caller chooses the result type `S`. `S` must implement `Sum` for the item type.
+  fn sum<S : Sum<Self::Item>>(self : &mut Self) -> S {
+    return S::sum(self);
   }
 
   /// Every item multiplied together, consuming the sequence. One for one already finished.
   ///
-  /// The item type says how, by implementing `Product`.
-  fn product(self : &mut Self) -> Self::Item {
-    return Self::Item::product(self);
+  /// The caller chooses the result type `S`. `S` must implement `Product` for the item type.
+  fn product<S : Product<Self::Item>>(self : &mut Self) -> S {
+    return S::product(self);
   }
 
   /// The greatest item, or nothing for a sequence already finished. Of several equal greatest
@@ -822,14 +822,14 @@ trait Extend<A> {
 /// A type whose values can be added up from an iterator's items, which is what `sum` does.
 trait Sum<A> {
   /// Every item `iter` has left, added up. Zero when it has none.
-  fn sum<I : Iterator>(iter : I) -> Self;
+  fn sum<I : Iterator<Item = A>>(iter : I) -> Self;
 }
 
 /// A type whose values can be multiplied together from an iterator's items, which is what
 /// `product` does.
 trait Product<A> {
   /// Every item `iter` has left, multiplied together. One when it has none.
-  fn product<I : Iterator>(iter : I) -> Self;
+  fn product<I : Iterator<Item = A>>(iter : I) -> Self;
 }
 
 /// `Sum` and `Product` for one number type, starting from its zero and its one.
@@ -837,7 +837,7 @@ macro_rules stamp_accumulate {
   ($t : ident , $zero : expr , $one : expr) => {
     impl Sum<$t> for $t {
       /// Every item added up, from zero.
-      fn sum<I : Iterator>(iter : I) -> $t {
+      fn sum<I : Iterator<Item = $t>>(iter : I) -> $t {
         let mut it = iter;
         let mut total : $t = $zero;
         loop {
@@ -853,7 +853,7 @@ macro_rules stamp_accumulate {
 
     impl Product<$t> for $t {
       /// Every item multiplied together, from one.
-      fn product<I : Iterator>(iter : I) -> $t {
+      fn product<I : Iterator<Item = $t>>(iter : I) -> $t {
         let mut it = iter;
         let mut total : $t = $one;
         loop {
@@ -862,6 +862,44 @@ macro_rules stamp_accumulate {
             return total;
           }
           total = total * step.unwrap();
+        }
+        return total;
+      }
+    }
+  };
+}
+
+/// `Sum` and `Product` of narrow items into a wider type. Each impl converts every item to the
+/// wider type first, and the conversion keeps every value.
+macro_rules stamp_accumulate_widened {
+  ($item : ident , $t : ident , $zero : expr , $one : expr) => {
+    impl Sum<$item> for $t {
+      /// Every item converted and added up, from zero.
+      fn sum<I : Iterator<Item = $item>>(iter : I) -> $t {
+        let mut it = iter;
+        let mut total : $t = $zero;
+        loop {
+          let step = it.next();
+          if step.is_none() {
+            return total;
+          }
+          total = total + (step.unwrap() as $t);
+        }
+        return total;
+      }
+    }
+
+    impl Product<$item> for $t {
+      /// Every item converted and multiplied together, from one.
+      fn product<I : Iterator<Item = $item>>(iter : I) -> $t {
+        let mut it = iter;
+        let mut total : $t = $one;
+        loop {
+          let step = it.next();
+          if step.is_none() {
+            return total;
+          }
+          total = total * (step.unwrap() as $t);
         }
         return total;
       }
@@ -880,3 +918,17 @@ stamp_accumulate!(u64 , 0 , 1);
 stamp_accumulate!(usize , 0 , 1);
 stamp_accumulate!(f32 , 0.0 , 1.0);
 stamp_accumulate!(f64 , 0.0 , 1.0);
+
+stamp_accumulate_widened!(i8 , i16 , 0 , 1);
+stamp_accumulate_widened!(i8 , i32 , 0 , 1);
+stamp_accumulate_widened!(i8 , i64 , 0 , 1);
+stamp_accumulate_widened!(i16 , i32 , 0 , 1);
+stamp_accumulate_widened!(i16 , i64 , 0 , 1);
+stamp_accumulate_widened!(i32 , i64 , 0 , 1);
+stamp_accumulate_widened!(u8 , u16 , 0 , 1);
+stamp_accumulate_widened!(u8 , u32 , 0 , 1);
+stamp_accumulate_widened!(u8 , u64 , 0 , 1);
+stamp_accumulate_widened!(u16 , u32 , 0 , 1);
+stamp_accumulate_widened!(u16 , u64 , 0 , 1);
+stamp_accumulate_widened!(u32 , u64 , 0 , 1);
+stamp_accumulate_widened!(f32 , f64 , 0.0 , 1.0);

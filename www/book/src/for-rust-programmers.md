@@ -145,7 +145,7 @@ fn main() -> i32 {
     let s = Rect { w : 1, h : 1 };
     println!("area {}", total(&r, &s));
 
-    let squares = range(1i64, 4i64).map(| x : i64 | x * x).sum();
+    let squares : i64 = range(1i64, 4i64).map(| x : i64 | x * x).sum();
     println!("squares {}", squares);
 
     match quarter(12) {

@@ -1,0 +1,66 @@
+//===- core_iter_sum_into_a_chosen_type.vx - Vx Compiler --------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// `sum` and `product` answer the type that the caller names, as in Rust.
+//
+//   6000000000   three i32 items of 2000000000, summed into an i64 (too big for an i32)
+//   30000000000  the i32 items 100000, 100000 and 3, multiplied into an i64
+//   -300         three i8 items of -100, summed into an i64: the sign stays
+//   600          three u8 items of 200, summed into a u64
+//   16777218     the f32 items 2^24, 1 and 1, summed into an f64 (an f32 sum stays at 2^24)
+//   0 1          no i32 items: the sum into an i64 is 0, the product is 1
+//   6 6          the i32 items 1, 2 and 3 into an i32: the sum and the product
+import core::iter;
+
+fn main() -> i32 {
+  let mut big = range(0i64, 3i64).map(| x : i64 | 2000000000i32);
+  let big_sum : i64 = big.sum();
+  print(big_sum);
+  print!(" ");
+  let mut factors = range(0i64, 3i64).map(| x : i64 | if x == 2i64 {
+    3i32
+  } else {
+    100000i32
+  });
+  let big_product : i64 = factors.product();
+  print(big_product);
+  print!(" ");
+  let mut negative = range(0i64, 3i64).map(| x : i64 | -100i8);
+  let negative_sum : i64 = negative.sum();
+  print(negative_sum);
+  print!(" ");
+  let mut bytes = range(0i64, 3i64).map(| x : i64 | 200u8);
+  let byte_sum : u64 = bytes.sum();
+  print(byte_sum);
+  print!(" ");
+  let mut floats = range(0i64, 3i64).map(| x : i64 | if x == 0i64 {
+    16777216f32
+  } else {
+    1f32
+  });
+  let float_sum : f64 = floats.sum();
+  print(float_sum);
+  print!(" ");
+  let mut empty = range(0i64, 0i64).map(| x : i64 | 7i32);
+  let empty_sum : i64 = empty.sum();
+  let mut empty_too = range(0i64, 0i64).map(| x : i64 | 7i32);
+  let empty_product : i64 = empty_too.product();
+  print(empty_sum);
+  print!(" ");
+  print(empty_product);
+  print!(" ");
+  let mut small = range(1i64, 4i64).map(| x : i64 | x as i32);
+  let small_sum : i32 = small.sum();
+  let mut small_too = range(1i64, 4i64).map(| x : i64 | x as i32);
+  let small_product : i32 = small_too.product();
+  print(small_sum);
+  print!(" ");
+  print(small_product);
+  return 0;
+}
+
+// EXPECT: 6000000000 30000000000 -300 600 16777218 0 1 6 6

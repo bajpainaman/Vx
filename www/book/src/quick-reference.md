@@ -300,7 +300,7 @@ fn main() -> i32 {
   }
   println!("len {} total {}", v.len(), total);
 
-  let odd_squares = range(1i64, 10i64).filter(| x : &i64 | *x % 2 == 1).map(| x : i64 | x * x).sum();
+  let odd_squares : i64 = range(1i64, 10i64).filter(| x : &i64 | *x % 2 == 1).map(| x : i64 | x * x).sum();
   println!("odd squares {}", odd_squares);
 
   match parse_digit(55) {

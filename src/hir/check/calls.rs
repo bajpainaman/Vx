@@ -2203,6 +2203,41 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Do the arguments of a call of `m` meet the bounds of `m` that bind an associated type,
+    /// such as `I : Iterator<Item = A>`? A parameter written `iter : I` binds `I` to the type of
+    /// its argument. The default `sum` passes `self`, a `&mut Self`, where `I` is expected. So
+    /// the check uses the type that a reference points to. A bound with no binding counts as
+    /// met, and so does an argument whose type is not known after an earlier error.
+    fn method_bounds_hold(&mut self, m: &Function, arg_types: &[Type]) -> bool {
+        let mut mapping: HashMap<crate::symbol::Symbol, Type> = HashMap::new();
+        for ((_, p), a) in m.params.iter().zip(arg_types) {
+            if let Type::Generic(g, _) = p {
+                let a = match a {
+                    Type::Borrow { inner, .. } | Type::Ref(inner, _) => inner.as_ref(),
+                    other => other,
+                };
+                if !matches!(a, Type::Unknown) {
+                    mapping.insert(g.clone(), a.clone());
+                }
+            }
+        }
+        for param in &m.generics {
+            let decl::GenericParam::Type { name, bounds } = param else {
+                continue;
+            };
+            let Some(ty) = mapping.get(name).cloned() else {
+                continue;
+            };
+            for bound in bounds.iter().filter(|b| !b.bindings.is_empty()) {
+                let bound = self.substitute_bound(bound, &mapping);
+                if !self.bound_holds(&bound, &ty) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Resolve and instantiate a `Struct::method(...)` static call (an inherent-impl method
     /// named through its type). Parses any explicit type args on the struct or method, finds the
     /// matching `_inherent` impl method, deduces what those left open from the arguments and
@@ -2292,7 +2327,8 @@ impl<'a> TypeChecker<'a> {
             }
         };
         let mut inherent: Vec<&decl::ImplBlock> = Vec::new();
-        let mut from_traits: Vec<(&crate::symbol::Symbol, &decl::ImplBlock)> = Vec::new();
+        // The list owns the trait names, so `bound_holds` below can borrow `self`.
+        let mut from_traits: Vec<(crate::symbol::Symbol, &'a decl::ImplBlock)> = Vec::new();
         for (trait_key, impl_blocks) in self.env.impls.iter() {
             if only_trait.as_ref().is_some_and(|t| t != trait_key.as_ref()) {
                 continue;
@@ -2309,7 +2345,7 @@ impl<'a> TypeChecker<'a> {
                 if trait_key.as_ref() == "_inherent" {
                     inherent.push(ib);
                 } else {
-                    from_traits.push((trait_key, ib));
+                    from_traits.push((trait_key.clone(), *ib));
                 }
             }
         }
@@ -2330,6 +2366,26 @@ impl<'a> TypeChecker<'a> {
                     .find(|m| m.name == method_name.as_str().into())
                     .is_some_and(|m| params_accept(m, arg_types))
             });
+        }
+        // Impls of one trait with different type arguments, `Sum<i32>` and `Sum<i64>` on `i64`,
+        // all take a generic `I`. The bound `I : Iterator<Item = A>` says which impl applies.
+        // Impls of two different traits stay a refusal (E3035).
+        if inherent.is_empty()
+            && from_traits.len() > 1
+            && from_traits.iter().all(|(t, _)| *t == from_traits[0].0)
+        {
+            let mut kept = Vec::new();
+            for (t, ib) in std::mem::take(&mut from_traits) {
+                let m = ib
+                    .methods
+                    .iter()
+                    .find(|m| m.name == method_name.as_str().into())
+                    .expect("each impl here has the method");
+                if self.method_bounds_hold(m, arg_types) {
+                    kept.push((t, ib));
+                }
+            }
+            from_traits = kept;
         }
         // The trait and its arguments belong in the instantiated name for the same reason they
         // belong in instance dispatch's: `impl MyFrom<i32> for i64` and `impl MyFrom<u8> for i64`
@@ -2397,7 +2453,7 @@ impl<'a> TypeChecker<'a> {
             from_traits
                 .first()
                 .map(|(tr, ib)| {
-                    let seg = crate::syntax::types::trait_segment(Some(*tr), &ib.trait_args);
+                    let seg = crate::syntax::types::trait_segment(Some(tr), &ib.trait_args);
                     // A trait with no arguments adds nothing to the name, so `A::f` and `B::f`
                     // on one type would both be `i32::f`. A trait-qualified call names the trait.
                     if seg.is_empty() && only_trait.is_some() {

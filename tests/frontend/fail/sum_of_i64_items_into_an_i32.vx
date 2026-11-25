@@ -1,0 +1,18 @@
+//===- sum_of_i64_items_into_an_i32.vx - Vx Compiler ------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s '--implicit-check-not=Error['
+
+// An `i32` can sum `i8`, `i16` and `i32` items, but not `i64` items, which may not fit.
+import core::iter;
+
+fn main() -> i32 {
+  let mut items = range(0i64, 3i64);
+  // CHECK: Error[E3036] at {{.*}}: No impl of 'sum' on 'i32' takes (&mut Range); 'i32' implements Sum<i16>, Sum<i32>, Sum<i8>
+  let total : i32 = items.sum();
+  return total;
+}

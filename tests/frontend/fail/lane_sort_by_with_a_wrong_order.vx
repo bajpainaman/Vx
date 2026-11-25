@@ -1,0 +1,55 @@
+//===- lane_sort_by_with_a_wrong_order.vx - Vx Compiler -*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The third argument of `lanes::sort_by(&mut t, n, less)` is the name of a function
+// `fn(i64, i64) -> bool`. Each lane calls it at each step of the sort, so the compiler must know
+// the function. Each call below gives the sort a wrong order. A name that the program does not
+// define gets only the error of an unknown name.
+//
+// RUN: not vxc %s --host default --machine fleet/a100-80.vx --emit-mlir -o /dev/null 2>&1 | FileCheck %s --implicit-check-not=Error
+
+fn greater(a : i64, b : i64) -> bool {
+  return a > b;
+}
+
+fn greater_f32(a : f32, b : f32) -> bool {
+  return a > b;
+}
+
+fn compare(a : i64, b : i64) -> i64 {
+  return a - b;
+}
+
+pub fn wrong_orders(out : &mut Tensor<i64, [?], Memory::HBM>, x : &Tensor<i64, [?], Memory::HBM>) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..1 across blocks {
+      let mut keys = unsafe { Tensor<i64, [64], Memory::SMEM>::uninit() };
+      for t in 0..64 across lanes(64) {
+        keys[t] = x[t];
+      }
+      let order = greater;
+      // CHECK: Error[E3003] at {{.*}}lane_sort_by_with_a_wrong_order.vx:[[@LINE+1]]:7: {{.*}}the third argument of `lanes::sort_by` must be the name of a function `fn(i64, i64) -> bool`, which gives true when its first argument goes before its second, but `order` is a variable of type `fn(i64, i64) -> bool`
+      lanes::sort_by(&mut keys, 64, order);
+      // CHECK: Error[E3003] at {{.*}}lane_sort_by_with_a_wrong_order.vx:[[@LINE+1]]:7: {{.*}}the third argument of `lanes::sort_by`{{.*}} but `greater_f32` is `fn(f32, f32) -> bool`
+      lanes::sort_by(&mut keys, 64, greater_f32);
+      // CHECK: Error[E3003] at {{.*}}lane_sort_by_with_a_wrong_order.vx:[[@LINE+1]]:7: {{.*}}the third argument of `lanes::sort_by`{{.*}} but `compare` is `fn(i64, i64) -> i64`
+      lanes::sort_by(&mut keys, 64, compare);
+      // CHECK: Error[E3003] at {{.*}}lane_sort_by_with_a_wrong_order.vx:[[@LINE+1]]:7: {{.*}}the third argument of `lanes::sort_by`{{.*}} but it is `i32`
+      lanes::sort_by(&mut keys, 64, 1);
+      // CHECK: Error[E3003] at {{.*}}lane_sort_by_with_a_wrong_order.vx:[[@LINE+1]]:7: {{.*}}the third argument of `lanes::sort_by`{{.*}} but it is a closure
+      lanes::sort_by(&mut keys, 64, |a : i64, b : i64| a < b);
+      // CHECK: Error[E3003] at {{.*}}lane_sort_by_with_a_wrong_order.vx:[[@LINE+1]]:7: {{.*}}`lanes::sort_by` takes 3 arguments, a borrowed tensor, the number of its elements to sort and the name of a function that orders two elements, but it got 2
+      lanes::sort_by(&mut keys, 64);
+      // CHECK: Error[E2001] at {{.*}}lane_sort_by_with_a_wrong_order.vx:[[@LINE+1]]:37: {{.*}}Undefined variable 'smaller'
+      lanes::sort_by(&mut keys, 64, smaller);
+      for t in 0..64 across lanes(64) {
+        out[t] = keys[t];
+      }
+    }
+  }
+  return;
+}

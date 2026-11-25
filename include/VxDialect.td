@@ -278,9 +278,11 @@ def Vx_LaneArgmaxOp : Vx_Op<"lane_argmax", [MemoryEffects<[MemRead, MemWrite]>,
     let results = (outs I32:$result);
 }
 
-// `lanes::sort` and `lanes::sort_descending`: the first `count` elements of
-// `input`, an `i64` tensor whose size is a power of two, in order. The other
-// elements do not change. `lanes` is the number of lanes of the block, or 32 in
+// `lanes::sort`, `lanes::sort_descending` and `lanes::sort_by`: the first
+// `count` elements of `input`, an `i64` tensor whose size is a power of two, in
+// order. The other elements do not change. With `less`, the order is that of
+// the function `less(a, b)`, of type `(i64, i64) -> i1`: `a` goes before `b`
+// when it gives true. `lanes` is the number of lanes of the block, or 32 in
 // the code of a subgroup. The device clone expands it into a sorting network in
 // registers, and the host lowering and `serial` into loops. It reads and writes
 // memory so that nothing moves it past a use of `input` or into a branch.
@@ -288,8 +290,8 @@ def Vx_LaneSortOp : Vx_Op<"lane_sort", [MemoryEffects<[MemRead, MemWrite]>,
         DeclareOpInterfaceMethods<Vx_LaneOpInterface, ["expandInKernel"]>]> {
     let summary = "Sort the first elements of a tensor with the lanes.";
     let arguments = (ins AnyMemRef:$input, I32:$count, I64Attr:$lanes,
-                     UnitAttr:$descending, UnitAttr:$subgroup,
-                     UnitAttr:$serial);
+                     UnitAttr:$descending, OptionalAttr<FlatSymbolRefAttr>:$less,
+                     UnitAttr:$subgroup, UnitAttr:$serial);
 }
 
 // `acc = acc + (lhs as f32) @ (rhs as f32)` in the code of a subgroup, or with

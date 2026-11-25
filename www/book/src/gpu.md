@@ -202,7 +202,8 @@ The library has other routines of this kind. `lanes::max` gives the largest elem
 `lanes::argmax` its index. Write each call as the whole value of a `let`, in the code of a block.
 `lanes::sum_unordered` lets the compiler choose the order of the adds, so the last bits of the sum
 can differ from `lanes::sum`. `lanes::sort(&mut t, n)` sorts the first `n` elements of a tile of
-`i64`, whose size is a power of two.
+`i64`, whose size is a power of two. `lanes::sort_by(&mut t, n, less)` sorts them in the order of
+the function `less`.
 
 ## Atomics on the elements of a tensor
 

@@ -2869,6 +2869,12 @@ static void expandLaneReduction(OpBuilder &b, OpTy op, bool device,
 // an ascending sort and the smallest for a descending one. So the sentinels go
 // to the end, and the first `count` elements are the sorted ones. A sort of
 // integers has one result, so the CPU loops and the GPU network agree.
+//
+// A sort with `less` has no sentinel, because no key goes after every other
+// key in each order. So each key has a flag that says whether it is one of the
+// first `count`, and a key without the flag goes after every key with it. Two
+// keys that `less` cannot order can be in either order. So the CPU and the GPU
+// run the same steps, and the two positions of a pair make the same choice.
 
 /// The size of the tensor of a lane sort on the GPU. The checker made sure that
 /// it is a number and a power of two, and the flat code generator keeps it in
@@ -2921,6 +2927,49 @@ static Value laneSortKeep(OpBuilder &b, Location loc, vx::LaneSortOp op,
                                    b.create<arith::MaxSIOp>(loc, mine, theirs));
 }
 
+/// With `less`: whether key `a` goes before key `b`. `aIn` and `bIn` say
+/// whether each key is one of the first `count`. A key that is not goes after
+/// every key that is. `less` sees only keys of the count.
+static Value laneSortBefore(OpBuilder &b, Location loc, vx::LaneSortOp op,
+                            Value a, Value aIn, Value bKey, Value bIn) {
+  Type i1 = b.getI1Type();
+  Value both = b.create<arith::AndIOp>(loc, aIn, bIn);
+  auto pick = b.create<scf::IfOp>(loc, TypeRange{i1}, both,
+                                  /*withElseRegion=*/true);
+  OpBuilder::InsertionGuard guard(b);
+  b.setInsertionPointToStart(&pick.getThenRegion().front());
+  auto call = b.create<func::CallOp>(loc, op.getLessAttr(), TypeRange{i1},
+                                     ValueRange{a, bKey});
+  b.create<scf::YieldOp>(loc, call.getResults());
+  b.setInsertionPointToStart(&pick.getElseRegion().front());
+  Value notB = b.create<arith::XOrIOp>(
+      loc, bIn, b.create<arith::ConstantIntOp>(loc, i1, 1));
+  b.create<scf::YieldOp>(loc,
+                         ValueRange{b.create<arith::AndIOp>(loc, aIn, notB)});
+  return pick.getResult(0);
+}
+
+/// With `less`: whether the pair at the step in the merge of runs of `size`
+/// trades its keys. `lo` is the key at the lower position and `hi` the key at
+/// the higher one, each with its flag. `p` is either position. In a run that
+/// goes up, the pair trades when `hi` goes before `lo`, and in a run that goes
+/// down, when `lo` goes before `hi`. Both positions ask `less` with the same
+/// keys in the same order, so they make the same choice.
+static Value laneSortTrade(OpBuilder &b, Location loc, vx::LaneSortOp op,
+                           Value p, Value size, Value lo, Value loIn, Value hi,
+                           Value hiIn) {
+  assert(!op.getDescending() && "a sort with `less` has no `descending`");
+  Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+  Value up =
+      b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                              b.create<arith::AndIOp>(loc, p, size), zero);
+  auto choose = [&](Value x, Value y) {
+    return b.create<arith::SelectOp>(loc, up, x, y).getResult();
+  };
+  return laneSortBefore(b, loc, op, choose(hi, lo), choose(hiIn, loIn),
+                        choose(lo, hi), choose(loIn, hiIn));
+}
+
 /// The count, at least 0 and at most `size`, as an index.
 static Value laneSortCount(OpBuilder &b, vx::LaneSortOp op, Value size) {
   Location loc = op.getLoc();
@@ -2967,13 +3016,24 @@ static void expandLaneSortOnHost(OpBuilder &b, vx::LaneSortOp op) {
   Value work = b.create<memref::AllocaOp>(
       loc, MemRefType::get({ShapedType::kDynamic}, b.getI64Type()),
       ValueRange{all});
-  b.create<scf::ForOp>(loc, zero, all, one, ValueRange{},
-                       [&](OpBuilder &nb, Location l, Value i, ValueRange) {
-                         nb.create<memref::StoreOp>(
-                             l, laneSortLoad(nb, op, op.getInput(), i, n), work,
-                             ValueRange{i});
-                         nb.create<scf::YieldOp>(l);
-                       });
+  // With `less`, the flag of each key of `work`: whether it is one of the
+  // first `n`.
+  Value flags;
+  if (op.getLess())
+    flags = b.create<memref::AllocaOp>(
+        loc, MemRefType::get({ShapedType::kDynamic}, b.getI1Type()),
+        ValueRange{all});
+  b.create<scf::ForOp>(
+      loc, zero, all, one, ValueRange{},
+      [&](OpBuilder &nb, Location l, Value i, ValueRange) {
+        nb.create<memref::StoreOp>(l, laneSortLoad(nb, op, op.getInput(), i, n),
+                                   work, ValueRange{i});
+        if (flags)
+          nb.create<memref::StoreOp>(
+              l, nb.create<arith::CmpIOp>(l, arith::CmpIPredicate::slt, i, n),
+              flags, ValueRange{i});
+        nb.create<scf::YieldOp>(l);
+      });
   // One step: each pair `i` and `i ^ d`, with `i` the lower, in place.
   auto step = [&](OpBuilder &b, Location loc, Value run, Value d) {
     b.create<scf::ForOp>(
@@ -2988,10 +3048,29 @@ static void expandLaneSortOnHost(OpBuilder &b, vx::LaneSortOp op) {
             nb.setInsertionPointToStart(&pair.getThenRegion().front());
             Value mine = nb.create<memref::LoadOp>(l, work, ValueRange{i});
             Value theirs = nb.create<memref::LoadOp>(l, work, ValueRange{j});
-            Value keep = laneSortKeep(nb, l, op, i, run, d, mine, theirs);
-            Value other = laneSortKeep(nb, l, op, j, run, d, theirs, mine);
-            nb.create<memref::StoreOp>(l, keep, work, ValueRange{i});
-            nb.create<memref::StoreOp>(l, other, work, ValueRange{j});
+            if (flags) {
+              Value mineIn = nb.create<memref::LoadOp>(l, flags, ValueRange{i});
+              Value theirsIn =
+                  nb.create<memref::LoadOp>(l, flags, ValueRange{j});
+              Value trade = laneSortTrade(nb, l, op, i, run, mine, mineIn,
+                                          theirs, theirsIn);
+              auto pick = [&](Value x, Value y) {
+                return nb.create<arith::SelectOp>(l, trade, x, y).getResult();
+              };
+              nb.create<memref::StoreOp>(l, pick(theirs, mine), work,
+                                         ValueRange{i});
+              nb.create<memref::StoreOp>(l, pick(mine, theirs), work,
+                                         ValueRange{j});
+              nb.create<memref::StoreOp>(l, pick(theirsIn, mineIn), flags,
+                                         ValueRange{i});
+              nb.create<memref::StoreOp>(l, pick(mineIn, theirsIn), flags,
+                                         ValueRange{j});
+            } else {
+              Value keep = laneSortKeep(nb, l, op, i, run, d, mine, theirs);
+              Value other = laneSortKeep(nb, l, op, j, run, d, theirs, mine);
+              nb.create<memref::StoreOp>(l, keep, work, ValueRange{i});
+              nb.create<memref::StoreOp>(l, other, work, ValueRange{j});
+            }
           }
           nb.create<scf::YieldOp>(l);
         });
@@ -3046,6 +3125,18 @@ static Value laneSortShuffle(OpBuilder &b, Location loc, Value v, int32_t d) {
                                 newLo);
 }
 
+/// The flag `f` of lane `lane ^ d` of the warp, as one 32-bit shuffle.
+static Value laneSortShuffleFlag(OpBuilder &b, Location loc, Value f,
+                                 int32_t d) {
+  Type i32 = b.getI32Type();
+  Value wide = b.create<arith::ExtUIOp>(loc, i32, f);
+  Value other =
+      b.create<gpu::ShuffleOp>(loc, wide, d, 32, gpu::ShuffleMode::XOR)
+          .getShuffleResult();
+  return b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, other,
+                                 b.create<arith::ConstantIntOp>(loc, i32, 0));
+}
+
 /// On the GPU: lane `x` of the block, or of the subgroup, holds positions
 /// `x + k * lanes` of the network in registers. A step of distance below 32
 /// takes the other value from a lane of the warp with a shuffle. A step of a
@@ -3067,11 +3158,17 @@ static void expandLaneSortOnDevice(OpBuilder &b, vx::LaneSortOp op) {
                       loc, tid, b.create<arith::ConstantIndexOp>(loc, 32))
                 : tid;
   Value inTensor = b.create<arith::ConstantIndexOp>(loc, size);
-  SmallVector<Value> pos, r, kept;
+  bool by = static_cast<bool>(op.getLess());
+  // With `less`, `in[k]` is the flag of the key `r[k]`: whether it is one of
+  // the first `n`.
+  SmallVector<Value> pos, r, kept, in;
   for (int64_t k = 0; k < regs; ++k) {
     pos.push_back(b.create<arith::AddIOp>(
         loc, x, b.create<arith::ConstantIndexOp>(loc, k * lanes)));
     r.push_back(laneSortLoad(b, op, op.getInput(), pos[k], n));
+    if (by)
+      in.push_back(
+          b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, pos[k], n));
     // The steps below can exchange keys through the tensor itself, and they
     // write each position of it. So each lane keeps its keys past the count.
     kept.push_back(laneSortLoad(b, op, op.getInput(), pos[k], inTensor));
@@ -3097,44 +3194,97 @@ static void expandLaneSortOnDevice(OpBuilder &b, vx::LaneSortOp op) {
     }
     return shared;
   };
+  // With `less`, the flags of the steps between, in a tile of shared memory.
+  Value sharedFlags;
+  auto flagMemory = [&]() {
+    if (!sharedFlags) {
+      auto t =
+          MemRefType::get({size}, b.getI8Type(), MemRefLayoutAttrInterface{},
+                          b.getI64IntegerAttr(3));
+      sharedFlags = b.create<memref::AllocaOp>(loc, t, b.getI64IntegerAttr(16));
+    }
+    return sharedFlags;
+  };
+  // Element `other` of `m` when it is in the tensor, and `outside` otherwise.
+  auto loadOther = [&](Value m, Value other, Value outside) {
+    Value inRange = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt,
+                                            other, inTensor);
+    auto pick = b.create<scf::IfOp>(loc, TypeRange{outside.getType()}, inRange,
+                                    /*withElseRegion=*/true);
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(&pick.getThenRegion().front());
+    b.create<scf::YieldOp>(
+        loc, ValueRange{b.create<memref::LoadOp>(loc, m, ValueRange{other})});
+    b.setInsertionPointToStart(&pick.getElseRegion().front());
+    b.create<scf::YieldOp>(loc, ValueRange{outside});
+    return pick.getResult(0);
+  };
   for (int64_t run = 2; run <= span; run *= 2)
     for (int64_t d = run / 2; d >= 1; d /= 2) {
-      SmallVector<Value> theirs(regs);
+      SmallVector<Value> theirs(regs), theirsIn(regs);
       if (d < 32) {
-        for (int64_t k = 0; k < regs; ++k)
+        for (int64_t k = 0; k < regs; ++k) {
           theirs[k] = laneSortShuffle(b, loc, r[k], static_cast<int32_t>(d));
+          if (by)
+            theirsIn[k] =
+                laneSortShuffleFlag(b, loc, in[k], static_cast<int32_t>(d));
+        }
       } else if (d >= lanes) {
-        for (int64_t k = 0; k < regs; ++k)
+        for (int64_t k = 0; k < regs; ++k) {
           theirs[k] = r[k ^ (d / lanes)];
+          if (by)
+            theirsIn[k] = in[k ^ (d / lanes)];
+        }
       } else {
         Value m = memory();
-        for (int64_t k = 0; k < regs; ++k)
+        Value f = by ? flagMemory() : Value();
+        for (int64_t k = 0; k < regs; ++k) {
           laneSortStore(b, loc, r[k], m, pos[k], inTensor);
+          if (by)
+            laneSortStore(b, loc,
+                          b.create<arith::ExtUIOp>(loc, b.getI8Type(), in[k]),
+                          f, pos[k], inTensor);
+        }
         b.create<gpu::BarrierOp>(loc);
         Value dist = b.create<arith::ConstantIndexOp>(loc, d);
         for (int64_t k = 0; k < regs; ++k) {
           Value other = b.create<arith::XOrIOp>(loc, pos[k], dist);
-          Value inRange = b.create<arith::CmpIOp>(
-              loc, arith::CmpIPredicate::slt, other, inTensor);
-          auto pick = b.create<scf::IfOp>(loc, TypeRange{b.getI64Type()},
-                                          inRange, /*withElseRegion=*/true);
-          OpBuilder::InsertionGuard guard(b);
-          b.setInsertionPointToStart(&pick.getThenRegion().front());
-          b.create<scf::YieldOp>(loc, ValueRange{b.create<memref::LoadOp>(
-                                          loc, m, ValueRange{other})});
-          b.setInsertionPointToStart(&pick.getElseRegion().front());
-          b.create<scf::YieldOp>(loc, ValueRange{laneSortSentinel(b, op)});
-          b.setInsertionPointAfter(pick);
-          theirs[k] = pick.getResult(0);
+          theirs[k] = loadOther(m, other, laneSortSentinel(b, op));
+          if (by) {
+            Value zero8 = b.create<arith::ConstantIntOp>(loc, b.getI8Type(), 0);
+            theirsIn[k] =
+                b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne,
+                                        loadOther(f, other, zero8), zero8);
+          }
         }
         // The next step writes the memory again.
         b.create<gpu::BarrierOp>(loc);
       }
       Value runValue = b.create<arith::ConstantIndexOp>(loc, run);
       Value dValue = b.create<arith::ConstantIndexOp>(loc, d);
-      for (int64_t k = 0; k < regs; ++k)
-        r[k] =
-            laneSortKeep(b, loc, op, pos[k], runValue, dValue, r[k], theirs[k]);
+      for (int64_t k = 0; k < regs; ++k) {
+        if (!by) {
+          r[k] = laneSortKeep(b, loc, op, pos[k], runValue, dValue, r[k],
+                              theirs[k]);
+          continue;
+        }
+        // The lower position of the pair has the key `lo`.
+        Value lower = b.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::eq,
+            b.create<arith::AndIOp>(loc, pos[k], dValue),
+            b.create<arith::ConstantIndexOp>(loc, 0));
+        auto ordered = [&](Value mine, Value other) {
+          return std::make_pair(
+              b.create<arith::SelectOp>(loc, lower, mine, other).getResult(),
+              b.create<arith::SelectOp>(loc, lower, other, mine).getResult());
+        };
+        auto [lo, hi] = ordered(r[k], theirs[k]);
+        auto [loIn, hiIn] = ordered(in[k], theirsIn[k]);
+        Value trade =
+            laneSortTrade(b, loc, op, pos[k], runValue, lo, loIn, hi, hiIn);
+        r[k] = b.create<arith::SelectOp>(loc, trade, theirs[k], r[k]);
+        in[k] = b.create<arith::SelectOp>(loc, trade, theirsIn[k], in[k]);
+      }
     }
   for (int64_t k = 0; k < regs; ++k)
     laneSortStore(b, loc, r[k], op.getInput(), pos[k], n);
@@ -6670,26 +6820,36 @@ struct DeviceCallees {
 /// an operation no device pipeline lowers.
 static bool collectDeviceCallees(Operation *op, ModuleOp module, bool inCallee,
                                  DeviceCallees &out,
-                                 llvm::SmallPtrSetImpl<Operation *> &onStack) {
-  if (auto call = dyn_cast<func::CallOp>(op)) {
-    auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
-    if (!callee || callee.isExternal() || onStack.contains(callee))
-      return false;
-    if (out.funcs.contains(callee))
-      return true;
-    onStack.insert(callee);
-    WalkResult r = callee.getBody().walk([&](Operation *inner) {
-      return collectDeviceCallees(inner, module, /*inCallee=*/true, out,
-                                  onStack)
-                 ? WalkResult::advance()
-                 : WalkResult::interrupt();
-    });
-    onStack.erase(callee);
-    if (r.wasInterrupted())
-      return false;
-    out.funcs.insert(callee);
+                                 llvm::SmallPtrSetImpl<Operation *> &onStack);
+
+/// Add the function `name`, which a kernel or one of its callees calls, and
+/// what it needs to `out`. False when it cannot run on the device.
+static bool collectDeviceFunction(StringRef name, ModuleOp module,
+                                  DeviceCallees &out,
+                                  llvm::SmallPtrSetImpl<Operation *> &onStack) {
+  auto callee = module.lookupSymbol<func::FuncOp>(name);
+  if (!callee || callee.isExternal() || onStack.contains(callee))
+    return false;
+  if (out.funcs.contains(callee))
     return true;
-  }
+  onStack.insert(callee);
+  WalkResult r = callee.getBody().walk([&](Operation *inner) {
+    return collectDeviceCallees(inner, module, /*inCallee=*/true, out, onStack)
+               ? WalkResult::advance()
+               : WalkResult::interrupt();
+  });
+  onStack.erase(callee);
+  if (r.wasInterrupted())
+    return false;
+  out.funcs.insert(callee);
+  return true;
+}
+
+static bool collectDeviceCallees(Operation *op, ModuleOp module, bool inCallee,
+                                 DeviceCallees &out,
+                                 llvm::SmallPtrSetImpl<Operation *> &onStack) {
+  if (auto call = dyn_cast<func::CallOp>(op))
+    return collectDeviceFunction(call.getCallee(), module, out, onStack);
   if (auto get = dyn_cast<memref::GetGlobalOp>(op)) {
     auto global = module.lookupSymbol<memref::GlobalOp>(get.getName());
     if (!global || !global.getConstant() || !global.getInitialValue())
@@ -6922,6 +7082,11 @@ static bool runsOnDevice(Operation *op, ModuleOp module,
   // compiles the shapes they name, so they apply to this pipeline alone.
   if (pipeline == DevicePipeline::Spirv && spirvRefusalOf(op))
     return false;
+  // The expansion of a sort with `less` calls it, so the function comes along.
+  if (auto sort = dyn_cast<vx::LaneSortOp>(op); sort && sort.getLess()) {
+    llvm::SmallPtrSet<Operation *, 8> onStack;
+    return collectDeviceFunction(*sort.getLess(), module, callees, onStack);
+  }
   // Rewritten to `gpu.return` and `gpu.barrier` in the device clone (Vx#379).
   // A `vx.launch_dim` leaves the region when it is outlined.
   if (isa<vx::YieldOp, vx::ReturnOp, vx::BarrierOp, vx::LaunchDimOp,
@@ -8544,6 +8709,9 @@ struct ConvertVxToStandardPass
       if (auto call = dyn_cast<func::CallOp>(blocker))
         what = "the call to '" + call.getCallee().str() +
                "' or something that it calls";
+      if (auto sort = dyn_cast<vx::LaneSortOp>(blocker); sort && sort.getLess())
+        what = "the function '" + sort.getLess()->str() +
+               "' of the lane sort, or something that it calls";
       if (across) {
         k.emitError() << "a GPU region with `across` loops cannot run on the "
                          "GPU, because the GPU code generator cannot take "

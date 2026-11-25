@@ -1,0 +1,50 @@
+//===- lane_sorts_in_the_order_of_a_function_on_the_gpu.vx - Vx Compiler -*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The PTX of `lanes::sort_by(&mut t, n, less)`. The GPU copy of the kernel takes the function
+// `less` with it, and each step of the sorting network calls it.
+//
+// RUN: vxc %s --host default --machine fleet/a100-80.vx --emit-ptx -o %t.ptx
+// RUN: FileCheck %s < %t.ptx --implicit-check-not=local_depot
+// RUN: FileCheck %s --check-prefix=LESS < %t.ptx
+// RUN: vxc %s --legacy-codegen --host default --machine fleet/a100-80.vx --emit-ptx -o %t.ast.ptx
+// RUN: FileCheck %s < %t.ast.ptx --implicit-check-not=local_depot
+// RUN: FileCheck %s --check-prefix=LESS < %t.ast.ptx
+
+fn greater(a : i64, b : i64) -> bool {
+  return a > b;
+}
+
+// A block of 256 lanes sorts 512 keys, two in each lane. Each key moves with a flag that says
+// whether it is one of the first `n`. So a step with shuffles takes two 32-bit shuffles for the
+// key and one for the flag. 35 of the 45 steps use shuffles: 35 * 2 keys * 3 = 210 shuffles. The
+// keys go through the tensor itself, and the flags through 512 bytes of shared memory. Each of
+// the 45 steps calls `greater` once for each key of a lane, and the call is inlined: 90 compares
+// of two `i64` with `>`.
+// CHECK-LABEL: .entry sort_by_greater(
+// CHECK-DAG: .shared .align 16 .b8 {{.*}}[4096];
+// CHECK-DAG: .shared .align 16 .b8 {{.*}}[512];
+// CHECK-COUNT-210: shfl.sync.bfly.b32
+// CHECK-NOT: shfl.sync
+// LESS-LABEL: .entry sort_by_greater(
+// LESS-COUNT-90: setp.gt.s64
+// LESS-NOT: setp.gt.s64
+pub fn sort_by_greater(out : &mut Tensor<i64, [?], Memory::HBM>, x : &Tensor<i64, [?], Memory::HBM>, n : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..1 across blocks {
+      let mut keys = unsafe { Tensor<i64, [512], Memory::SMEM>::uninit() };
+      for t in 0..512 across lanes(256) {
+        keys[t] = x[t];
+      }
+      lanes::sort_by(&mut keys, n, greater);
+      for t in 0..512 across lanes(256) {
+        out[t] = keys[t];
+      }
+    }
+  }
+  return;
+}

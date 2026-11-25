@@ -7452,7 +7452,23 @@ pub(crate) fn lower_lane_call<'c>(
     }
     let mut block = block;
     let mut operands = Vec::new();
+    let mut less = None;
     for (&arg, &kind) in args.iter().zip(routine.args) {
+        if kind == LaneArg::Function {
+            let Expr::Identifier(id) = arg else {
+                return Err(LowerError::ParseType(format!(
+                    "the order of `lanes::{}` is the name of a function",
+                    routine.name
+                )));
+            };
+            assert!(
+                gen.functions.contains_key(id.name.as_ref()),
+                "the checker gives `lanes::{}` a function that the module has",
+                routine.name
+            );
+            less = Some(id.name.clone());
+            continue;
+        }
         // An integer of the place, or an `i32`, which the op takes as an `i32`.
         let mut integer = |gen: &mut MeliorGenerator<'c>, e: &Expr| -> Result<(), LowerError> {
             let (v, v_ty, b) = gen.generate_expr(e, block)?;
@@ -7513,7 +7529,7 @@ pub(crate) fn lower_lane_call<'c>(
                 .is_some_and(|m| m.subgroup_keeps_its_row()),
         lanes,
     };
-    let attrs: Vec<(Identifier<'c>, Attribute<'c>)> = routine
+    let mut attrs: Vec<(Identifier<'c>, Attribute<'c>)> = routine
         .op_attributes(&site)
         .into_iter()
         .map(|(name, value)| {
@@ -7525,6 +7541,12 @@ pub(crate) fn lower_lane_call<'c>(
             (Identifier::new(gen.context, name), value)
         })
         .collect();
+    if let Some(less) = &less {
+        attrs.push((
+            Identifier::new(gen.context, "less"),
+            FlatSymbolRefAttribute::new(gen.context, less.as_ref()).into(),
+        ));
+    }
     let result = routine.result.map(|value| match value {
         crate::hir::check::lanes::LaneValue::F32 => gen.f32_ty,
         crate::hir::check::lanes::LaneValue::I32 => gen.i32_ty,

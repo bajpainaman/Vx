@@ -527,7 +527,21 @@ impl Lowerer<'_> {
         let mut operands = Vec::new();
         let mut place = None;
         let mut tile_ranks = Vec::new();
+        // The id of the function that orders a sort, which the `LaneCall` gives in its type.
+        let mut less = None;
         for (&arg, &kind) in args.iter().zip(routine.args) {
+            if kind == LaneArg::Function {
+                let Expr::Identifier(id) = arg else {
+                    return Err(crate::emitter_gap!());
+                };
+                let sig = self.registry.fn_sigs.get(id.name.as_ref()).ok_or(
+                    Decline::TypeNotModelled {
+                        what: "the order of a lane sort that is not a known function",
+                    },
+                )?;
+                less = Some(sig.gid);
+                continue;
+            }
             if kind == LaneArg::Place {
                 let Expr::Array(at) = arg else {
                     return Err(crate::emitter_gap!());
@@ -599,6 +613,22 @@ impl Lowerer<'_> {
             site,
         }
         .encode();
+        if let Some(gid) = less {
+            assert!(
+                routine.result.is_none(),
+                "a lane routine with a function gives no value"
+            );
+            let type_idx = TypeIdx(self.types.len() as u32);
+            self.types.push(gid);
+            self.code.push(HirInstruction::new(
+                Opcode::LaneCall,
+                Register(0),
+                Register(0),
+                type_idx,
+                imm,
+            ));
+            return Ok(None);
+        }
         Ok(match routine.result {
             Some(value) => Some(self.emit_value(
                 Opcode::LaneCall,

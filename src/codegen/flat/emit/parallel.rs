@@ -392,7 +392,7 @@ impl FnEmit<'_> {
                 }
             });
         }
-        let attrs: Vec<String> = routine
+        let mut attrs: Vec<String> = routine
             .op_attributes(&call.site)
             .into_iter()
             .map(|(name, value)| match value {
@@ -401,6 +401,15 @@ impl FnEmit<'_> {
                 LaneAttr::I64(n) => format!("{name} = {n} : i64"),
             })
             .collect();
+        // The function that orders a sort: its id is the type of the call.
+        if routine.args.contains(&LaneArg::Function) {
+            let gid = *self
+                .types
+                .get(ins.type_idx.0 as usize)
+                .ok_or(crate::emitter_gap!())?;
+            let less = self.ctx.callees.get(&gid).ok_or(crate::emitter_gap!())?;
+            attrs.push(format!("less = {}", sym_ref(&less.name)));
+        }
         let attrs = if attrs.is_empty() {
             String::new()
         } else {

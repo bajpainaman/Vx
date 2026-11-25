@@ -198,6 +198,8 @@ fn flat_path_coverage_of_the_backend_corpus_holds() {
         "optimizations/pass/across_loops_run_in_parallel_on_both_code_generators.vx", // needs --machine
         "optimizations/pass/lane_routines_run_in_parallel_on_both_code_generators.vx", // needs --machine
         "optimizations/pass/lane_sorts_on_the_cpu.vx",                        // needs --machine
+        "optimizations/pass/lane_sorts_in_the_order_of_a_function_on_the_cpu.vx", // needs --machine
+        "optimizations/pass/lane_sorts_in_the_order_of_a_function_on_the_gpu.vx", // needs --machine
         "optimizations/pass/lane_prefetch_into_the_l2_cache.vx",              // needs --machine
         "optimizations/pass/lane_sorts_on_the_gpu.vx",                        // needs --machine
         "optimizations/pass/values_at_the_start_of_block_code_reach_every_lane.vx", // needs --machine

@@ -108,9 +108,18 @@ kernel expands it, and the argmax shuffles a value and an index at each step:
 ## Sorts
 
 `lanes::sort(&mut t, n)` sorts `t[0]` to `t[n - 1]` from the smallest value up, and
-`lanes::sort_descending(&mut t, n)` from the largest value down. The other elements of `t` do not
-change. A sort gives no value, so a call is a statement of its own, in the places that a lane
-reduction can be.
+`lanes::sort_descending(&mut t, n)` from the largest value down. `lanes::sort_by(&mut t, n, less)`
+sorts them in the order of a function `less(a, b)`, which gives true when `a` goes before `b`, as
+`std::sort` does in C++. The other elements of `t` do not change. A sort gives no value, so a call
+is a statement of its own, in the places that a lane reduction can be.
+
+```rust
+fn greater(a : i64, b : i64) -> bool {
+  return a > b;
+}
+
+lanes::sort_by(&mut keys, n, greater);
+```
 
 - `t` is a rank-1 tensor of `i64`, with a size `N` that is a power of two. To sort other values,
   put each value in the high bits of an `i64` key, and its index in the low bits.
@@ -118,8 +127,14 @@ reduction can be.
 - In the code of a block, the lanes of the block are a power of two and at least 32. In the code
   of a subgroup, a subgroup has 32 lanes. Each lane holds at most 8 elements, so `N` is at most
   8 times the lanes.
+- `less` is the name of a function `fn(i64, i64) -> bool`, not a variable. The compiler must know
+  it, because each lane calls it at each step of the network, and the GPU copy of the kernel takes
+  it along. `less` must be a strict weak order. The compiler cannot prove that, so a wrong `less`
+  gives a wrong order, as in C++.
 
-A sort of integers has one result, so every copy of a kernel gives the same bits. Each copy uses
+A sort of integers has one result, so every copy of a kernel gives the same bits. With
+`sort_by`, two elements that `less` does not order can be in either order. Every copy of a kernel
+runs the same steps, so each copy still gives the same bits. Each copy uses
 a bitonic sorting network. On the GPU, each lane holds its elements in registers. A step of the
 network with a distance below 32 uses `shfl.sync.bfly`, and a step with a distance of at least
 the lanes stays in the registers of a lane. Only the steps between them use shared memory and

@@ -9,8 +9,9 @@
 // The lane reductions: `lanes::sum(&t, n)`, `lanes::max(&t, n)`,
 // `lanes::argmax(&values, &indices, n)` and their `_unordered` versions. Each one combines the
 // first `n` elements of rank-1 tensors, and every lane of the block or the subgroup gets the
-// result. docs/lane_reductions.md has the order. `lanes::sort(&mut t, n)` and
-// `lanes::sort_descending(&mut t, n)` sort the first `n` elements of a rank-1 tensor of `i64`.
+// result. docs/lane_reductions.md has the order. `lanes::sort(&mut t, n)`,
+// `lanes::sort_descending(&mut t, n)` and `lanes::sort_by(&mut t, n, less)` sort the first `n`
+// elements of a rank-1 tensor of `i64`.
 // `lanes::copy_rows_async(&mut tile, &x, &ids, [first, col])` copies the rows of `x` that `ids`
 // chooses into a tile in shared memory, in the background.
 // `lanes::copy(&mut dst, &src, [i, j])` copies a tile in shared memory to or from a tensor.
@@ -38,6 +39,8 @@ pub enum LaneOp {
     Sort,
     /// A sort in place, from the largest value down.
     SortDescending,
+    /// A sort in place, in the order of a function `less(a, b)` that the program names.
+    SortBy,
     /// A copy of a tile of a tensor into a tile of shared memory, which goes on in the background.
     /// It gives a token.
     CopyAsync,
@@ -60,7 +63,7 @@ pub enum LaneOp {
 
 impl LaneOp {
     pub fn is_sort(self) -> bool {
-        matches!(self, LaneOp::Sort | LaneOp::SortDescending)
+        matches!(self, LaneOp::Sort | LaneOp::SortDescending | LaneOp::SortBy)
     }
 }
 
@@ -94,6 +97,9 @@ pub enum LaneArg {
     Place,
     /// A number, such as the value of a fill.
     Scalar,
+    /// The name of a function, such as the order of a sort. The op takes it as the attribute
+    /// `less`, not as an operand.
+    Function,
 }
 
 impl LaneArg {
@@ -293,14 +299,15 @@ impl LaneRoutine {
     }
 
     /// The kind of each of the `operands` of the op. The place gives the operands that the other
-    /// arguments leave. `None` when there are too few.
+    /// arguments leave. A function is not an operand. `None` when there are too few.
     pub fn operand_kinds(&self, operands: usize) -> Option<Vec<LaneArg>> {
-        let fixed = self.args.iter().filter(|a| **a != LaneArg::Place).count();
-        let lists = self.args.len() - fixed;
+        let args = self.args.iter().filter(|a| **a != LaneArg::Function);
+        let fixed = args.clone().filter(|a| **a != LaneArg::Place).count();
+        let lists = args.clone().count() - fixed;
         let numbers = operands.checked_sub(fixed)?;
         let places = numbers.checked_div(lists).unwrap_or(0);
         let mut kinds = Vec::new();
-        for kind in self.args {
+        for kind in args {
             match kind {
                 LaneArg::Place => kinds.extend(std::iter::repeat_n(LaneArg::Place, places)),
                 kind => kinds.push(*kind),
@@ -365,7 +372,7 @@ const ORDERED: (&str, LaneAttr) = ("ordered", LaneAttr::Unit);
 
 /// The lane routines.
 pub const LANE_ROUTINES: &[LaneRoutine] = {
-    use LaneArg::{Matrix, Place, Scalar, Tensor, Tile, Vector, I32};
+    use LaneArg::{Function, Matrix, Place, Scalar, Tensor, Tile, Vector, I32};
     use LaneOp::*;
     use LaneValue::{F32, I32 as INT};
     let reduce: &[LaneArg] = &[Vector, I32];
@@ -421,6 +428,15 @@ pub const LANE_ROUTINES: &[LaneRoutine] = {
             None,
         )
         .with_attrs(&[("descending", LaneAttr::Unit)])
+        .with_lanes()
+        .writing_first(),
+        LaneRoutine::call(
+            "sort_by",
+            SortBy,
+            "vx.lane_sort",
+            &[Vector, I32, Function],
+            None,
+        )
         .with_lanes()
         .writing_first(),
         LaneRoutine::call(
@@ -787,8 +803,9 @@ impl crate::hir::TypeChecker<'_> {
         result
     }
 
-    /// The type of a call `lanes::sort(&mut t, n)` or `lanes::sort_descending(&mut t, n)`. The
-    /// size of `t` goes to `lane_reductions`, for the checks of `across` loops.
+    /// The type of a call `lanes::sort(&mut t, n)`, `lanes::sort_descending(&mut t, n)` or
+    /// `lanes::sort_by(&mut t, n, less)`. The size of `t` goes to `lane_reductions`, for the
+    /// checks of `across` loops.
     fn check_lane_sort(
         &mut self,
         name: &str,
@@ -801,17 +818,32 @@ impl crate::hir::TypeChecker<'_> {
             return void;
         }
         let span = Some(SourceSpan::from_ast_span(&call_span));
-        if args.len() != 2 {
+        let by = lane_routine(name).is_some_and(|r| r.op == LaneOp::SortBy);
+        let (wanted, what) = if by {
+            (
+                3,
+                "a borrowed tensor, the number of its elements to sort and the name of a function \
+                 that orders two elements",
+            )
+        } else {
+            (
+                2,
+                "a borrowed tensor and the number of its elements to sort",
+            )
+        };
+        if args.len() != wanted {
             self.errors.error_with_code(
                 DiagnosticCode::E3003,
                 format!(
-                    "`{name}` takes 2 arguments, a borrowed tensor and the number of its elements \
-                     to sort, but it got {}",
+                    "`{name}` takes {wanted} arguments, {what}, but it got {}",
                     args.len()
                 ),
                 span,
             );
             return void;
+        }
+        if by {
+            self.check_sort_order(name, &args[2], &arg_types[2], span.clone());
         }
         let size = match &arg_types[0] {
             Type::Borrow {
@@ -856,6 +888,38 @@ impl crate::hir::TypeChecker<'_> {
             );
         }
         void
+    }
+
+    /// The third argument of `lanes::sort_by` must name a function `fn(i64, i64) -> bool`. The
+    /// code of each lane calls it, so it is a name and not a value that the program computes.
+    fn check_sort_order(&mut self, name: &str, less: &Expr, ty: &Type, span: Option<SourceSpan>) {
+        let order = Type::Function(
+            vec![
+                Type::Scalar(ElementType::I64),
+                Type::Scalar(ElementType::I64),
+            ],
+            Box::new(Type::Scalar(ElementType::Bool)),
+            false,
+        );
+        let wanted = format!(
+            "the third argument of `{name}` must be the name of a function `{order}`, which \
+             gives true when its first argument goes before its second"
+        );
+        let message = match less {
+            // The checker already reported a name that it does not know.
+            _ if *ty == Type::Unknown => return,
+            Expr::Identifier(id) if self.lookup_with_depth(id.name.as_ref()).is_some() => {
+                format!("{wanted}, but `{}` is a variable of type `{ty}`", id.name)
+            }
+            Expr::Identifier(_) if *ty == order => return,
+            Expr::Identifier(id) => format!("{wanted}, but `{}` is `{ty}`", id.name),
+            _ if matches!(ty, Type::Struct(n, _) if n.as_ref().starts_with("Closure_")) => {
+                format!("{wanted}, but it is a closure")
+            }
+            _ => format!("{wanted}, but it is `{ty}`"),
+        };
+        self.errors
+            .error_with_code(DiagnosticCode::E3003, message, span);
     }
 
     /// The type of a call `lanes::copy_async(&mut dst, &src, [i, j, ..])`: a token of the copy of

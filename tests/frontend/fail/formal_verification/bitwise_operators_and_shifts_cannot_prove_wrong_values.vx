@@ -10,7 +10,9 @@
 // - `mask_too_small`: `x & 255` can be 255, so it is not always below 255;
 // - `logical_not_arithmetic`: `>>` on a negative `i8` copies the sign bit, so -128 >> 7 is not 1;
 // - `lost_bits`: a `u8` shifted left by 4 loses its top bits, so 255 << 4 >> 4 is not 255;
-// - `shift_by_the_width`: a shift by 32 or more is undefined, so the prover gives it no value.
+// - `shift_by_the_width`: a shift by 32 or more is undefined, so the prover gives it no value;
+// - `xor_once`: `x ^ k` is not `x` when `k` is not 0;
+// - `unpack_loses_the_top`: a `u16` price of 1000 shifted left by 8 loses its top bits.
 //
 // RUN: not vxc %s --action emit-mlir 2>&1 | FileCheck %s
 
@@ -43,6 +45,21 @@ ensures return == 0 {
   // CHECK: Error[E8001]
   // CHECK-SAME: Function 'shift_by_the_width' cannot prove postcondition
   return x << n;
+}
+
+fn xor_once(x : u128, k : u128) -> u128
+ensures return == x {
+  // CHECK: Error[E8001]
+  // CHECK-SAME: Function 'xor_once' cannot prove postcondition
+  return x ^ k;
+}
+
+fn unpack_loses_the_top(price : u16) -> u16
+requires price == 1000
+ensures return == price {
+  // CHECK: Error[E8001]
+  // CHECK-SAME: Function 'unpack_loses_the_top' cannot prove postcondition
+  return ((price << 8u16) | 7u16) >> 8u16;
 }
 
 fn main() -> i32 {

@@ -29,6 +29,9 @@ pub struct SmtProver {
     nonlinear: bool,
     /// Whether a fact has a bitwise operation or a shift. Only then does z3 need bitvectors.
     bitvectors: bool,
+    /// Whether each integer of the query is a bitvector of the width of its type. See
+    /// `use_bitvectors`.
+    bitvector_mode: bool,
     /// The sort of each name that a fact uses as a number or as a condition.
     sorts: std::collections::HashMap<String, Sort>,
     /// Pairs of names that `==` or `!=` compares, so that they have the same sort.
@@ -43,13 +46,15 @@ pub struct SmtProver {
 enum Sort {
     Int,
     Bool,
+    /// A bitvector of this many bits, for an integer in a query in bitvector mode.
+    BitVec(u32),
 }
 
 /// Checks that a term of sort `have` can stand where a term of sort `want` is expected.
 fn expect(want: Option<Sort>, have: Sort) -> Result<(), String> {
     match want {
         Some(w) if w != have => Err(match have {
-            Sort::Int => "a number where a condition is expected".to_string(),
+            Sort::Int | Sort::BitVec(_) => "a number where a condition is expected".to_string(),
             Sort::Bool => "a condition where a number is expected".to_string(),
         }),
         _ => Ok(()),
@@ -70,6 +75,7 @@ impl SmtProver {
             ranges: std::collections::HashMap::new(),
             nonlinear: false,
             bitvectors: false,
+            bitvector_mode: false,
             sorts: std::collections::HashMap::new(),
             same_sort: Vec::new(),
             overflow_names: std::collections::HashMap::new(),
@@ -86,8 +92,14 @@ impl SmtProver {
         };
         self.declarations.insert(name.clone());
         if let Some(sort) = want {
-            if *self.sorts.entry(name.clone()).or_insert(sort) != sort {
-                return Err(format!("`{name}`, which is both a number and a condition"));
+            let had = *self.sorts.entry(name.clone()).or_insert(sort);
+            if had != sort {
+                return Err(match (had, sort) {
+                    (Sort::Int, Sort::Bool) | (Sort::Bool, Sort::Int) => {
+                        format!("`{name}`, which is both a number and a condition")
+                    }
+                    _ => format!("`{name}`, which has two types in the facts"),
+                });
             }
         }
         Ok(name)
@@ -122,19 +134,32 @@ impl SmtProver {
     }
 
     pub fn prove(&self) -> Result<bool, String> {
-        let logic = match (self.bitvectors, self.nonlinear) {
-            (true, _) => "ALL",
-            (false, true) => "QF_NIA",
-            (false, false) => "QF_LIA",
+        let logic = match (self.bitvector_mode, self.bitvectors, self.nonlinear) {
+            (true, _, _) => "QF_BV",
+            (false, true, _) => "ALL",
+            (false, false, true) => "QF_NIA",
+            (false, false, false) => "QF_LIA",
         };
         let mut script = format!("(set-option :rlimit {Z3_STEP_LIMIT})\n(set-logic {logic})\n");
         let sorts = self.resolve_sorts()?;
 
         for decl in &self.declarations {
-            if sorts.get(decl) == Some(&Sort::Bool) {
-                script.push_str(&format!("(declare-const {decl} Bool)\n"));
-                continue;
+            match sorts.get(decl) {
+                Some(Sort::Bool) => {
+                    script.push_str(&format!("(declare-const {decl} Bool)\n"));
+                    continue;
+                }
+                Some(Sort::BitVec(bits)) => {
+                    script.push_str(&format!("(declare-const {decl} (_ BitVec {bits}))\n"));
+                    continue;
+                }
+                _ => {}
             }
+            // In bitvector mode each name has a bitvector sort or `Bool`, and QF_BV has no `Int`.
+            assert!(
+                !self.bitvector_mode,
+                "the name {decl} has no sort in a query in bitvector mode"
+            );
             script.push_str(&format!("(declare-const {} Int)\n", decl));
             if let Some((lo, hi)) = self.ranges.get(decl).and_then(int_range) {
                 script.push_str(&format!("(assert (<= {lo} {decl} {hi}))\n"));
@@ -187,14 +212,33 @@ impl SmtProver {
     /// Add `expr` as a fact. `type_of` gives an expression's integer type, so that the prover knows
     /// the width of an operation on it, and its range.
     pub fn add_constraint(&mut self, expr: &Expr, type_of: IntTypeOf) -> Result<(), String> {
-        let smt_expr = self.lower_expr(expr, type_of, None, Some(Sort::Bool))?;
+        let smt_expr = if self.bitvector_mode {
+            self.lower_bv(expr, type_of, None, true)?.0
+        } else {
+            self.lower_expr(expr, type_of, None, Some(Sort::Bool))?
+        };
         self.assertions.push(smt_expr);
         Ok(())
     }
 
     /// The SMT term of the value `expr`, for a goal that the caller builds.
     pub fn lower_term(&mut self, expr: &Expr, type_of: IntTypeOf) -> Result<String, String> {
+        if self.bitvector_mode {
+            return Ok(self.lower_bv(expr, type_of, None, false)?.0);
+        }
         self.lower_expr(expr, type_of, None, None)
+    }
+
+    /// Makes each integer of the query a bitvector of the width of its type, so that the query
+    /// has the machine's semantics for every operation. A query with a bitwise operation needs
+    /// it: z3 proves little when it converts between integers and bitvectors. Other queries keep
+    /// integers, which z3 solves faster. Call it before the first fact.
+    pub fn use_bitvectors(&mut self) {
+        assert!(
+            self.assertions.is_empty() && self.declarations.is_empty(),
+            "the prover chooses its encoding before the first fact"
+        );
+        self.bitvector_mode = true;
     }
 
     /// Adds `smt`, a term that the caller built from `lower_term`, as a fact.
@@ -228,9 +272,323 @@ impl SmtProver {
         Ok(format!("(ite (<= {lo} {exact} {hi}) {exact} {undefined})"))
     }
 
-    /// `lhs op rhs` for a bitwise operator or a shift on the integer type `ty`. The operands
-    /// become bitvectors of the width of `ty`, and the result becomes an integer again, so the
-    /// other facts stay integer facts. A shift by a count outside `0` to `width - 1` is
+    /// `expr` in bitvector mode: an integer becomes a bitvector of the width of its type, and
+    /// each operation is the one the machine does. The second value is the integer type of
+    /// the term, and `None` for a condition. `expected` is the type that the place of `expr`
+    /// gives a number with no type of its own. `condition` says that the place needs a condition.
+    fn lower_bv(
+        &mut self,
+        expr: &Expr,
+        type_of: IntTypeOf,
+        expected: Option<ElementType>,
+        condition: bool,
+    ) -> Result<(String, Option<ElementType>), String> {
+        let number = |condition: bool| -> Result<(), String> {
+            match condition {
+                true => Err("a number where a condition is expected".to_string()),
+                false => Ok(()),
+            }
+        };
+        match expr {
+            Expr::Number(n) => {
+                number(condition)?;
+                let ty =
+                    n.ty.clone()
+                        .or(expected)
+                        .filter(is_integer)
+                        .ok_or("a number whose integer type is not known")?;
+                let value = n.value.parse::<u128>().map_err(|_| "a float number")?;
+                Ok((bv_constant(value, &ty)?, Some(ty)))
+            }
+            Expr::Identifier(id) if is_bool_literal(&id.name) => {
+                if !condition {
+                    return Err("a condition where a number is expected".to_string());
+                }
+                Ok((id.name.to_string(), None))
+            }
+            Expr::Identifier(_) | Expr::MemberAccess(_) | Expr::IndexAccess(_) => {
+                let text = place_text(expr).ok_or("a place whose name is not known")?;
+                match type_of(expr).filter(|(t, _)| is_integer(t)) {
+                    Some((ty, ranged)) => {
+                        number(condition)?;
+                        let bits = ty.int_bits().expect("an integer type");
+                        let name = self.name(&text, Some(Sort::BitVec(bits)))?;
+                        // A `usize` holds 0 to `i64::MAX`, in 64 bits.
+                        if ranged && ty == ElementType::USize {
+                            let max = bv_max(&ty);
+                            let fact = format!("(bvule {name} {max})");
+                            if !self.assertions.contains(&fact) {
+                                self.assertions.push(fact);
+                            }
+                        }
+                        Ok((name, Some(ty)))
+                    }
+                    None if condition => Ok((self.name(&text, Some(Sort::Bool))?, None)),
+                    None => Err(format!("`{text}`, whose integer type is not known")),
+                }
+            }
+            Expr::BinaryOp(b) => {
+                let shift = matches!(b.op, BinaryOp::Shl | BinaryOp::Shr);
+                let ty = if is_division(&b.op) {
+                    int_type(expr, type_of)
+                } else {
+                    b.operand_ty
+                        .clone()
+                        .or_else(|| arithmetic_context_type(expr, type_of))
+                        .or(expected)
+                };
+                // `&`, `|` and `^` on `bool` are the logical operations. A contract has no
+                // types, so an operation in the place of a condition is on `bool` too.
+                if is_bitwise(&b.op)
+                    && !shift
+                    && (ty == Some(ElementType::Bool) || (ty.is_none() && condition))
+                {
+                    let lhs = self.lower_bv(&b.lhs, type_of, None, true)?.0;
+                    let rhs = self.lower_bv(&b.rhs, type_of, None, true)?.0;
+                    let op = match b.op {
+                        BinaryOp::BitAnd => "and",
+                        BinaryOp::BitOr => "or",
+                        _ => "xor",
+                    };
+                    return Ok((format!("({op} {lhs} {rhs})"), None));
+                }
+                number(condition)?;
+                let ty = ty
+                    .filter(is_integer)
+                    .ok_or("an operation whose integer type is not known")?;
+                let a = self.bv_word(&b.lhs, type_of, &ty)?;
+                let c = self.bv_word(&b.rhs, type_of, &ty)?;
+                let signed = ty.is_signed_int();
+                let bits = ty.int_bits().expect("an integer type");
+                let zero = format!("(_ bv0 {bits})");
+                let value = match b.op {
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul if ty == ElementType::USize => {
+                        return Ok((self.bv_usize_checked(&b.op, &a, &c)?, Some(ty)));
+                    }
+                    BinaryOp::Add => format!("(bvadd {a} {c})"),
+                    BinaryOp::Sub => format!("(bvsub {a} {c})"),
+                    BinaryOp::Mul => format!("(bvmul {a} {c})"),
+                    BinaryOp::Div | BinaryOp::Rem => {
+                        let op = match (&b.op, signed) {
+                            (BinaryOp::Div, true) => "bvsdiv",
+                            (BinaryOp::Div, false) => "bvudiv",
+                            (_, true) => "bvsrem",
+                            (_, false) => "bvurem",
+                        };
+                        // A division by zero, or of the minimum value by -1, stops the program.
+                        let invalid = if signed {
+                            let min = format!("(_ bv{} {bits})", 1u128 << (bits - 1));
+                            let minus_one = bv_max_unsigned(bits);
+                            format!("(or (= {c} {zero}) (and (= {a} {min}) (= {c} {minus_one})))")
+                        } else {
+                            format!("(= {c} {zero})")
+                        };
+                        let undefined = self.name(
+                            &format!("division.undefined.{}", self.declarations.len()),
+                            Some(Sort::BitVec(bits)),
+                        )?;
+                        format!("(ite {invalid} {undefined} ({op} {a} {c}))")
+                    }
+                    BinaryOp::BitAnd => format!("(bvand {a} {c})"),
+                    BinaryOp::BitOr => format!("(bvor {a} {c})"),
+                    BinaryOp::BitXor => format!("(bvxor {a} {c})"),
+                    BinaryOp::Shl | BinaryOp::Shr => {
+                        let op = match (&b.op, signed) {
+                            (BinaryOp::Shl, _) => "bvshl",
+                            (_, true) => "bvashr",
+                            (_, false) => "bvlshr",
+                        };
+                        let raw = format!("({op} {a} {c})");
+                        // A count outside 0 to `bits - 1` is undefined. A `usize` `<<` stops the
+                        // program when the count is 63 or more, or when it loses a bit.
+                        let width = format!("(_ bv{bits} {bits})");
+                        let mut defined = format!("(bvult {c} {width})");
+                        if signed {
+                            defined = format!("(and (bvsge {c} {zero}) {defined})");
+                        }
+                        if ty == ElementType::USize && b.op == BinaryOp::Shl {
+                            let max = bv_max(&ty);
+                            defined = format!(
+                                "(and (bvult {c} (_ bv63 64)) (= (bvlshr {raw} {c}) {a}) (bvule {raw} {max}))"
+                            );
+                        }
+                        let count = self.overflow_names.len();
+                        let undefined = self
+                            .overflow_names
+                            .entry(raw.clone())
+                            .or_insert_with(|| format!("shift.undefined.{count}"))
+                            .clone();
+                        let undefined = self.name(&undefined, Some(Sort::BitVec(bits)))?;
+                        format!("(ite {defined} {raw} {undefined})")
+                    }
+                    BinaryOp::MatMul => return Err("the `@` operator".to_string()),
+                };
+                Ok((value, Some(ty)))
+            }
+            Expr::RelationalOp(r) => {
+                if !condition {
+                    return Err("a condition where a number is expected".to_string());
+                }
+                let side = r
+                    .operand_ty
+                    .clone()
+                    .or_else(|| arithmetic_context_type(&r.lhs, type_of))
+                    .or_else(|| arithmetic_context_type(&r.rhs, type_of));
+                if side.as_ref().is_some_and(|t| t.is_float()) {
+                    return Err("a comparison of floats".to_string());
+                }
+                let Some(ty) = side.filter(is_integer) else {
+                    // Two conditions. Only `==` and `!=` compare them.
+                    let op = match r.op {
+                        RelationalOp::Eq => "=",
+                        RelationalOp::NotEq => "distinct",
+                        _ => return Err("an order of values whose type is not known".to_string()),
+                    };
+                    let lhs = self.lower_bv(&r.lhs, type_of, None, true)?.0;
+                    let rhs = self.lower_bv(&r.rhs, type_of, None, true)?.0;
+                    return Ok((format!("({op} {lhs} {rhs})"), None));
+                };
+                let a = self.bv_word(&r.lhs, type_of, &ty)?;
+                let c = self.bv_word(&r.rhs, type_of, &ty)?;
+                let signed = ty.is_signed_int();
+                let op = match (&r.op, signed) {
+                    (RelationalOp::Eq, _) => "=",
+                    (RelationalOp::NotEq, _) => "distinct",
+                    (RelationalOp::Lt, true) => "bvslt",
+                    (RelationalOp::Lt, false) => "bvult",
+                    (RelationalOp::Le, true) => "bvsle",
+                    (RelationalOp::Le, false) => "bvule",
+                    (RelationalOp::Gt, true) => "bvsgt",
+                    (RelationalOp::Gt, false) => "bvugt",
+                    (RelationalOp::Ge, true) => "bvsge",
+                    (RelationalOp::Ge, false) => "bvuge",
+                };
+                Ok((format!("({op} {a} {c})"), None))
+            }
+            Expr::LogicalOp(l) => {
+                if !condition {
+                    return Err("a condition where a number is expected".to_string());
+                }
+                let lhs = self.lower_bv(&l.lhs, type_of, None, true)?.0;
+                let rhs = self.lower_bv(&l.rhs, type_of, None, true)?.0;
+                let op = match l.op {
+                    LogicalOp::And => "and",
+                    LogicalOp::Or => "or",
+                };
+                Ok((format!("({op} {lhs} {rhs})"), None))
+            }
+            Expr::UnaryOp(u) => match u.op {
+                UnaryOp::Not => {
+                    if !condition {
+                        return Err("a condition where a number is expected".to_string());
+                    }
+                    let inner = self.lower_bv(&u.expr, type_of, None, true)?.0;
+                    Ok((format!("(not {inner})"), None))
+                }
+                UnaryOp::Neg => {
+                    number(condition)?;
+                    let ty = int_type(&u.expr, type_of)
+                        .or(expected)
+                        .filter(is_integer)
+                        .ok_or("a negation whose integer type is not known")?;
+                    // A program cannot negate a usize.
+                    if ty == ElementType::USize {
+                        return Err("a negation of a usize".to_string());
+                    }
+                    let inner = self.bv_word(&u.expr, type_of, &ty)?;
+                    Ok((format!("(bvneg {inner})"), Some(ty)))
+                }
+                UnaryOp::Try => Err("the `?` operator".to_string()),
+            },
+            Expr::AsCast(c) => {
+                number(condition)?;
+                let (from, to) = cast_int_types(c, type_of)
+                    .ok_or("a cast whose integer source or destination type is not known")?;
+                let value = self.bv_word(&c.expr, type_of, &from)?;
+                let (fw, tw) = (from.int_bits().unwrap(), to.int_bits().unwrap());
+                let extend = if from.is_signed_int() {
+                    "sign_extend"
+                } else {
+                    "zero_extend"
+                };
+                if to == ElementType::USize && !keeps_every_value(&from, &to) {
+                    // A cast to usize stops the program on a value out of range, so that cast
+                    // has no value.
+                    let wide = fw.max(64);
+                    let v = match wide - fw {
+                        0 => value,
+                        n => format!("((_ {extend} {n}) {value})"),
+                    };
+                    let max = format!("(_ bv{} {wide})", i64::MAX);
+                    let fits = if from.is_signed_int() {
+                        format!("(and (bvsge {v} (_ bv0 {wide})) (bvsle {v} {max}))")
+                    } else {
+                        format!("(bvule {v} {max})")
+                    };
+                    let undefined = self.name(
+                        &format!("cast.undefined.{}", self.declarations.len()),
+                        Some(Sort::BitVec(64)),
+                    )?;
+                    let low = match wide {
+                        64 => v,
+                        _ => format!("((_ extract 63 0) {v})"),
+                    };
+                    return Ok((format!("(ite {fits} {low} {undefined})"), Some(to)));
+                }
+                let value = match tw.cmp(&fw) {
+                    std::cmp::Ordering::Equal => value,
+                    std::cmp::Ordering::Greater => format!("((_ {extend} {}) {value})", tw - fw),
+                    std::cmp::Ordering::Less => format!("((_ extract {} 0) {value})", tw - 1),
+                };
+                Ok((value, Some(to)))
+            }
+            _ => Err(format!("a `{}` expression", kind_name(expr))),
+        }
+    }
+
+    /// `e` as a bitvector of the type `ty`. An operand of another width cannot stand there.
+    fn bv_word(
+        &mut self,
+        e: &Expr,
+        type_of: IntTypeOf,
+        ty: &ElementType,
+    ) -> Result<String, String> {
+        let (term, have) = self.lower_bv(e, type_of, Some(ty.clone()), false)?;
+        match have {
+            Some(h) if h.int_bits() == ty.int_bits() => Ok(term),
+            _ => Err(format!(
+                "a value that is not a `{ty}` where a `{ty}` is expected"
+            )),
+        }
+    }
+
+    /// `a op b` on `usize`, which stops the program when the exact result is not in 0 to
+    /// `i64::MAX`. Then the operation has no value. One operation on the same operands has one
+    /// name for that value, as in `machine_result`.
+    fn bv_usize_checked(&mut self, op: &BinaryOp, a: &str, b: &str) -> Result<String, String> {
+        let op = match op {
+            BinaryOp::Add => "bvadd",
+            BinaryOp::Sub => "bvsub",
+            _ => "bvmul",
+        };
+        // In 128 bits the exact result of two values below 2^63 cannot wrap above 2^127, and a
+        // negative difference wraps to a value above `i64::MAX`.
+        let wide = format!("({op} ((_ zero_extend 64) {a}) ((_ zero_extend 64) {b}))");
+        let fits = format!("(bvule {wide} (_ bv{} 128))", i64::MAX);
+        let count = self.overflow_names.len();
+        let undefined = self
+            .overflow_names
+            .entry(wide.clone())
+            .or_insert_with(|| format!("overflow.undefined.{count}"))
+            .clone();
+        let undefined = self.name(&undefined, Some(Sort::BitVec(64)))?;
+        Ok(format!("(ite {fits} ({op} {a} {b}) {undefined})"))
+    }
+
+    /// `lhs op rhs` for a bitwise operator or a shift on the integer type `ty`, in a query of
+    /// integers. Only the pointer checks build such a query: `prove_expr` uses bitvector mode for
+    /// a query with a bitwise operation. The operands become bitvectors of the width of `ty`, and
+    /// the result becomes an integer again, so the other facts stay integer facts. A shift by a count outside `0` to `width - 1` is
     /// undefined, and a `usize` `<<` that loses a bit stops the program. Such a shift has no
     /// value: it becomes a name with no facts.
     fn bitwise(
@@ -590,6 +948,65 @@ impl SmtProver {
             }
             _ => Err(format!("a `{}` expression", kind_name(expr))),
         }
+    }
+}
+
+/// Whether `ty` is an integer type, `bool` not included.
+fn is_integer(ty: &ElementType) -> bool {
+    ty.int_bits().is_some() && *ty != ElementType::Bool
+}
+
+/// The bitvector constant `value` of the type `ty`. A value that does not fit the type is not
+/// one of its values, so it is refused rather than wrapped.
+fn bv_constant(value: u128, ty: &ElementType) -> Result<String, String> {
+    let bits = ty.int_bits().expect("an integer type");
+    if bits < 128 && value >> bits != 0 {
+        return Err(format!("the number {value}, which a `{ty}` cannot hold"));
+    }
+    Ok(format!("(_ bv{value} {bits})"))
+}
+
+/// The bitvector with each of its `bits` bits set.
+fn bv_max_unsigned(bits: u32) -> String {
+    let max = if bits == 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
+    format!("(_ bv{max} {bits})")
+}
+
+/// The largest value of the unsigned type `ty` as a bitvector: `i64::MAX` for `usize`.
+fn bv_max(ty: &ElementType) -> String {
+    match ty {
+        ElementType::USize => format!("(_ bv{} 64)", i64::MAX),
+        _ => bv_max_unsigned(ty.int_bits().expect("an integer type")),
+    }
+}
+
+/// The name of a variable, a field or an element, as `p.x` or `a[0]`.
+fn place_text(e: &Expr) -> Option<String> {
+    Some(match e {
+        Expr::Identifier(id) => id.name.replace('.', "_"),
+        Expr::MemberAccess(m) => format!("{}.{}", place_text(&m.base)?, m.member),
+        Expr::IndexAccess(i) => format!("{}[{}]", place_text(&i.base)?, to_source(&i.index)?),
+        _ => return None,
+    })
+}
+
+/// Whether `e` has a bitwise operator or a shift. A query with one needs bitvectors.
+pub fn has_bitwise(e: &Expr) -> bool {
+    match e {
+        Expr::BinaryOp(b) => is_bitwise(&b.op) || has_bitwise(&b.lhs) || has_bitwise(&b.rhs),
+        Expr::RelationalOp(r) => has_bitwise(&r.lhs) || has_bitwise(&r.rhs),
+        Expr::LogicalOp(l) => has_bitwise(&l.lhs) || has_bitwise(&l.rhs),
+        Expr::UnaryOp(u) => has_bitwise(&u.expr),
+        Expr::AsCast(c) => has_bitwise(&c.expr),
+        Expr::MemberAccess(m) => has_bitwise(&m.base),
+        Expr::IndexAccess(i) => has_bitwise(&i.base) || has_bitwise(&i.index),
+        Expr::FunctionCall(c) => c.args.iter().any(has_bitwise),
+        Expr::Borrow(b) => has_bitwise(&b.expr),
+        _ => false,
     }
 }
 

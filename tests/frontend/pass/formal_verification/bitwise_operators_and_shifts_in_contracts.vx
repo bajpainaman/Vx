@@ -12,7 +12,9 @@
 // - `sign_copy`: `>>` on a negative `i8` copies the sign bit, so -128 >> 7 is -1;
 // - `logical_shift`: `>>` on a `u8` shifts in zeros, so 128 >> 7 is 1;
 // - `set_bit`: `x | 1` is odd;
-// - `both`: `&` on `bool` is the logical and.
+// - `both`: `&` on `bool` is the logical and;
+// - `xor_twice_*`: `x ^ k ^ k` is `x`, at 16, 64 and 128 bits;
+// - `unpack_*`: a price packed into the high half of a word with `|` comes back out with `>>`.
 //
 // RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
 // CHECK-NOT: E8001
@@ -53,8 +55,37 @@ ensures return {
   return a & b;
 }
 
+fn xor_twice_u16(x : u16, k : u16) -> u16
+ensures return == x {
+  return x ^ k ^ k;
+}
+
+fn xor_twice_u64(x : u64, k : u64) -> u64
+ensures return == x {
+  return x ^ k ^ k;
+}
+
+fn xor_twice_u128(x : u128, k : u128) -> u128
+ensures return == x {
+  return x ^ k ^ k;
+}
+
+fn unpack_u32(price : u32) -> u32
+requires price < 65536
+ensures return == price {
+  return ((price << 16u32) | 7u32) >> 16u32;
+}
+
+fn unpack_u64(price : u64, size : u64) -> u64
+requires price < 4294967296 && size < 4294967296
+ensures return == price {
+  return ((price << 32u64) | size) >> 32u64;
+}
+
 fn main() -> i32 {
   println!("{} {} {} {}", low_byte(1000u32), shift_back(3u32), sign_copy(-128i8), logical_shift(128u8));
   println!("{} {}", set_bit(4u16), both(true, true));
+  println!("{} {} {}", xor_twice_u16(5u16, 9u16), xor_twice_u64(5u64, 9u64), xor_twice_u128(5u128, 9u128));
+  println!("{} {}", unpack_u32(1234u32), unpack_u64(1234u64, 5u64));
   return 0;
 }

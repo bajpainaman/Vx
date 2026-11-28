@@ -3591,6 +3591,14 @@ impl<'a> TypeChecker<'a> {
             .map(|c| self.abstract_calls(c, &mut calls, &mut facts))
             .collect();
         let goal = self.abstract_calls(expr, &mut calls, &mut facts);
+        if constraints
+            .iter()
+            .chain(&facts)
+            .chain([&goal])
+            .any(hir::prover::has_bitwise)
+        {
+            prover.use_bitvectors();
+        }
         // A fact the prover cannot express is left out, so it knows less and proves less. Say so,
         // or a later "cannot prove" has no visible cause.
         for constraint in constraints.iter().chain(&facts) {

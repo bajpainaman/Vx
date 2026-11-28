@@ -29,9 +29,10 @@ ensures return == -1 {
   return x >> 63i64;
 }
 
-// A fee in basis points. The prover cannot reason about `/` yet, so this function has no
-// `ensures`.
-pub fn fee(amount : u64, bps : u64) -> u64 {
+// A fee in basis points. The prover shows that the fee is never more than the amount.
+pub fn fee(amount : u64, bps : u64) -> u64
+requires amount < 1000000000000 && bps <= 10000
+ensures return <= amount {
   return amount * bps / 10000u64;
 }
 

@@ -1,0 +1,54 @@
+//===- division_in_contracts.vx - Vx Compiler ----------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The prover knows the value of an integer `/`:
+//
+// - `fee`: a fee in basis points is never more than the amount;
+// - `toward_zero`: -7 / 2 is -3, because division rounds toward zero, not down;
+// - `negative_divisor`: 7 / -2 is -3;
+// - `unsigned`: 200u8 / 3 is 66;
+// - `by_a_value`: `x / d` is at most `x` for a divisor that is not a constant.
+//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+// CHECK-NOT: E8001
+// CHECK-NOT: the prover ignores
+// CHECK: func.func @main
+
+fn fee(amount : u64, bps : u64) -> u64
+requires amount < 1000000000000 && bps <= 10000
+ensures return <= amount {
+  return amount * bps / 10000u64;
+}
+
+fn toward_zero(x : i32) -> i32
+requires x == -7
+ensures return == -3 {
+  return x / 2;
+}
+
+fn negative_divisor(x : i32) -> i32
+requires x == 7
+ensures return == -3 {
+  return x / -2;
+}
+
+fn unsigned(x : u8) -> u8
+requires x == 200
+ensures return == 66 {
+  return x / 3u8;
+}
+
+fn by_a_value(x : u32, d : u32) -> u32
+requires d > 0
+ensures return <= x {
+  return x / d;
+}
+
+fn main() -> i32 {
+  println!("{} {} {} {} {}", fee(50000u64, 30u64), toward_zero(-7), negative_divisor(7), unsigned(200u8), by_a_value(9u32, 2u32));
+  return 0;
+}

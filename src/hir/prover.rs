@@ -364,8 +364,9 @@ impl SmtProver {
                 self.bitwise(&b.op, lhs, rhs, ty)
             }
             Expr::BinaryOp(b) => {
-                let ty = if b.op == BinaryOp::Rem {
-                    // A comparison's result type cannot determine a remainder's signedness.
+                let division = matches!(b.op, BinaryOp::Div | BinaryOp::Rem);
+                let ty = if division {
+                    // A comparison's result type cannot determine the signedness of a division.
                     int_type(expr, type_of)
                 } else {
                     b.operand_ty
@@ -376,16 +377,16 @@ impl SmtProver {
                 expect(want, Sort::Int)?;
                 let lhs = self.lower_expr(&b.lhs, type_of, ty.clone(), Some(Sort::Int))?;
                 let rhs = self.lower_expr(&b.rhs, type_of, ty.clone(), Some(Sort::Int))?;
-                if b.op == BinaryOp::Rem {
+                if division {
                     let ty = ty
                         .filter(|t| t.int_bits().is_some() && *t != ElementType::Bool)
-                        .ok_or("a remainder whose integer type is not known")?;
+                        .ok_or("a division whose integer type is not known")?;
                     // Leave undefined operations unconstrained instead of assuming they cannot occur.
                     let undefined = self.name(
-                        &format!("remainder.undefined.{}", self.declarations.len()),
+                        &format!("division.undefined.{}", self.declarations.len()),
                         Some(Sort::Int),
                     )?;
-                    // A remainder by a constant stays linear, so that z3 can use its fast logic.
+                    // A division by a constant stays linear, so that z3 can use its fast logic.
                     let divisor = match smt_constant_magnitude(&rhs) {
                         Some("0") => return Ok(undefined),
                         Some(digits) => digits.to_string(),
@@ -394,14 +395,20 @@ impl SmtProver {
                             format!("(ite (< {rhs} 0) (- {rhs}) {rhs})")
                         }
                     };
-                    let magnitude = format!("(mod (ite (< {lhs} 0) (- {lhs}) {lhs}) {divisor})");
-                    let value = if ty.is_signed_int() {
-                        format!("(ite (< {lhs} 0) (- {magnitude}) {magnitude})")
-                    } else {
-                        format!("(mod {lhs} {rhs})")
+                    // Both round toward zero. The remainder has the sign of the dividend, and
+                    // the quotient is negative when the operands have different signs.
+                    let smt_op = if b.op == BinaryOp::Div { "div" } else { "mod" };
+                    let magnitude =
+                        format!("({smt_op} (ite (< {lhs} 0) (- {lhs}) {lhs}) {divisor})");
+                    let value = match (ty.is_signed_int(), &b.op) {
+                        (false, _) => format!("({smt_op} {lhs} {rhs})"),
+                        (true, BinaryOp::Div) => {
+                            format!("(ite (= (< {lhs} 0) (< {rhs} 0)) {magnitude} (- {magnitude}))")
+                        }
+                        (true, _) => format!("(ite (< {lhs} 0) (- {magnitude}) {magnitude})"),
                     };
                     let invalid = if ty.is_signed_int() {
-                        let (min, _) = int_range(&ty).expect("an integer remainder");
+                        let (min, _) = int_range(&ty).expect("an integer division");
                         format!("(or (= {rhs} 0) (and (= {lhs} {min}) (= {rhs} (- 1))))")
                     } else {
                         format!("(= {rhs} 0)")
@@ -586,6 +593,11 @@ impl SmtProver {
     }
 }
 
+/// Whether `op` is `/` or `%`, whose result depends on the signedness of the operands.
+fn is_division(op: &BinaryOp) -> bool {
+    matches!(op, BinaryOp::Div | BinaryOp::Rem)
+}
+
 /// Whether `op` is `&`, `|`, `^`, `<<` or `>>`.
 fn is_bitwise(op: &BinaryOp) -> bool {
     matches!(
@@ -743,7 +755,7 @@ pub(crate) fn with_integer_context(
                 });
                 b.operand_ty = ty.clone();
                 let child_context =
-                    ty.or_else(|| (b.op != BinaryOp::Rem).then_some(expected).flatten());
+                    ty.or_else(|| (!is_division(&b.op)).then_some(expected).flatten());
                 *b.lhs = typed(&b.lhs, child_context.clone(), type_of);
                 *b.rhs = typed(&b.rhs, child_context, type_of);
             }
@@ -787,7 +799,7 @@ pub(crate) fn with_integer_context(
 /// Preserve context for older arithmetic facts whose local variables left scope.
 fn arithmetic_context_type(e: &Expr, type_of: IntTypeOf) -> Option<ElementType> {
     match e {
-        Expr::BinaryOp(b) if b.op != BinaryOp::Rem => b
+        Expr::BinaryOp(b) if !is_division(&b.op) => b
             .operand_ty
             .clone()
             .or_else(|| arithmetic_context_type(&b.lhs, type_of))
@@ -892,7 +904,7 @@ fn wrap(exact: String, ty: Option<ElementType>) -> Result<String, String> {
     }
 }
 
-/// Whether the prover can model `e`: names, numbers, `+`, `-`, `*`, `%`, the bitwise operators
+/// Whether the prover can model `e`: names, numbers, `+`, `-`, `*`, `/`, `%`, the bitwise operators
 /// `&`, `|`, `^`, `<<` and `>>`, comparisons, `&&`, `||`, `!`,
 /// negation, field and element reads of those, integer casts, and calls with such
 /// arguments, or references to them, whose results are known through the callee's `ensures`.
@@ -904,7 +916,7 @@ pub fn is_modelled(e: &Expr) -> bool {
         Expr::BinaryOp(b) => {
             (matches!(
                 b.op,
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Rem
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
             ) || is_bitwise(&b.op))
                 && is_modelled(&b.lhs)
                 && is_modelled(&b.rhs)
@@ -991,6 +1003,7 @@ pub fn to_source(e: &Expr) -> Option<String> {
                 BinaryOp::Add => "+",
                 BinaryOp::Sub => "-",
                 BinaryOp::Mul => "*",
+                BinaryOp::Div => "/",
                 BinaryOp::Rem => "%",
                 BinaryOp::BitAnd => "&",
                 BinaryOp::BitOr => "|",
@@ -1073,7 +1086,7 @@ fn binding_level(e: &Expr) -> u8 {
         Expr::LogicalOp(_) => LOGICAL,
         Expr::RelationalOp(_) => COMPARISON,
         Expr::BinaryOp(b) => match b.op {
-            BinaryOp::Mul | BinaryOp::Rem => PRODUCT,
+            BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => PRODUCT,
             BinaryOp::BitOr => BIT_OR,
             BinaryOp::BitXor => BIT_XOR,
             BinaryOp::BitAnd => BIT_AND,
@@ -1150,26 +1163,28 @@ mod tests {
     }
 
     #[test]
-    fn a_remainder_needs_its_own_operand_type() {
+    fn a_division_or_remainder_needs_its_own_operand_type() {
         let unknown = Expr::Identifier(IdentifierExpr::new("unknown".into(), Span::default()));
-        for divisor_type in [None, Some(ElementType::U32)] {
-            let remainder = Expr::BinaryOp(BinaryOpExpr::new(
-                Box::new(unknown.clone()),
-                BinaryOp::Rem,
-                Box::new(Expr::Number(NumberExpr::new(
-                    "10".into(),
-                    divisor_type.clone(),
+        for op in [BinaryOp::Div, BinaryOp::Rem] {
+            for divisor_type in [None, Some(ElementType::U32)] {
+                let division = Expr::BinaryOp(BinaryOpExpr::new(
+                    Box::new(unknown.clone()),
+                    op.clone(),
+                    Box::new(Expr::Number(NumberExpr::new(
+                        "10".into(),
+                        divisor_type.clone(),
+                        Span::default(),
+                    ))),
                     Span::default(),
-                ))),
-                Span::default(),
-            ));
-            let mut prover = SmtProver::new();
-            let remainder = with_integer_context(&remainder, Some(ElementType::U32), &|_| None);
-            assert_eq!(
-                prover.lower_expr(&remainder, &|_| None, Some(ElementType::U32), None),
-                Err("a remainder whose integer type is not known".to_string()),
-                "unknown operand with divisor type {divisor_type:?}"
-            );
+                ));
+                let mut prover = SmtProver::new();
+                let division = with_integer_context(&division, Some(ElementType::U32), &|_| None);
+                assert_eq!(
+                    prover.lower_expr(&division, &|_| None, Some(ElementType::U32), None),
+                    Err("a division whose integer type is not known".to_string()),
+                    "{op:?} of an unknown operand with divisor type {divisor_type:?}"
+                );
+            }
         }
     }
 

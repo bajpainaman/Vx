@@ -774,6 +774,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/dialect/vx-opt.cpp");
     println!("cargo:rerun-if-changed=src/dialect/NarrowFloats.cpp");
     println!("cargo:rerun-if-changed=src/dialect/MetalImage.cpp");
+    println!("cargo:rerun-if-changed=src/dialect/EvmImage.cpp");
 
     // Compile the dialect
     let dialect_obj_path = PathBuf::from(&out_dir).join("VxDialect.o");
@@ -782,6 +783,7 @@ fn main() {
     let vx_opt_obj_path = PathBuf::from(&out_dir).join("vx-opt.o");
     let narrow_floats_obj_path = PathBuf::from(&out_dir).join("NarrowFloats.o");
     let metal_image_obj_path = PathBuf::from(&out_dir).join("MetalImage.o");
+    let evm_image_obj_path = PathBuf::from(&out_dir).join("EvmImage.o");
     let dialect_lib_path = PathBuf::from(&out_dir).join("libvx_dialect.a");
 
     let mut dialect_cmd = Command::new(&cxx);
@@ -904,6 +906,20 @@ fn main() {
         "clang++ compilation failed for MetalImage"
     );
 
+    let mut evm_image_cmd = Command::new(&cxx);
+    evm_image_cmd.args([
+        "-c",
+        "src/dialect/EvmImage.cpp",
+        "-o",
+        evm_image_obj_path.to_str().unwrap(),
+        "-std=c++17",
+    ]);
+    evm_image_cmd.args(&llvm_cxxflags_vec);
+    let status = evm_image_cmd
+        .status()
+        .expect("Failed to execute cxx for EvmImage");
+    assert!(status.success(), "clang++ compilation failed for EvmImage");
+
     let mut ar_cmd = Command::new(&ar);
     ar_cmd.args(&arflags);
     ar_cmd.args([
@@ -914,6 +930,7 @@ fn main() {
         vx_opt_obj_path.to_str().unwrap(),
         narrow_floats_obj_path.to_str().unwrap(),
         metal_image_obj_path.to_str().unwrap(),
+        evm_image_obj_path.to_str().unwrap(),
     ]);
     let status = ar_cmd.status().expect("Failed to archive libvx_dialect.a");
     assert!(status.success(), "ar failed for libvx_dialect");

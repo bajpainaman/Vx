@@ -43,6 +43,7 @@ pub mod plugin;
 pub mod registry;
 pub mod report;
 pub mod resolver;
+pub mod sbf;
 pub mod session;
 pub mod suggest;
 pub mod symbol;

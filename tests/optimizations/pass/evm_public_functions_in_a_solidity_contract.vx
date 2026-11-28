@@ -1,0 +1,60 @@
+// The Solidity file that vxc writes for the EVM. Each `pub fn` becomes one function of the
+// contract, and the code of the function is Yul. A Solidity compiler makes the bytecode from
+// the file. The test needs no EVM and no Solidity compiler.
+//
+// RUN: vxc %s --emit-evm -o %t.sol
+// RUN: FileCheck %s --input-file=%t.sol --implicit-check-not='function twice('
+
+// The contract has the name of the file. `twice` is not `pub`, so no line of the file
+// declares a Solidity function `twice`: the second RUN line refuses one anywhere. Its Yul
+// function, `vx_twice`, is in the code of `scaled`, which calls it.
+// CHECK: pragma solidity
+// CHECK: contract Evm_public_functions_in_a_solidity_contract {
+
+// In Yul, an integer has its sign bit in each bit above it. Solidity gives an unsigned
+// parameter with 0 in each of those bits. So `a` gets its sign bits on the way in, and the
+// result loses them on the way out. `b` is signed and needs neither.
+// CHECK-LABEL: function scaled(uint64 a0, int64 a1) external pure returns (uint64 r0) {
+// CHECK-NEXT: assembly ("memory-safe") {
+// CHECK-NEXT: r0 := and(vx_scaled(signextend(7, a0), a1), 0xffffffffffffffff)
+// CHECK: function vx_scaled(
+// CHECK: function vx_twice(
+fn twice(a : i64) -> i64 {
+  return a * 2;
+}
+
+pub fn scaled(a : u64, b : i64) -> u64 {
+  return a + (twice(b) as u64);
+}
+
+// A sum that does not fit 64 bits wraps, as it does on a CPU.
+// CHECK-LABEL: function add(int64 a0, int64 a1) external pure returns (int64 r0) {
+// CHECK: r0 := vx_add(a0, a1)
+// CHECK: let {{x[0-9]+}} := signextend(7, add({{x[0-9]+}}, {{x[0-9]+}}))
+pub fn add(a : i64, b : i64) -> i64 {
+  return a + b;
+}
+
+// A division by zero makes the call revert. An unsigned division and an unsigned comparison
+// read each operand without its sign bits.
+// CHECK-LABEL: function ratio_is_big(uint32 a0, uint32 a1) external pure returns (bool r0) {
+// CHECK: if iszero({{x[0-9]+}}) { revert(0, 0) }
+// CHECK: div(and({{x[0-9]+}}, 0xffffffff), and({{x[0-9]+}}, 0xffffffff))
+// CHECK: gt(and({{x[0-9]+}}, 0xffffffff), and({{x[0-9]+}}, 0xffffffff))
+pub fn ratio_is_big(a : u32, b : u32) -> bool {
+  return a / b > 1000;
+}
+
+// Yul has structured loops only. A `while` becomes a `for` that a `break` ends.
+// CHECK-LABEL: function sum_to(int64 a0) external pure returns (int64 r0) {
+// CHECK: for { } 1 { } {
+// CHECK: break
+pub fn sum_to(n : i64) -> i64 {
+  let mut total : i64 = 0;
+  let mut i : i64 = 1;
+  while i <= n {
+    total = total + i;
+    i = i + 1;
+  }
+  return total;
+}

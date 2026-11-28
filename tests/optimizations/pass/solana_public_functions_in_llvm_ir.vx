@@ -1,0 +1,52 @@
+// The LLVM IR that vxc writes for a Solana program, and the `.json` file beside it that says
+// how to call each `pub fn`. The Solana `clang` makes the program file from the LLVM IR. The
+// test needs no Solana tool.
+//
+// A failed check calls `puts` on a host. Solana has no `puts`, so the file must not name it.
+//
+// RUN: vxc %s --emit-sbf -o %t.ll
+// RUN: FileCheck %s --input-file=%t.ll --implicit-check-not=@puts
+// RUN: FileCheck %s --check-prefix=JSON --input-file=%t.json
+
+// The module is for the target that the Solana `clang` calls `sbf`.
+// CHECK: target datalayout = "e-m:e-p:64:64-i64:64-n32:64-S128"
+// CHECK: target triple = "sbf"
+
+// Only the entry point is visible outside the program, so each function of the program is
+// internal. The check of the divisor writes its message to the log, then stops the program.
+// CHECK: define internal i1 @ratio_is_big(i32 %0, i32 %1)
+// CHECK: call void @vx_sbf_log(ptr @assert_msg
+// CHECK: call void @abort()
+// CHECK: define internal i64 @add(i64 %0, i64 %1)
+pub fn add(a : i64, b : i64) -> i64 {
+  return a + b;
+}
+
+pub fn ratio_is_big(a : u32, b : u32) -> bool {
+  return a / b > 1000;
+}
+
+// The entry point reads the first 8 bytes of the instruction data as one number. For `add`
+// they are the first 8 bytes of the SHA-256 of `global:add`, as in an Anchor program.
+// CHECK: define i64 @entrypoint(ptr %input)
+// CHECK: i64 -5388434059783702231, label %f0
+
+// `add` takes 8 bytes of name and two arguments of 8 bytes. Its result is 8 bytes of return
+// data.
+// CHECK: %f0.fits = icmp eq i64 %length, 24
+// CHECK: %f0.at1 = getelementptr i8, ptr %data, i64 16
+// CHECK: %f0.r = call i64 @add(i64 %f0.a0, i64 %f0.a1)
+// CHECK: call void @sol_set_return_data(ptr %out, i64 8)
+
+// `ratio_is_big` takes two arguments of 4 bytes, and its `bool` is 1 byte of return data.
+// CHECK: %f1.fits = icmp eq i64 %length, 16
+// CHECK: %f1.byte = zext i1 %f1.r to i8
+// CHECK: call void @sol_set_return_data(ptr %out, i64 1)
+
+// Other instruction data ends the call with the error "invalid instruction data".
+// CHECK: bad:
+// CHECK-NEXT: ret i64 12884901888
+
+// JSON: "target": "sbf"
+// JSON: {"name": "add", "discriminator": [41, 249, 249, 146, 197, 111, 56, 181], "params": ["i64", "i64"], "returns": "i64"}
+// JSON: {"name": "ratio_is_big", "discriminator": [{{.*}}], "params": ["u32", "u32"], "returns": "bool"}

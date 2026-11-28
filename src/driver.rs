@@ -52,6 +52,13 @@ pub enum Action {
     /// Write the program's Apple GPU kernels as one Metal Shading Language file, and a `.json`
     /// file beside it that gives each kernel's parameters
     EmitMsl,
+    /// Write the program's `pub` functions as one Solidity contract for the EVM. A Solidity
+    /// compiler makes the bytecode and the ABI from that file
+    EmitEvm,
+    /// Write the program's `pub` functions as LLVM IR for a Solana program, and a `.json` file
+    /// beside it that says how to call each one. The Solana `clang` and `ld.lld` make the
+    /// program file from the LLVM IR
+    EmitSbf,
     /// Parse and typecheck the program, then print each fact that the compiler trusts without a
     /// proof: each `assume`, each pointer clause that a call in `unsafe` code trusts, each
     /// `ensures` of a function in an `extern` block, and each pointer `requires` of an `extern fn`
@@ -67,7 +74,7 @@ pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), vx_build_commit::co
 pub struct DriverOptions {
     /// Action to perform
     #[arg(short = 'a', long = "action", value_enum, default_value_t = Action::RunJit)]
-    #[arg(overrides_with_all = ["compile", "parse_only", "print_ast", "emit_mlir", "emit_llvm", "run_jit", "emit_interface", "emit_ptx", "emit_msl", "audit"])]
+    #[arg(overrides_with_all = ["compile", "parse_only", "print_ast", "emit_mlir", "emit_llvm", "run_jit", "emit_interface", "emit_ptx", "emit_msl", "emit_evm", "emit_sbf", "audit"])]
     pub action: Action,
 
     /// Output file. With several inputs, a directory that receives one output per input
@@ -110,6 +117,14 @@ pub struct DriverOptions {
     /// Write the Apple GPU kernels as Metal Shading Language (alias for --action emit-msl)
     #[arg(long = "emit-msl", overrides_with = "action")]
     pub emit_msl: bool,
+
+    /// Write the `pub` functions as a Solidity contract for the EVM (alias for --action emit-evm)
+    #[arg(long = "emit-evm", overrides_with = "action")]
+    pub emit_evm: bool,
+
+    /// Write the `pub` functions as LLVM IR for a Solana program (alias for --action emit-sbf)
+    #[arg(long = "emit-sbf", overrides_with = "action")]
+    pub emit_sbf: bool,
 
     /// Print the facts that the compiler trusts without a proof (alias for --action audit)
     #[arg(long = "audit", overrides_with = "action")]
@@ -383,6 +398,10 @@ impl CompilerDriver {
             options.action = Action::EmitPtx;
         } else if options.emit_msl {
             options.action = Action::EmitMsl;
+        } else if options.emit_evm {
+            options.action = Action::EmitEvm;
+        } else if options.emit_sbf {
+            options.action = Action::EmitSbf;
         } else if options.audit || options.audit_library {
             options.action = Action::Audit;
         } else if options.compile {
@@ -463,6 +482,8 @@ impl CompilerDriver {
             Action::EmitInterface => "vxlib",
             Action::EmitPtx => "ptx",
             Action::EmitMsl => "metal",
+            Action::EmitEvm => "sol",
+            Action::EmitSbf => "ll",
             _ => return Ok(None),
         };
         if !out.is_dir() {
@@ -1664,7 +1685,7 @@ impl CompilerDriver {
             )?
         };
 
-        let module = match flat_module {
+        let mut module = match flat_module {
             Some(m) => {
                 // Quiet by default: the flat path is the usual one. VX_FLAT_DBG asks for the line.
                 if std::env::var("VX_FLAT_DBG").is_ok() {
@@ -1718,6 +1739,32 @@ impl CompilerDriver {
             }
         };
 
+        if matches!(self.options.action, Action::EmitEvm | Action::EmitSbf) {
+            // MLIR does not say whether an integer is signed, or whether a function is `pub`.
+            // src/dialect/EvmImage.cpp and src/sbf.rs read both from this attribute.
+            use melior::ir::operation::OperationMutLike;
+            let evm = self.options.action == Action::EmitEvm;
+            let exports = public_functions(&monomorphized_ast)?;
+            module.as_operation_mut().set_attribute(
+                if evm {
+                    "vx.evm_exports"
+                } else {
+                    "vx.sbf_exports"
+                },
+                melior::ir::attribute::StringAttribute::new(&context, &exports).into(),
+            );
+            if evm {
+                module.as_operation_mut().set_attribute(
+                    "vx.evm_contract",
+                    melior::ir::attribute::StringAttribute::new(
+                        &context,
+                        &evm_contract_name(main_file),
+                    )
+                    .into(),
+                );
+            }
+        }
+
         self.lower_and_emit(&context, module, host_arch, filename, main_file, mlir_args)
     }
 
@@ -1742,12 +1789,47 @@ impl CompilerDriver {
             self.options.action,
             Action::EmitLlvm | Action::RunJit | Action::EmitObj | Action::EmitPtx | Action::EmitMsl
         );
-        let pipeline_str = get_optimization_pipeline(
-            self.options.opt_level,
-            llvm_lower,
-            self.options.disable_mlir_optimizations,
-            self.options.bounds_checks(),
-        );
+        let pipeline_str = if matches!(self.options.action, Action::EmitEvm | Action::EmitSbf) {
+            let evm = self.options.action == Action::EmitEvm;
+            // Only the sequential driver says which functions are `pub`.
+            let exports = if evm {
+                "vx.evm_exports"
+            } else {
+                "vx.sbf_exports"
+            };
+            if module.as_operation().attribute(exports).is_err() {
+                return Err(format!(
+                    "Cannot write '{filename}' for {}. `{}` does not work with a parallel \
+                     compile (`-j`) yet. Compile without `-j`.",
+                    if evm { "the EVM" } else { "Solana" },
+                    if evm { "--emit-evm" } else { "--emit-sbf" }
+                ));
+            }
+            if evm {
+                get_evm_pipeline()
+            } else {
+                // `mlir-translate` copies these two to the LLVM IR.
+                use melior::ir::operation::OperationMutLike;
+                module.as_operation_mut().set_attribute(
+                    "llvm.target_triple",
+                    melior::ir::attribute::StringAttribute::new(context, crate::sbf::TARGET_TRIPLE)
+                        .into(),
+                );
+                module.as_operation_mut().set_attribute(
+                    "llvm.data_layout",
+                    melior::ir::attribute::StringAttribute::new(context, crate::sbf::DATA_LAYOUT)
+                        .into(),
+                );
+                get_sbf_pipeline()
+            }
+        } else {
+            get_optimization_pipeline(
+                self.options.opt_level,
+                llvm_lower,
+                self.options.disable_mlir_optimizations,
+                self.options.bounds_checks(),
+            )
+        };
 
         let pass_manager = melior::pass::PassManager::new(context);
         pass_manager.enable_verifier(true);
@@ -1851,6 +1933,44 @@ impl CompilerDriver {
                 )
                 .map_err(|e| e.to_string())?;
                 print_program_output(&out);
+            }
+            Action::EmitEvm => {
+                let contract_path = self.options.output.clone().unwrap_or_else(|| {
+                    let mut p = main_file.to_path_buf();
+                    p.set_extension("sol");
+                    p
+                });
+                let contract = module
+                    .as_operation()
+                    .attribute("vx.exported_evm")
+                    .ok()
+                    .and_then(|a| melior::ir::attribute::StringAttribute::try_from(a).ok())
+                    .map(|s| s.value().to_string())
+                    .ok_or_else(|| format!("{filename} gave no contract to write"))?;
+                std::fs::write(&contract_path, contract)
+                    .map_err(|e| format!("could not write '{}': {e}", contract_path.display()))?;
+            }
+            Action::EmitSbf => {
+                let ir_path = self.options.output.clone().unwrap_or_else(|| {
+                    let mut p = main_file.to_path_buf();
+                    p.set_extension("ll");
+                    p
+                });
+                let lines = module
+                    .as_operation()
+                    .attribute("vx.sbf_exports")
+                    .ok()
+                    .and_then(|a| melior::ir::attribute::StringAttribute::try_from(a).ok())
+                    .map(|s| s.value().to_string())
+                    .ok_or_else(|| format!("{filename} does not say which functions are `pub`"))?;
+                let functions = crate::sbf::parse_public_functions(&lines)?;
+                let module_ir = crate::sbf::translate(&format!("{}", module.as_operation()))?;
+                let program = crate::sbf::program_ir(&module_ir, &functions)?;
+                let json_path = ir_path.with_extension("json");
+                std::fs::write(&ir_path, program)
+                    .map_err(|e| format!("could not write '{}': {e}", ir_path.display()))?;
+                std::fs::write(&json_path, crate::sbf::manifest(&functions))
+                    .map_err(|e| format!("could not write '{}': {e}", json_path.display()))?;
             }
             Action::EmitPtx | Action::EmitMsl => {
                 let msl = self.options.action == Action::EmitMsl;
@@ -2358,6 +2478,136 @@ fn get_optimization_pipeline(
     }
 
     format!("builtin.module({})", passes.join(","))
+}
+
+/// The passes for `--emit-evm`. The division check runs as it does for every backend. No pass
+/// lowers to LLVM, because the EVM takes no LLVM code. The last pass writes the contract.
+fn get_evm_pipeline() -> String {
+    let passes = [
+        "convert-vx-to-standard",
+        // Before the contract is written, so that a division by zero stops the call.
+        "vx-check-integer-division",
+        "vx-export-evm",
+    ];
+    format!("builtin.module({})", passes.join(","))
+}
+
+/// The passes for `--emit-sbf`. The division check runs as it does for every backend. Then the
+/// module becomes the LLVM dialect, with none of the passes that prepare a program for a host:
+/// a Solana program has no C library and no Vx runtime library.
+fn get_sbf_pipeline() -> String {
+    let passes = [
+        "convert-vx-to-standard",
+        // Before the lowering, so that a division by zero stops the program.
+        "vx-check-integer-division",
+        "convert-scf-to-cf",
+        "finalize-memref-to-llvm",
+        "convert-func-to-llvm",
+        "convert-cf-to-llvm",
+        "convert-arith-to-llvm",
+        "convert-index-to-llvm",
+        "reconcile-unrealized-casts",
+    ];
+    format!("builtin.module({})", passes.join(","))
+}
+
+/// The lines of the module attributes `vx.evm_exports` and `vx.sbf_exports`: one for each
+/// `pub fn` that the program's own file declares, as `name(u64,i64)->u64`. They give the types
+/// as the source spells them, because MLIR does not say whether an integer is signed. `void` is
+/// a function that returns nothing. src/dialect/EvmImage.cpp and src/sbf.rs read the lines.
+fn public_functions(program: &crate::syntax::Program) -> Result<String, String> {
+    use crate::syntax::types::{ElementType, Type};
+
+    fn scalar(ty: &Type) -> Option<&'static str> {
+        let Type::Scalar(element) = ty else {
+            return None;
+        };
+        Some(match element {
+            ElementType::I8 => "i8",
+            ElementType::U8 => "u8",
+            ElementType::I16 => "i16",
+            ElementType::U16 => "u16",
+            ElementType::I32 => "i32",
+            ElementType::U32 => "u32",
+            ElementType::I64 => "i64",
+            ElementType::U64 => "u64",
+            ElementType::I128 => "i128",
+            ElementType::U128 => "u128",
+            ElementType::USize => "usize",
+            ElementType::Bool => "bool",
+            _ => return None,
+        })
+    }
+
+    let mut lines = Vec::new();
+    for function in &program.functions {
+        if function.visibility != crate::gid::Visibility::Public {
+            continue;
+        }
+        // A `pub fn` of an imported file is not a function that a caller on the chain can call.
+        if function.file.is_some() && function.file != program.file {
+            continue;
+        }
+        let name = &function.name;
+        if !function.generics.is_empty() {
+            return Err(format!(
+                "Cannot write public function '{name}' for the EVM or Solana, because it has \
+                 type parameters. A function that a transaction calls has one type for each \
+                 parameter."
+            ));
+        }
+        let mut params = Vec::new();
+        for (param, ty) in &function.params {
+            let Some(spelled) = scalar(ty) else {
+                return Err(format!(
+                    "Cannot write public function '{name}' for the EVM or Solana. Its \
+                     parameter '{param}' is not an integer or a `bool`, and these two backends \
+                     take only those types."
+                ));
+            };
+            params.push(spelled);
+        }
+        let result = if crate::syntax::types::is_void_ty(&function.return_type) {
+            "void"
+        } else {
+            scalar(&function.return_type).ok_or_else(|| {
+                format!(
+                    "Cannot write public function '{name}' for the EVM or Solana. It does not \
+                     return an integer, a `bool` or nothing, and these two backends return \
+                     only those."
+                )
+            })?
+        };
+        lines.push(format!("{name}({})->{result}", params.join(",")));
+    }
+    if lines.is_empty() {
+        return Err(
+            "The program has no `pub fn`. `--emit-evm` and `--emit-sbf` write one function \
+             that a transaction can call for each `pub fn`."
+                .to_string(),
+        );
+    }
+    Ok(lines.join("\n"))
+}
+
+/// The name of the contract for the program in `main_file`: the name of the file, with a capital
+/// first letter, and with `_` for each character that a Solidity name cannot have.
+fn evm_contract_name(main_file: &std::path::Path) -> String {
+    let stem = main_file
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut name: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    match name.chars().next() {
+        Some(first) if first.is_ascii_alphabetic() => {
+            name.replace_range(..1, &first.to_ascii_uppercase().to_string());
+        }
+        _ => name.insert_str(0, "Vx"),
+    }
+    name
 }
 
 extern "C" {

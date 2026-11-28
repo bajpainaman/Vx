@@ -1,0 +1,41 @@
+// A Vx program that becomes a Solidity contract. The prover checks each `ensures` when vxc
+// compiles the program, so the contract gets only functions whose clauses hold.
+//
+// Write the contract and make its bytecode:
+//
+//   vxc examples/solidity_contract_with_proved_ensures.vx --emit-evm -o Fees.sol
+//   solc --via-ir --optimize --bin --abi Fees.sol -o out
+//
+// On a local anvil chain, `low_byte(4660)` returns 52, `price_round_trip(1234)` returns 1234,
+// `sign_mask(-5)` returns -1 and `fee(50000, 30)` returns 150. The CPU gives the same values.
+
+// The low byte of a packed value. The prover shows that it is at most 255.
+pub fn low_byte(packed : u64) -> u64
+ensures return <= 255 {
+  return packed & 255u64;
+}
+
+// A 16-bit price moved into the high half of a word and back. The prover shows that no bit is lost.
+pub fn price_round_trip(price : u32) -> u32
+requires price < 65536
+ensures return == price {
+  return (price << 16u32) >> 16u32;
+}
+
+// -1 for a negative value. The prover shows that `>>` copies the sign bit.
+pub fn sign_mask(x : i64) -> i64
+requires x < 0
+ensures return == -1 {
+  return x >> 63i64;
+}
+
+// A fee in basis points. The prover cannot reason about `/` yet, so this function has no
+// `ensures`.
+pub fn fee(amount : u64, bps : u64) -> u64 {
+  return amount * bps / 10000u64;
+}
+
+fn main() -> i32 {
+  println!("{} {} {} {}", low_byte(4660u64), price_round_trip(1234u32), sign_mask(-5i64), fee(50000u64, 30u64));
+  return 0;
+}

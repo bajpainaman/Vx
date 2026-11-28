@@ -1,0 +1,50 @@
+//===- bitwise_operators_and_shifts_cannot_prove_wrong_values.vx ---*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The prover does not accept a wrong value of `&`, `<<` or `>>`:
+//
+// - `mask_too_small`: `x & 255` can be 255, so it is not always below 255;
+// - `logical_not_arithmetic`: `>>` on a negative `i8` copies the sign bit, so -128 >> 7 is not 1;
+// - `lost_bits`: a `u8` shifted left by 4 loses its top bits, so 255 << 4 >> 4 is not 255;
+// - `shift_by_the_width`: a shift by 32 or more is undefined, so the prover gives it no value.
+//
+// RUN: not vxc %s --action emit-mlir 2>&1 | FileCheck %s
+
+fn mask_too_small(x : u32) -> u32
+ensures return < 255 {
+  // CHECK: Error[E8001]
+  // CHECK-SAME: Function 'mask_too_small' cannot prove postcondition
+  return x & 255u32;
+}
+
+fn logical_not_arithmetic(x : i8) -> i8
+requires x == -128
+ensures return == 1 {
+  // CHECK: Error[E8001]
+  // CHECK-SAME: Function 'logical_not_arithmetic' cannot prove postcondition
+  return x >> 7i8;
+}
+
+fn lost_bits(x : u8) -> u8
+requires x == 255
+ensures return == 255 {
+  // CHECK: Error[E8001]
+  // CHECK-SAME: Function 'lost_bits' cannot prove postcondition
+  return (x << 4u8) >> 4u8;
+}
+
+fn shift_by_the_width(x : u32, n : u32) -> u32
+requires n == 32
+ensures return == 0 {
+  // CHECK: Error[E8001]
+  // CHECK-SAME: Function 'shift_by_the_width' cannot prove postcondition
+  return x << n;
+}
+
+fn main() -> i32 {
+  return 0;
+}

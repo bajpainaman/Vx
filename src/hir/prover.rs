@@ -27,12 +27,14 @@ pub struct SmtProver {
     /// Whether a fact multiplies two values that are not constants, or divides by one. Only then
     /// does z3 need nonlinear arithmetic, which is much slower.
     nonlinear: bool,
+    /// Whether a fact has a bitwise operation or a shift. Only then does z3 need bitvectors.
+    bitvectors: bool,
     /// The sort of each name that a fact uses as a number or as a condition.
     sorts: std::collections::HashMap<String, Sort>,
     /// Pairs of names that `==` or `!=` compares, so that they have the same sort.
     same_sort: Vec<(String, String)>,
-    /// The name of the unknown value of each `usize` operation that can overflow, by the text
-    /// of the operation.
+    /// The name of the unknown value of each operation that can have no value, by the text of
+    /// the operation: a `usize` operation that can overflow, or a shift.
     overflow_names: std::collections::HashMap<String, String>,
 }
 
@@ -67,6 +69,7 @@ impl SmtProver {
             declarations: std::collections::BTreeSet::new(),
             ranges: std::collections::HashMap::new(),
             nonlinear: false,
+            bitvectors: false,
             sorts: std::collections::HashMap::new(),
             same_sort: Vec::new(),
             overflow_names: std::collections::HashMap::new(),
@@ -119,7 +122,11 @@ impl SmtProver {
     }
 
     pub fn prove(&self) -> Result<bool, String> {
-        let logic = if self.nonlinear { "QF_NIA" } else { "QF_LIA" };
+        let logic = match (self.bitvectors, self.nonlinear) {
+            (true, _) => "ALL",
+            (false, true) => "QF_NIA",
+            (false, false) => "QF_LIA",
+        };
         let mut script = format!("(set-option :rlimit {Z3_STEP_LIMIT})\n(set-logic {logic})\n");
         let sorts = self.resolve_sorts()?;
 
@@ -221,6 +228,72 @@ impl SmtProver {
         Ok(format!("(ite (<= {lo} {exact} {hi}) {exact} {undefined})"))
     }
 
+    /// `lhs op rhs` for a bitwise operator or a shift on the integer type `ty`. The operands
+    /// become bitvectors of the width of `ty`, and the result becomes an integer again, so the
+    /// other facts stay integer facts. A shift by a count outside `0` to `width - 1` is
+    /// undefined, and a `usize` `<<` that loses a bit stops the program. Such a shift has no
+    /// value: it becomes a name with no facts.
+    fn bitwise(
+        &mut self,
+        op: &BinaryOp,
+        lhs: String,
+        rhs: String,
+        ty: ElementType,
+    ) -> Result<String, String> {
+        let bits = ty.int_bits().expect("an integer type");
+        // A shift by a constant `k` is a product or a floor division by `2^k`, which z3 solves
+        // much faster than bitvectors. A `usize` `<<` by 63 always stops the program.
+        let usable = if ty == ElementType::USize { 63 } else { bits };
+        if let Some(k) = rhs.parse::<u32>().ok().filter(|k| *k < usable) {
+            let p = pow2(k);
+            match op {
+                BinaryOp::Shl => return self.machine_result(format!("(* {lhs} {p})"), Some(ty)),
+                BinaryOp::Shr => return Ok(format!("(div {lhs} {p})")),
+                _ => {}
+            }
+        }
+        self.bitvectors = true;
+        let bv = |t: &str| format!("((_ int2bv {bits}) {t})");
+        let (a, c) = (bv(&lhs), bv(&rhs));
+        let bv_op = match op {
+            BinaryOp::BitAnd => "bvand",
+            BinaryOp::BitOr => "bvor",
+            BinaryOp::BitXor => "bvxor",
+            BinaryOp::Shl => "bvshl",
+            BinaryOp::Shr if ty.is_signed_int() => "bvashr",
+            BinaryOp::Shr => "bvlshr",
+            _ => unreachable!("not a bitwise operator: {op:?}"),
+        };
+        let raw = format!("({bv_op} {a} {c})");
+        let unsigned = format!("(bv2nat {raw})");
+        // The bits as a value of `ty`: a signed type reads the top bit as the sign.
+        let value = if ty.is_signed_int() {
+            wrap(unsigned.clone(), Some(ty.clone()))?
+        } else {
+            unsigned.clone()
+        };
+        if !matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+            return Ok(value);
+        }
+        let defined = if ty == ElementType::USize && *op == BinaryOp::Shl {
+            // The rule of the code generator: the count is below 63 and no bit is lost.
+            let (_, max) = int_range(&ty).expect("the range of usize");
+            format!(
+                "(and (<= 0 {rhs} 62) (= (bv2nat (bvlshr {raw} {c})) {lhs}) (<= {unsigned} {max}))"
+            )
+        } else {
+            format!("(<= 0 {rhs} {})", bits - 1)
+        };
+        let count = self.overflow_names.len();
+        let undefined = self
+            .overflow_names
+            .entry(raw)
+            .or_insert_with(|| format!("shift.undefined.{count}"))
+            .clone();
+        let undefined = self.name(&undefined, Some(Sort::Int))?;
+        Ok(format!("(ite {defined} {value} {undefined})"))
+    }
+
     /// `expected` supplies context for literal arithmetic. Remainder requires its own operand type.
     /// `want` is the sort that the place of `expr` needs, when the place tells it.
     fn lower_expr(
@@ -259,6 +332,36 @@ impl SmtProver {
                     self.ranges.insert(name.clone(), ty);
                 }
                 Ok(name)
+            }
+            Expr::BinaryOp(b) if is_bitwise(&b.op) => {
+                let ty = b
+                    .operand_ty
+                    .clone()
+                    .or_else(|| arithmetic_context_type(expr, type_of))
+                    .or(expected);
+                // `&`, `|` and `^` on `bool` are the logical operations. A contract has no
+                // types, so an operation in the place of a condition is on `bool` too.
+                let shift = matches!(b.op, BinaryOp::Shl | BinaryOp::Shr);
+                if !shift
+                    && (ty == Some(ElementType::Bool) || (ty.is_none() && want == Some(Sort::Bool)))
+                {
+                    expect(want, Sort::Bool)?;
+                    let lhs = self.lower_expr(&b.lhs, type_of, None, Some(Sort::Bool))?;
+                    let rhs = self.lower_expr(&b.rhs, type_of, None, Some(Sort::Bool))?;
+                    let op = match b.op {
+                        BinaryOp::BitAnd => "and",
+                        BinaryOp::BitOr => "or",
+                        _ => "xor",
+                    };
+                    return Ok(format!("({op} {lhs} {rhs})"));
+                }
+                expect(want, Sort::Int)?;
+                let ty = ty
+                    .filter(|t| t.int_bits().is_some() && *t != ElementType::Bool)
+                    .ok_or("a bitwise operation whose integer type is not known")?;
+                let lhs = self.lower_expr(&b.lhs, type_of, Some(ty.clone()), Some(Sort::Int))?;
+                let rhs = self.lower_expr(&b.rhs, type_of, Some(ty.clone()), Some(Sort::Int))?;
+                self.bitwise(&b.op, lhs, rhs, ty)
             }
             Expr::BinaryOp(b) => {
                 let ty = if b.op == BinaryOp::Rem {
@@ -483,6 +586,14 @@ impl SmtProver {
     }
 }
 
+/// Whether `op` is `&`, `|`, `^`, `<<` or `>>`.
+fn is_bitwise(op: &BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr
+    )
+}
+
 fn is_bool_literal(name: &str) -> bool {
     name == "true" || name == "false"
 }
@@ -505,6 +616,9 @@ fn static_sort(e: &Expr, type_of: IntTypeOf) -> Option<Sort> {
         }
         Expr::RelationalOp(_) | Expr::LogicalOp(_) => Some(Sort::Bool),
         Expr::UnaryOp(u) if u.op == UnaryOp::Not => Some(Sort::Bool),
+        Expr::BinaryOp(b) if b.operand_ty == Some(ElementType::Bool) => Some(Sort::Bool),
+        // A contract has no types, and `&`, `|` and `^` take `bool` as well as integers.
+        Expr::BinaryOp(b) if is_bitwise(&b.op) && b.operand_ty.is_none() => None,
         Expr::Number(_)
         | Expr::BinaryOp(_)
         | Expr::UnaryOp(_)
@@ -778,7 +892,8 @@ fn wrap(exact: String, ty: Option<ElementType>) -> Result<String, String> {
     }
 }
 
-/// Whether the prover can model `e`: names, numbers, `+`, `-`, `*`, `%`, comparisons, `&&`, `||`, `!`,
+/// Whether the prover can model `e`: names, numbers, `+`, `-`, `*`, `%`, the bitwise operators
+/// `&`, `|`, `^`, `<<` and `>>`, comparisons, `&&`, `||`, `!`,
 /// negation, field and element reads of those, integer casts, and calls with such
 /// arguments, or references to them, whose results are known through the callee's `ensures`.
 pub fn is_modelled(e: &Expr) -> bool {
@@ -787,10 +902,11 @@ pub fn is_modelled(e: &Expr) -> bool {
         Expr::FunctionCall(c) => c.args.iter().all(|a| is_modelled(without_borrow(a))),
         Expr::AsCast(c) => can_model_integer_cast(c) && is_modelled(&c.expr),
         Expr::BinaryOp(b) => {
-            matches!(
+            (matches!(
                 b.op,
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Rem
-            ) && is_modelled(&b.lhs)
+            ) || is_bitwise(&b.op))
+                && is_modelled(&b.lhs)
                 && is_modelled(&b.rhs)
         }
         Expr::RelationalOp(r) => is_modelled(&r.lhs) && is_modelled(&r.rhs),
@@ -876,6 +992,11 @@ pub fn to_source(e: &Expr) -> Option<String> {
                 BinaryOp::Sub => "-",
                 BinaryOp::Mul => "*",
                 BinaryOp::Rem => "%",
+                BinaryOp::BitAnd => "&",
+                BinaryOp::BitOr => "|",
+                BinaryOp::BitXor => "^",
+                BinaryOp::Shl => "<<",
+                BinaryOp::Shr => ">>",
                 _ => return None,
             };
             // The operators group from the left, so a right operand at the same level keeps
@@ -937,11 +1058,15 @@ pub fn to_source(e: &Expr) -> Option<String> {
 // parser.
 const LOGICAL: u8 = 1;
 const COMPARISON: u8 = 2;
-const SUM: u8 = 3;
-const PRODUCT: u8 = 4;
-const CAST: u8 = 5;
-const UNARY: u8 = 6;
-const POSTFIX: u8 = 7;
+const BIT_OR: u8 = 3;
+const BIT_XOR: u8 = 4;
+const BIT_AND: u8 = 5;
+const SHIFT: u8 = 6;
+const SUM: u8 = 7;
+const PRODUCT: u8 = 8;
+const CAST: u8 = 9;
+const UNARY: u8 = 10;
+const POSTFIX: u8 = 11;
 
 fn binding_level(e: &Expr) -> u8 {
     match e {
@@ -949,6 +1074,10 @@ fn binding_level(e: &Expr) -> u8 {
         Expr::RelationalOp(_) => COMPARISON,
         Expr::BinaryOp(b) => match b.op {
             BinaryOp::Mul | BinaryOp::Rem => PRODUCT,
+            BinaryOp::BitOr => BIT_OR,
+            BinaryOp::BitXor => BIT_XOR,
+            BinaryOp::BitAnd => BIT_AND,
+            BinaryOp::Shl | BinaryOp::Shr => SHIFT,
             _ => SUM,
         },
         Expr::AsCast(_) => CAST,

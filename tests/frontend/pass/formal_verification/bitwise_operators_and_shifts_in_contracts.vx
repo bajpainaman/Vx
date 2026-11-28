@@ -1,0 +1,60 @@
+//===- bitwise_operators_and_shifts_in_contracts.vx - Vx Compiler --*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The prover knows the value of `&`, `|`, `^`, `<<` and `>>`:
+//
+// - `low_byte`: a mask with 255 is at most 255;
+// - `shift_back`: a small `u32` shifted left by 4 and right by 4 is itself;
+// - `sign_copy`: `>>` on a negative `i8` copies the sign bit, so -128 >> 7 is -1;
+// - `logical_shift`: `>>` on a `u8` shifts in zeros, so 128 >> 7 is 1;
+// - `set_bit`: `x | 1` is odd;
+// - `both`: `&` on `bool` is the logical and.
+//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+// CHECK-NOT: E8001
+// CHECK-NOT: the prover ignores
+// CHECK: func.func @main
+
+fn low_byte(x : u32) -> u32
+ensures return <= 255 {
+  return x & 255u32;
+}
+
+fn shift_back(x : u32) -> u32
+requires x < 16
+ensures return == x {
+  return (x << 4u32) >> 4u32;
+}
+
+fn sign_copy(x : i8) -> i8
+requires x == -128
+ensures return == -1 {
+  return x >> 7i8;
+}
+
+fn logical_shift(x : u8) -> u8
+requires x == 128
+ensures return == 1 {
+  return x >> 7u8;
+}
+
+fn set_bit(x : u16) -> u16
+ensures return % 2 == 1 {
+  return x | 1u16;
+}
+
+fn both(a : bool, b : bool) -> bool
+requires a && b
+ensures return {
+  return a & b;
+}
+
+fn main() -> i32 {
+  println!("{} {} {} {}", low_byte(1000u32), shift_back(3u32), sign_copy(-128i8), logical_shift(128u8));
+  println!("{} {}", set_bit(4u16), both(true, true));
+  return 0;
+}

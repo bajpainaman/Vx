@@ -1226,6 +1226,12 @@ impl CompilerDriver {
             p.name_file_on_items();
         }
 
+        // A transaction can call a `pub fn` with any arguments, and nothing proves a `requires`
+        // at that call. So the two chain backends check each one when the function starts.
+        if matches!(self.options.action, Action::EmitEvm | Action::EmitSbf) {
+            check_requires_of_public_functions(ast);
+        }
+
         // Build the resolution env from *owned* clones: full bodies for the imported modules (so
         // their methods/generics can be instantiated) plus the entry module's signature. Owning the
         // clones leaves `ast` and `other_asts` free to be type-checked *in place* below — which #203
@@ -2543,29 +2549,6 @@ fn get_sbf_pipeline(bounds_checks: bool) -> String {
 /// as the source spells them, because MLIR does not say whether an integer is signed. `void` is
 /// a function that returns nothing. src/dialect/EvmImage.cpp and src/sbf.rs read the lines.
 fn public_functions(program: &crate::syntax::Program) -> Result<String, String> {
-    use crate::syntax::types::{ElementType, Type};
-
-    fn scalar(ty: &Type) -> Option<&'static str> {
-        let Type::Scalar(element) = ty else {
-            return None;
-        };
-        Some(match element {
-            ElementType::I8 => "i8",
-            ElementType::U8 => "u8",
-            ElementType::I16 => "i16",
-            ElementType::U16 => "u16",
-            ElementType::I32 => "i32",
-            ElementType::U32 => "u32",
-            ElementType::I64 => "i64",
-            ElementType::U64 => "u64",
-            ElementType::I128 => "i128",
-            ElementType::U128 => "u128",
-            ElementType::USize => "usize",
-            ElementType::Bool => "bool",
-            _ => return None,
-        })
-    }
-
     let mut lines = Vec::new();
     for function in &program.functions {
         if function.visibility != crate::gid::Visibility::Public {
@@ -2585,7 +2568,7 @@ fn public_functions(program: &crate::syntax::Program) -> Result<String, String> 
         }
         let mut params = Vec::new();
         for (param, ty) in &function.params {
-            let Some(spelled) = scalar(ty) else {
+            let Some(spelled) = chain_scalar(ty) else {
                 return Err(format!(
                     "Cannot write public function '{name}' for the EVM or Solana. Its \
                      parameter '{param}' is not an integer or a `bool`, and these two backends \
@@ -2597,7 +2580,7 @@ fn public_functions(program: &crate::syntax::Program) -> Result<String, String> 
         let result = if crate::syntax::types::is_void_ty(&function.return_type) {
             "void"
         } else {
-            scalar(&function.return_type).ok_or_else(|| {
+            chain_scalar(&function.return_type).ok_or_else(|| {
                 format!(
                     "Cannot write public function '{name}' for the EVM or Solana. It does not \
                      return an integer, a `bool` or nothing, and these two backends return \
@@ -2615,6 +2598,65 @@ fn public_functions(program: &crate::syntax::Program) -> Result<String, String> 
         );
     }
     Ok(lines.join("\n"))
+}
+
+/// The name of `ty` as the source spells it, when `--emit-evm` and `--emit-sbf` take it as a
+/// parameter or a result: an integer or a `bool`.
+fn chain_scalar(ty: &crate::syntax::types::Type) -> Option<&'static str> {
+    use crate::syntax::types::{ElementType, Type};
+    let Type::Scalar(element) = ty else {
+        return None;
+    };
+    Some(match element {
+        ElementType::I8 => "i8",
+        ElementType::U8 => "u8",
+        ElementType::I16 => "i16",
+        ElementType::U16 => "u16",
+        ElementType::I32 => "i32",
+        ElementType::U32 => "u32",
+        ElementType::I64 => "i64",
+        ElementType::U64 => "u64",
+        ElementType::I128 => "i128",
+        ElementType::U128 => "u128",
+        ElementType::USize => "usize",
+        ElementType::Bool => "bool",
+        _ => return None,
+    })
+}
+
+/// For `--emit-evm` and `--emit-sbf`: an `assert` of each `requires` of each `pub fn`, at the
+/// top of its body. The prover takes a `requires` as true, because each call in the program
+/// must prove it. A transaction proves nothing, and it can pass any arguments. Without the
+/// check, an `ensures` that the prover proved can be false for a call from a transaction.
+///
+/// A function with a parameter that is not an integer or a `bool` gets no check, because
+/// `public_functions` refuses it with an error that names the parameter.
+fn check_requires_of_public_functions(program: &mut crate::syntax::Program) {
+    for function in &mut program.functions {
+        let public = function.visibility == crate::gid::Visibility::Public;
+        if !public
+            || function
+                .params
+                .iter()
+                .any(|(_, ty)| chain_scalar(ty).is_none())
+        {
+            continue;
+        }
+        let checks: Vec<_> = function
+            .requires
+            .iter()
+            .map(|clause| {
+                let text = crate::hir::check::audit::clause_text(clause);
+                let msg = format!("the call breaks `requires {text}` of '{}'", function.name);
+                crate::syntax::Statement::Assert(crate::syntax::AssertStmt::new(
+                    Box::new(clause.clone()),
+                    Some(msg),
+                    clause.span(),
+                ))
+            })
+            .collect();
+        function.body.splice(0..0, checks);
+    }
 }
 
 /// The name of the contract for the program in `main_file`: the name of the file, with a capital

@@ -1,0 +1,55 @@
+// A transaction can call a `pub fn` with any arguments, and the prover proves a `requires` only
+// at a call in the program. So `--emit-evm` and `--emit-sbf` check each `requires` of a `pub fn`
+// when the function starts. `half` is not `pub`. Each call to it is in the program, so it gets
+// no check. The test needs no EVM or Solana tool.
+//
+// RUN: vxc %s --emit-evm -o %t.sol
+// RUN: FileCheck %s --check-prefix=EVM --input-file=%t.sol
+// RUN: vxc %s --emit-sbf -o %t.ll
+// RUN: FileCheck %s --check-prefix=SBF --input-file=%t.ll
+
+// On the EVM, a call that breaks a clause reverts before the function does anything else.
+// EVM-LABEL: function vx_clamp_fee(x0, x1) -> y2 {
+// EVM-NEXT: let x3 := 1000
+// EVM-NEXT: let x4 := iszero(gt(and(x1, 0xffffffffffffffff), and(x3, 0xffffffffffffffff)))
+// EVM-NEXT: if iszero(x4) { revert(0, 0) }
+// EVM-LABEL: function vx_half_fee(x0) -> y1 {
+// EVM: if iszero(x4) { revert(0, 0) }
+// EVM: if iszero(x5) { revert(0, 0) }
+// EVM-NEXT: let x6 := vx_half(x0)
+// EVM-LABEL: function vx_half(x0) -> y1 {
+// EVM-NOT: revert
+// EVM: shr(
+
+// On Solana, a call that breaks a clause writes the clause to the log and stops the program.
+// SBF-DAG: c"the call breaks `requires cap <= 1000` of 'clamp_fee'
+// SBF-DAG: c"the call breaks `requires amount <= 2000` of 'half_fee'
+// SBF-DAG: c"the call breaks `requires amount >= 2` of 'half_fee'
+// SBF-LABEL: define internal i64 @half_fee(i64 %0)
+// SBF-COUNT-2: call void @abort()
+// SBF-LABEL: define internal i64 @half(i64 %0)
+// SBF-NOT: @abort
+// SBF-LABEL: define internal i64 @clamp_fee(i64 %0, i64 %1)
+// SBF: call void @vx_sbf_log(ptr @assert_msg
+// SBF-NEXT: call void @abort()
+pub fn clamp_fee(amount : u64, cap : u64) -> u64
+requires cap <= 1000
+ensures return <= 1000 {
+  if amount > cap {
+    return cap;
+  }
+  return amount;
+}
+
+fn half(x : u64) -> u64
+requires x <= 2000
+ensures return <= 1000 {
+  return x >> 1u64;
+}
+
+pub fn half_fee(amount : u64) -> u64
+requires amount <= 2000
+requires amount >= 2
+ensures return <= 1000 {
+  return half(amount);
+}

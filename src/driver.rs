@@ -278,7 +278,8 @@ pub struct DriverOptions {
     ///
     /// `-fbounds-checks`: an index outside the shape of a tensor stops the program with an
     /// error. The check is in CPU code, not in a GPU kernel. The default, `-fno-bounds-checks`,
-    /// does not check indices.
+    /// does not check indices. `--emit-evm` and `--emit-sbf` have the other default: they check
+    /// indices unless `-fno-bounds-checks` says no.
     ///
     /// For each feature, the last one wins
     #[arg(short = 'f', value_name = "FEATURE", value_parser = ["auto-schedule-levels", "no-auto-schedule-levels", "weak-relaxed-atomics", "no-weak-relaxed-atomics", "bounds-checks", "no-bounds-checks"])]
@@ -315,6 +316,15 @@ impl DriverOptions {
             .is_some_and(|f| f == name)
     }
 
+    /// Whether `-fno-<name>` is on: the last of it and `-f<name>`.
+    fn feature_is_off(&self, name: &str) -> bool {
+        self.features
+            .iter()
+            .rev()
+            .find(|f| f.strip_prefix("no-").unwrap_or(f) == name)
+            .is_some_and(|f| f != name)
+    }
+
     /// Whether `-fauto-schedule-levels` is on.
     pub fn auto_schedule_levels(&self) -> bool {
         self.feature("auto-schedule-levels")
@@ -328,6 +338,13 @@ impl DriverOptions {
     /// Whether `-fbounds-checks` is on.
     pub fn bounds_checks(&self) -> bool {
         self.feature("bounds-checks")
+    }
+
+    /// Whether `--emit-evm` and `--emit-sbf` check the indices of a tensor. They check them
+    /// unless `-fno-bounds-checks` says no. Any caller picks the arguments of a program on a
+    /// chain, so an index that nobody checked lets a caller read or change other memory.
+    pub fn chain_bounds_checks(&self) -> bool {
+        !self.feature_is_off("bounds-checks")
     }
 
     /// Whether `--sanitize=thread` is on.
@@ -1806,7 +1823,7 @@ impl CompilerDriver {
                 ));
             }
             if evm {
-                get_evm_pipeline()
+                get_evm_pipeline(self.options.chain_bounds_checks())
             } else {
                 // `mlir-translate` copies these two to the LLVM IR.
                 use melior::ir::operation::OperationMutLike;
@@ -1820,7 +1837,7 @@ impl CompilerDriver {
                     melior::ir::attribute::StringAttribute::new(context, crate::sbf::DATA_LAYOUT)
                         .into(),
                 );
-                get_sbf_pipeline()
+                get_sbf_pipeline(self.options.chain_bounds_checks())
             }
         } else {
             get_optimization_pipeline(
@@ -2480,26 +2497,36 @@ fn get_optimization_pipeline(
     format!("builtin.module({})", passes.join(","))
 }
 
-/// The passes for `--emit-evm`. The division check runs as it does for every backend. No pass
-/// lowers to LLVM, because the EVM takes no LLVM code. The last pass writes the contract.
-fn get_evm_pipeline() -> String {
-    let passes = [
+/// The passes for `--emit-evm`. The division check runs as it does for every backend, and
+/// `bounds_checks` adds the check of each tensor index. No pass lowers to LLVM, because the EVM
+/// takes no LLVM code. The last pass writes the contract.
+fn get_evm_pipeline(bounds_checks: bool) -> String {
+    let mut passes = vec![
         "convert-vx-to-standard",
         // Before the contract is written, so that a division by zero stops the call.
         "vx-check-integer-division",
-        "vx-export-evm",
     ];
+    if bounds_checks {
+        passes.push("vx-check-tensor-indices");
+    }
+    passes.push("vx-export-evm");
     format!("builtin.module({})", passes.join(","))
 }
 
-/// The passes for `--emit-sbf`. The division check runs as it does for every backend. Then the
-/// module becomes the LLVM dialect, with none of the passes that prepare a program for a host:
-/// a Solana program has no C library and no Vx runtime library.
-fn get_sbf_pipeline() -> String {
-    let passes = [
+/// The passes for `--emit-sbf`. The division check runs as it does for every backend, and
+/// `bounds_checks` adds the check of each tensor index. Then the module becomes the LLVM
+/// dialect, with none of the passes that prepare a program for a host: a Solana program has no
+/// C library and no Vx runtime library.
+fn get_sbf_pipeline(bounds_checks: bool) -> String {
+    let mut passes = vec![
         "convert-vx-to-standard",
         // Before the lowering, so that a division by zero stops the program.
         "vx-check-integer-division",
+    ];
+    if bounds_checks {
+        passes.push("vx-check-tensor-indices");
+    }
+    passes.extend([
         "convert-scf-to-cf",
         "finalize-memref-to-llvm",
         "convert-func-to-llvm",
@@ -2507,7 +2534,7 @@ fn get_sbf_pipeline() -> String {
         "convert-arith-to-llvm",
         "convert-index-to-llvm",
         "reconcile-unrealized-casts",
-    ];
+    ]);
     format!("builtin.module({})", passes.join(","))
 }
 
@@ -2852,6 +2879,12 @@ mod tests {
         assert!(o.bounds_checks());
         assert!(!parse(&["-fbounds-checks", "-fno-bounds-checks"]).bounds_checks());
         assert!(!parse(&[]).bounds_checks());
+        // `--emit-evm` and `--emit-sbf` check indices unless the last flag says no.
+        assert!(parse(&[]).chain_bounds_checks());
+        assert!(parse(&["-fbounds-checks"]).chain_bounds_checks());
+        assert!(!parse(&["-fno-bounds-checks"]).chain_bounds_checks());
+        assert!(parse(&["-fno-bounds-checks", "-fbounds-checks"]).chain_bounds_checks());
+        assert!(!parse(&["-fbounds-checks", "-fno-bounds-checks"]).chain_bounds_checks());
     }
 
     /// Two modules can declare a host topology at once -- `--machine fleet/h100.vx --host default`
